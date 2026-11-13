@@ -1,0 +1,14 @@
+{
+  "providers": {
+    "dl": {
+      "label": "Directionally Local",
+      "base_url": "https://free.directionallylocal.com/v1",
+      "models": [
+        "gpt-6-luna",
+        "gpt-6.1-sol",
+        "gpt-6-astra",
+        "deepseek/deepseek-v4.1-flash-1017"
+      ]
+    }
+  }
+}

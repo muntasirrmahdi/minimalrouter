@@ -44,6 +44,8 @@ fetch() {
 fetch minimalrouter.py
 fetch rows.example.json
 fetch oauth-providers.example.json
+# Learned entries must survive an upgrade: seed the registry only once.
+if [ ! -f "$DEST/provider-registry.json" ]; then fetch provider-registry.json; fi
 chmod 600 "$DEST/minimalrouter.py" 2>/dev/null || true
 # Existing users get the new OAuth-capable code, but their personal rows stay untouched.
 if [ -f "$DEST/oauth.json" ]; then chmod 600 "$DEST/oauth.json"; fi

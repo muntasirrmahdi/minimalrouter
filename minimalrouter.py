@@ -92,6 +92,9 @@ ENV = load_env()
 OAUTH_PATH = os.path.join(MR_HOME, "oauth.json")
 OAUTH_PROFILES_PATH = os.path.join(MR_HOME, "oauth-providers.json")
 OAUTH_EXAMPLE_PATH = os.path.join(MR_HOME, "oauth-providers.example.json")
+# Extensible data file: name -> {label, base_url, models, api_mode?}.
+# Not a whitelist — anyone can append an entry here or in the repo. No secrets.
+PROVIDER_REGISTRY_PATH = os.path.join(MR_HOME, "provider-registry.json")
 
 
 def write_oauth_profiles(profiles):
@@ -114,6 +117,21 @@ def read_oauth_profiles():
             data = json.load(f)
         profiles = data.get("profiles", data) if isinstance(data, dict) else {}
         return profiles if isinstance(profiles, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def read_provider_registry():
+    """Load the extensible name -> provider map (provider-registry.json).
+
+    This is data, not a whitelist: any user can append an entry here (or in the
+    repo) for a new tool. Entries are {label, base_url, models, api_mode?}.
+    """
+    try:
+        with open(PROVIDER_REGISTRY_PATH) as f:
+            data = json.load(f)
+        providers = data.get("providers", data) if isinstance(data, dict) else {}
+        return providers if isinstance(providers, dict) else {}
     except (OSError, json.JSONDecodeError):
         return {}
 
@@ -1341,10 +1359,38 @@ def main():
                 except EOFError:
                     return ""
                 return v or default
-            print("New OAuth provider profile — paste the base URL and I find the rest.\n")
-            pid = ask("profile id (letters, e.g. myprovider): ").strip().lower()
-            if not pid:
+            print("New OAuth provider profile.\n")
+            seed = ask("tool name (e.g. myprovider) or base URL: ").strip()
+            if not seed:
                 print("cancelled")
+                return 2
+            registry = read_provider_registry()
+            entry = {}
+            if seed.startswith("http"):
+                base_url = seed.rstrip("/")
+                pid = ask("profile id (letters, e.g. myprovider): ").strip().lower()
+            else:
+                pid = seed.lower()
+                entry = registry.get(pid) or {}
+                if entry.get("base_url"):
+                    print("  known provider: %s -> %s"
+                          % (entry.get("label", pid), entry["base_url"]))
+                    if entry.get("models"):
+                        print("  models: %s"
+                              % ", ".join(m if isinstance(m, str)
+                                          else m.get("model", "")
+                                          for m in entry["models"]))
+                    base_url = entry["base_url"]
+                    edit = ask("  use this base URL? [Y/n] ", "y").lower()
+                    if edit.startswith("n"):
+                        base_url = ask("  base URL: ").strip()
+                else:
+                    print("  %s is not in provider-registry.json yet." % pid)
+                    print("  give its base URL once — I store it under this name"
+                          " so next time it is just `oauth add %s`." % pid)
+                    base_url = ask("  base URL (e.g. https://host/v1): ").strip()
+            if not pid:
+                print("cancelled: profile id is required")
                 return 2
             if not pid.replace("-", "").replace("_", "").isalnum():
                 print("cancelled: use letters, digits, - or _ only")
@@ -1352,12 +1398,11 @@ def main():
             if pid in profiles:
                 print("profile %r already exists; use another id" % pid)
                 return 2
-            label = ask("display label: ", pid)
-            base_url = ask("base URL (the one you'd use for chat, e.g. https://host/v1): ")
             if not base_url:
                 print("cancelled: base URL is required")
                 return 2
             base_url = base_url.rstrip("/")
+            label = entry.get("label") or ask("display label: ", pid)
 
             print("  discovering device login on %s ..." % _origin(base_url))
             found = discover_device_endpoints(base_url)
@@ -1388,6 +1433,8 @@ def main():
                 return 2
 
             models = ""
+            reg_default = ",".join(m if isinstance(m, str) else m.get("model", "")
+                                   for m in (entry.get("models") or []))
             status, listing = _get_json(base_url + "/models")
             ids = [m.get("id", "") for m in (listing.get("data") or [])
                    if isinstance(m, dict) and m.get("id")] if status == 200 else []
@@ -1395,6 +1442,8 @@ def main():
                 print("  models found: %s" % ", ".join(ids[:8]))
                 models = ask("  models to expose (comma separated, Enter = all): ",
                              ",".join(ids))
+            elif reg_default:
+                models = ask("  models, comma separated: ", reg_default)
             else:
                 models = ask("  models, comma separated: ")
             if not models:
@@ -1418,6 +1467,20 @@ def main():
                 spec["api_mode"] = api_mode
             profiles[pid] = spec
             write_oauth_profiles(profiles)
+            # Remember name -> endpoints so the next add is a single word.
+            registry[pid] = {"label": label, "base_url": base_url,
+                             "models": spec["models"]}
+            if spec.get("api_mode"):
+                registry[pid]["api_mode"] = spec["api_mode"]
+            try:
+                tmp = PROVIDER_REGISTRY_PATH + ".tmp"
+                with open(tmp, "w") as f:
+                    json.dump({"providers": registry}, f, indent=2)
+                    f.write("\n")
+                os.replace(tmp, PROVIDER_REGISTRY_PATH)
+                print("  remembered in provider-registry.json as %r" % pid)
+            except OSError:
+                pass
             print("\nprofile %s saved" % pid)
             print("next: minimalrouter oauth %s" % pid)
             return 0
