@@ -235,15 +235,21 @@ custom_providers:
 The router ships **no** provider profiles and never names a specific tool. You
 create a profile for whatever service you want, then sign in to it. Two ways:
 
-**Interactive (recommended):**
+**Easiest — paste the base URL and it finds the rest:**
 
 ```sh
 minimalrouter oauth add
 ```
 
-It asks for a profile id, a label, the device authorize URL, the token/poll URL,
-an optional refresh URL, the OpenAI-compatible base URL, the model ids, and an
-optional `api_mode` (`chat_completions` by default, or `responses`). Then:
+It asks for a profile id, a label, and the base URL (the same one you would use
+for chat). It then probes the host's OIDC discovery document and the usual
+device-auth paths, and accepts an authorize endpoint **only when the server
+actually returns a device code for it**; the token endpoint is confirmed by the
+way it answers that code. You see the endpoints it found and confirm them.
+
+If nothing answers, it asks for the authorize and token URLs, so a provider that
+follows no convention is still addable — nothing is ever locked out by a
+built-in list. Then:
 
 ```sh
 minimalrouter oauth myprovider     # prints a URL + code, waits for approval

@@ -12,7 +12,7 @@ Two ways to add a provider:
 Usage:
   minimalrouter              server + terminal dashboard
   minimalrouter serve        server only (for tmux / systemd)
-  minimalrouter oauth add    create an OAuth provider profile interactively
+  minimalrouter oauth add    add a provider: paste its base URL, endpoints are found interactively
   minimalrouter oauth list   profiles and their connection state
   minimalrouter oauth <id>   device-code sign-in for that profile
   minimalrouter oauth rm <id>  delete a profile and its stored token
@@ -116,6 +116,151 @@ def read_oauth_profiles():
         return profiles if isinstance(profiles, dict) else {}
     except (OSError, json.JSONDecodeError):
         return {}
+
+
+# Endpoint discovery: no provider list, only conventions. Anything new that
+# follows a convention is found automatically; anything exotic falls back to
+# manual entry. An authorize candidate counts as found only when the server
+# actually returns a device code for it.
+DISCOVERY_AUTHORIZE_PATHS = (
+    "/device/code", "/v1/device/code", "/oauth/device/code",
+    "/oauth/device_authorization", "/v1/oauth/device/code",
+    "/device/authorize", "/v1/device/authorize", "/device_authorization",
+    "/api/device-auth/codes", "/auth/device/code",
+)
+
+DISCOVERY_TOKEN_PATHS = (
+    "/device/token", "/v1/device/token", "/oauth/device/token",
+    "/oauth/token", "/v1/oauth/token", "/v1/token", "/token",
+)
+
+DISCOVERY_REFRESH_PATHS = (
+    "/token/refresh", "/v1/token/refresh", "/oauth/token/refresh",
+    "/v1/oauth/refresh", "/oauth/refresh", "/refresh",
+)
+
+
+def _origin(url):
+    u = urllib.parse.urlsplit(url)
+    return "%s://%s" % (u.scheme, u.netloc)
+
+
+def _post_json(url, body, timeout=20):
+    """POST JSON, return (status, parsed_or_empty). Never raises."""
+    req = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST")
+    req.add_header("Content-Type", "application/json")
+    req.add_header("Accept", "application/json")
+    req.add_header("User-Agent", UA)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, json.loads(r.read() or b"{}")
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code, json.loads(e.read() or b"{}")
+        except Exception:
+            return e.code, {}
+    except Exception:
+        return 0, {}
+
+
+def _get_json(url, timeout=15):
+    req = urllib.request.Request(url, headers={"User-Agent": UA,
+                                               "Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, json.loads(r.read() or b"{}")
+    except urllib.error.HTTPError as e:
+        return e.code, {}
+    except Exception:
+        return 0, {}
+
+
+def error_code(payload):
+    """Normalise an OAuth error to a lowercase code.
+
+    Handles {'error': 'x'}, {'error': {'code': 'x'}}, {'error': {'type': 'x'}}
+    and {'status': 'x'} — servers disagree on all four shapes.
+    """
+    if not isinstance(payload, dict):
+        return ""
+    e = payload.get("error")
+    if isinstance(e, dict):
+        return str(e.get("code") or e.get("type") or e.get("error") or "").lower()
+    if isinstance(e, str):
+        return e.split(":")[0].strip().lower()
+    return str(payload.get("status") or "").lower()
+
+
+def error_message(payload, fallback="OAuth failed"):
+    if not isinstance(payload, dict):
+        return fallback
+    e = payload.get("error")
+    if isinstance(e, dict):
+        return str(e.get("message") or e.get("description") or e.get("code") or fallback)
+    if isinstance(e, str):
+        return e
+    return str(payload.get("error_description") or fallback)
+
+
+PENDING_CODES = ("authorization_pending", "authorization_pending_request",
+                 "slow_down", "pending")
+
+
+def discover_device_endpoints(base_url, log_fn=print):
+    """Find device-flow endpoints from a base URL alone.
+
+    Order: OIDC discovery document, then conventional paths. An authorize
+    endpoint is accepted only if the server returns a device code for it; a
+    token endpoint only if it answers that code with authorization_pending
+    (or an access token). Returns a dict, empty on total failure.
+    """
+    origin = _origin(base_url)
+    out = {"authorize_url": "", "token_url": "", "refresh_url": "",
+           "base_url": base_url, "source": ""}
+
+    # 1. OIDC discovery document (the standard way anything self-describes).
+    status, oidc = _get_json(origin + "/.well-known/openid-configuration")
+    if status == 200:
+        auth = oidc.get("device_authorization_endpoint") or ""
+        tok = oidc.get("token_endpoint") or ""
+        if auth and tok:
+            out.update({"authorize_url": auth, "token_url": tok,
+                        "refresh_url": tok, "source": "oidc"})
+            log_fn("  found via OIDC discovery document")
+            return out
+
+    # 2. Conventional authorize paths, proven by an actual device code.
+    device_code = ""
+    for path in DISCOVERY_AUTHORIZE_PATHS:
+        status, d = _post_json(origin + path, {}, timeout=8)
+        code = d.get("device_code") or d.get("code") or ""
+        if code:
+            out["authorize_url"] = origin + path
+            out["source"] = "probe"
+            device_code = code
+            break
+
+    if not out["authorize_url"]:
+        return {}
+
+    # 3. Conventional token paths, proven by how they answer that code.
+    for path in DISCOVERY_TOKEN_PATHS:
+        status, d = _post_json(origin + path, {"device_code": device_code}, timeout=8)
+        if d.get("access_token") or error_code(d) in PENDING_CODES:
+            out["token_url"] = origin + path
+            break
+        if status == 200 and not d:
+            continue
+
+    # 4. Refresh endpoint is best-effort; wrong guesses are harmless because a
+    #    refresh is only attempted after an access token has expired.
+    for path in DISCOVERY_REFRESH_PATHS:
+        status, d = _post_json(origin + path, {"refresh_token": "probe"}, timeout=8)
+        if error_code(d) in ("invalid_grant", "invalid_request", "invalid_token") \
+                or status in (400, 401):
+            out["refresh_url"] = origin + path
+            break
+    return out
 
 
 def log(msg):
@@ -726,37 +871,76 @@ def oauth_start(provider):
 
 
 def oauth_poll(provider, flow):
+    """Poll the token endpoint until approval, honouring pending/400/202 shapes."""
     spec = read_oauth_profiles().get(provider, {})
-    deadline = time.time() + flow["expires"]
+    deadline = time.time() + float(flow.get("expires", 600))
     poll_url = spec.get("token_url", "")
     method = spec.get("poll_method", "POST").upper()
+    body = dict(spec.get("token_body") or {"device_code": flow["device_code"]})
+    interval = float(flow.get("interval", 5) or 5)
+    last_msg = ""
     while time.time() < deadline:
-        time.sleep(flow["interval"])
+        time.sleep(interval)
+        status = 0
+        d = {}
         try:
-            payload = {"device_code": flow["device_code"]}
             if method == "GET":
-                url = poll_url.rstrip("/") + "/" + urllib.parse.quote(flow["device_code"], safe="")
-                req = urllib.request.Request(url, headers={"User-Agent": UA})
-                res = urllib.request.urlopen(req, timeout=30)
+                url = poll_url.rstrip("/") + "/" + urllib.parse.quote(
+                    flow["device_code"], safe="")
+                req = urllib.request.Request(url, headers={"User-Agent": UA,
+                                                           "Accept": "application/json"})
+                with urllib.request.urlopen(req, timeout=30) as r:
+                    status = r.status
+                    d = json.loads(r.read() or b"{}")
             else:
-                res = oauth_post(poll_url, provider, "", payload, timeout=30)
-            d = json.loads(res.read() or b"{}")
-            access = d.get("access_token") or d.get("token")
-            if access:
-                out = {"access_token": access,
-                       "refresh_token": d.get("refresh_token", "")}
-                if d.get("org_id"):
-                    out["org_id"] = d["org_id"]
-                return out
-            if d.get("error") not in ("authorization_pending", "slow_down") and d.get("status") not in ("pending", "authorization_pending"):
-                raise RuntimeError(d.get("error_description", d.get("error", "OAuth failed")))
-        except urllib.error.HTTPError as e:
-            if e.code in (202, 403, 410):
-                if e.code == 403: raise RuntimeError("OAuth denied")
-                continue
-            if e.code >= 500: continue
-            raise
-    raise RuntimeError("OAuth expired before approval")
+                status, d = _post_json(poll_url, body, timeout=30)
+        except Exception as e:  # transport hiccup: keep waiting until deadline
+            last_msg = str(e)
+            continue
+
+        code = error_code(d)
+        access = d.get("access_token") or d.get("token")
+        if access:
+            out = {"access_token": access,
+                   "refresh_token": d.get("refresh_token", "")}
+            if d.get("expires_in"):
+                out["expires_at"] = time.time() + float(d["expires_in"])
+            elif d.get("expiresAt"):
+                ea = float(d["expiresAt"])
+                out["expires_at"] = ea / 1000.0 if ea > 1e12 else ea
+            else:
+                out["expires_at"] = time.time() + 3600
+            for k in ("org_id", "organization_id"):
+                if d.get(k):
+                    out["org_id"] = d[k]
+                    break
+            return out
+
+        if code in PENDING_CODES:
+            last_msg = error_message(d, code)
+            # Servers may ask for a slower cadence; respect it.
+            bump = None
+            if isinstance(d.get("error"), dict) and d["error"].get("interval"):
+                bump = d["error"]["interval"]
+            elif d.get("interval"):
+                bump = d["interval"]
+            if code == "slow_down" and bump:
+                interval = float(bump)
+            continue
+
+        if code in ("access_denied", "expired_token", "invalid_grant",
+                    "invalid_request", "unauthorized"):
+            raise RuntimeError(error_message(d, code))
+        if status in (202, 204, 409, 428):
+            continue
+        if status >= 500:
+            last_msg = "server error %d" % status
+            continue
+        if not d:
+            last_msg = "empty response (HTTP %s)" % status
+            continue
+        raise RuntimeError(error_message(d, "OAuth failed (HTTP %s)" % status))
+    raise RuntimeError(last_msg or "OAuth expired before approval")
 
 
 def _curses_main(stdscr, port):
@@ -1157,7 +1341,7 @@ def main():
                 except EOFError:
                     return ""
                 return v or default
-            print("New OAuth provider profile (blank lines cancel)\n")
+            print("New OAuth provider profile — paste the base URL and I find the rest.\n")
             pid = ask("profile id (letters, e.g. myprovider): ")
             if not pid:
                 print("cancelled")
@@ -1166,15 +1350,56 @@ def main():
                 print("profile %r already exists; use another id" % pid)
                 return 2
             label = ask("display label: ", pid)
-            authorize_url = ask("authorize URL (device code endpoint): ")
-            token_url = ask("token URL (poll endpoint): ")
-            refresh_url = ask("refresh URL (blank if none): ")
-            base_url = ask("OpenAI-compatible base URL: ")
-            models = ask("models, comma separated: ")
-            api_mode = ask("api_mode [chat_completions/responses] ", "chat_completions")
-            if not (authorize_url and token_url and base_url and models):
-                print("cancelled: authorize, token, base URL and models are required")
+            base_url = ask("base URL (the one you'd use for chat, e.g. https://host/v1): ")
+            if not base_url:
+                print("cancelled: base URL is required")
                 return 2
+            base_url = base_url.rstrip("/")
+
+            print("  discovering device login on %s ..." % _origin(base_url))
+            found = discover_device_endpoints(base_url)
+            authorize_url = token_url = refresh_url = ""
+            if found.get("authorize_url"):
+                print("  authorize : %s" % found["authorize_url"])
+                if found.get("token_url"):
+                    print("  token     : %s" % found["token_url"])
+                if found.get("refresh_url"):
+                    print("  refresh   : %s" % found["refresh_url"])
+                use = ask("  use the discovered endpoints? [Y/n] ", "y").lower()
+                if not use.startswith("n"):
+                    authorize_url = found["authorize_url"]
+                    token_url = found.get("token_url", "")
+                    refresh_url = found.get("refresh_url", "")
+            if not token_url:
+                if authorize_url:
+                    print("  token endpoint not identified — enter it (source: the"
+                          " tool's login code or docs)")
+                else:
+                    print("  no standard device endpoint answered on that host —"
+                          " enter them")
+                authorize_url = authorize_url or ask("  authorize URL (device code endpoint): ")
+                token_url = ask("  token URL (poll endpoint): ")
+                refresh_url = refresh_url or ask("  refresh URL (blank if none): ")
+            if not (authorize_url and token_url):
+                print("cancelled: authorize and token URLs are required")
+                return 2
+
+            models = ""
+            status, listing = _get_json(base_url + "/models")
+            ids = [m.get("id", "") for m in (listing.get("data") or [])
+                   if isinstance(m, dict) and m.get("id")] if status == 200 else []
+            if ids:
+                print("  models found: %s" % ", ".join(ids[:8]))
+                models = ask("  models to expose (comma separated, Enter = all): ",
+                             ",".join(ids))
+            else:
+                models = ask("  models, comma separated: ")
+            if not models:
+                print("cancelled: at least one model id is required")
+                return 2
+
+            api_mode = ask("  api_mode [chat_completions/responses] ", "chat_completions")
+
             spec = {
                 "label": label,
                 "authorize_url": authorize_url,
@@ -1190,7 +1415,7 @@ def main():
                 spec["api_mode"] = api_mode
             profiles[pid] = spec
             write_oauth_profiles(profiles)
-            print("\nprofile %s saved to %s" % (pid, OAUTH_PROFILES_PATH))
+            print("\nprofile %s saved" % pid)
             print("next: minimalrouter oauth %s" % pid)
             return 0
 
