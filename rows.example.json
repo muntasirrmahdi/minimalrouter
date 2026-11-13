@@ -1,5 +1,11 @@
 [
   {
+    "name": "kilocode-free",
+    "base": "https://api.kilo.ai/api/openrouter",
+    "model": "kilo-auto/free",
+    "key_env": ""
+  },
+  {
     "name": "groq-qwen3.8-27b",
     "base": "https://api.groq.com/openai/v1",
     "model": "qwen/qwen3.8-27b",

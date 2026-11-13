@@ -14,7 +14,7 @@ Small, focused changes are welcome.
   one allowed place where named tools live, because it is data, not logic —
   and entries there must keep endpoints out of the file (they are discovered
   live).
-- Keep the code readable: no clever abstractions for a 1,200-line file.
+- Keep the code readable: no clever abstractions for a single ~1,600-line file.
 
 ## Before you open a pull request
 

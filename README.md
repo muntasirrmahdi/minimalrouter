@@ -84,8 +84,9 @@ minimalrouter
 ```
 
 That starts the server and opens the dashboard. The example rows file ships with
-keyless and free-tier entries; rows that need a key stay `unknown` until you give
-one, and a failed row never blocks the others.
+keyless free-tier entries — the first row, `kilocode-free`, works with no
+setup at all — plus entries that need a key, which stay `unknown` until you
+give one. A failed row never blocks the others.
 
 Add your first provider:
 
