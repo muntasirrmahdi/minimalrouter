@@ -44,6 +44,8 @@ fetch() {
 fetch minimalrouter.py
 fetch rows.example.json
 chmod 600 "$DEST/minimalrouter.py" 2>/dev/null || true
+# Existing users get the new OAuth-capable code, but their personal rows stay untouched.
+if [ -f "$DEST/oauth.json" ]; then chmod 600 "$DEST/oauth.json"; fi
 
 if [ ! -f "$DEST/rows.json" ]; then
     cp "$DEST/rows.example.json" "$DEST/rows.json"

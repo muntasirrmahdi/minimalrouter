@@ -93,6 +93,19 @@ Add your first provider:
 4. The model list is fetched from the provider: type to filter, Enter to pick
 5. The row is tested; it is saved only if the test passes
 
+For OAuth-backed coding tools, use the terminal device flow instead:
+
+```sh
+minimalrouter oauth dl          # Directionally Local
+minimalrouter oauth omnirush    # OmniRush
+minimalrouter oauth kilocode    # Kilo Code
+```
+
+The command prints a provider-generated browser URL and code, waits for your
+approval, stores the returned token in `~/.minimalrouter/oauth.json` (chmod 600),
+and exposes the provider's aliases through `/v1/models`. It does not copy your
+existing 9Router tokens or read another app's credential store.
+
 Press `t` to re-test the selected row at any time. Press `q` to quit.
 
 For a long-running endpoint without the dashboard:
