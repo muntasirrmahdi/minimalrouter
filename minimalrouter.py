@@ -26,7 +26,6 @@ import json
 import os
 import sys
 import time
-import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -145,6 +144,7 @@ def oauth_access_token(provider):
                                      method="POST")
         req.add_header("Content-Type", "application/json")
         req.add_header("Accept", "application/json")
+        req.add_header("User-Agent", UA)
         for k, v in (spec.get("refresh_headers") or {}).items():
             req.add_header(k, str(v).replace("{refresh_token}", refresh_token))
         d = json.loads(urllib.request.urlopen(req, timeout=30).read() or b"{}")
@@ -166,6 +166,7 @@ def oauth_access_token(provider):
 
 def oauth_rows():
     rows = []
+    auth = read_oauth()
     for provider, spec in read_oauth_profiles().items():
         token = oauth_access_token(provider)
         for model in spec.get("models", []):
@@ -179,6 +180,8 @@ def oauth_rows():
                          "base": spec["base_url"], "model": model,
                          "aliases": aliases, "key": token,
                          "oauth_provider": provider,
+                         "api_mode": spec.get("api_mode", "chat_completions"),
+                         "org_id": (auth.get(provider) or {}).get("org_id", ""),
                          "oauth_label": spec.get("label", provider)})
     return rows
 
@@ -209,10 +212,11 @@ def ep(base, path):
 
 
 def upstream(base, key, path, payload=None, timeout=TIMEOUT, row=None):
-    # OAuth rows may require provider-specific client headers.
+    # Per-profile behavior only; no provider is known by name.
     row = row or {}
     provider = row.get("oauth_provider", "")
-    if provider == "omnirush" and path == "/v1/chat/completions":
+    api_mode = row.get("api_mode", "chat_completions")
+    if api_mode == "responses" and path == "/v1/chat/completions":
         return oauth_chat(row, payload, timeout)
     url = ep(base, path)
     data = json.dumps(payload).encode() if payload is not None else None
@@ -228,7 +232,10 @@ def upstream(base, key, path, payload=None, timeout=TIMEOUT, row=None):
 
 
 def oauth_chat(row, payload, timeout=TIMEOUT):
-    """Translate our Chat Completions request to OmniRush Responses."""
+    """Translate an OpenAI Chat request to a Responses-style upstream.
+
+    Used only when a profile declares "api_mode": "responses".
+    """
     base = row["base"].rstrip("/")
     token = row.get("key", "")
     messages = payload.get("messages", [])
@@ -246,12 +253,34 @@ def oauth_chat(row, payload, timeout=TIMEOUT):
     req = urllib.request.Request(ep(base, "/v1/responses"),
                                  data=json.dumps(body).encode(), method="POST")
     req.add_header("Content-Type", "application/json")
-    for hk, hv in oauth_headers("omnirush", token).items():
+    for hk, hv in oauth_headers(row.get("oauth_provider", ""), token,
+                                row.get("org_id", "")).items():
         req.add_header(hk, hv)
     return urllib.request.urlopen(req, timeout=timeout)
 
 
-def probe(base, key, model):
+def responses_text(raw):
+    """Extract assistant text from a Responses-style payload."""
+    if not isinstance(raw, dict):
+        return ""
+    if isinstance(raw.get("output_text"), str):
+        return raw["output_text"]
+    parts = []
+    for item in raw.get("output") or []:
+        for c in (item or {}).get("content") or []:
+            if isinstance(c, dict) and c.get("text"):
+                parts.append(str(c["text"]))
+    return "".join(parts)
+
+
+def chat_from_responses(row, payload):
+    """Run a non-streaming Responses call and return plain assistant text."""
+    resp = oauth_chat(row, dict(payload, stream=False))
+    raw = json.loads(resp.read() or b"{}")
+    return responses_text(raw)
+
+
+def probe(base, key, model, row=None):
     """Marker probe. Returns (ok, ms, error, content)."""
     t0 = time.time()
     payload = {"model": model, "max_tokens": 200,
@@ -259,9 +288,14 @@ def probe(base, key, model):
                              "content": "Reply with exactly: OK"}]}
     try:
         resp = upstream(base, key, "/v1/chat/completions", payload,
-                        timeout=PROBE_TIMEOUT, row={"oauth_provider": ""})
+                        timeout=PROBE_TIMEOUT, row=row or {})
         body = json.loads(resp.read() or b"{}")
         ms = (time.time() - t0) * 1000
+        if isinstance(body, dict) and "choices" not in body \
+                and (body.get("output") or body.get("output_text")):
+            body = {"choices": [{"message": {
+                "role": "assistant", "content": responses_text(body)}}],
+                "usage": body.get("usage", {})}
         if not isinstance(body, dict) or "choices" not in body:
             return False, ms, "unexpected body", ""
         try:
@@ -348,7 +382,7 @@ class Handler(BaseHTTPRequestHandler):
                 "models": [m if isinstance(m, str) else m.get("model", "")
                            for m in v.get("models", [])]} for k, v in profiles.items()]})
         if p == "/api/oauth/start":
-            return self._send(405, {"error": "OAuth is terminal-only. Run: minimalrouter oauth <dl|omnirush|kilocode>"})
+            return self._send(405, {"error": "OAuth is terminal-only. Run: minimalrouter oauth <provider-id>"})
         if p == "/":
             msg = ("MinimalRouter — terminal UI: run `minimalrouter`\n"
                    "API: POST http://%s:%d/v1/chat/completions\n"
@@ -396,7 +430,7 @@ class Handler(BaseHTTPRequestHandler):
                     break
             if not key and match:  # dashboard row test -> configured key
                 key = match["key"]
-            ok, ms, err, content = probe(base, key, model)
+            ok, ms, err, content = probe(base, key, model, row=match)
             if match:  # keep the table's STATE / LATENCY / LAST live
                 ROW_STATE[match["name"]] = {
                     "status": "ok" if ok else "fail", "ms": ms,
@@ -436,7 +470,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(400, {"ok": False,
                                         "error": "test failed: %s" % err})
             with ROW_LOCK:
-                rows = all_rows()
+                rows = read_rows()  # file rows only: never persist OAuth rows
                 while any(r["name"] == name for r in rows):
                     name, i = "%s-%d" % (name, i), i + 1
                 rows.append({"name": name, "base": base, "model": model,
@@ -449,7 +483,12 @@ class Handler(BaseHTTPRequestHandler):
         if p == "/api/remove":
             name = body.get("name", "")
             with ROW_LOCK:
-                rows = all_rows()
+                oauth_names = {r["name"] for r in oauth_rows()}
+                if name in oauth_names:
+                    return self._send(400, {
+                        "error": "that row comes from an OAuth profile; remove "
+                                 "the profile in oauth-providers.json instead"})
+                rows = read_rows()
                 kept = [r for r in rows if r["name"] != name]
                 if len(kept) == len(rows):
                     return self._send(404, {"error": "no such row"})
@@ -471,6 +510,39 @@ class Handler(BaseHTTPRequestHandler):
             for row in chain:
                 t0 = time.time()
                 try:
+                    if row.get("api_mode") == "responses":
+                        chat = chat_from_responses(row, body)
+                        ROW_STATE[row["name"]] = {
+                            "status": "ok", "ms": (time.time() - t0) * 1000,
+                            "at": time.time()}
+                        if stream:
+                            chunk = {"id": "chatcmpl-responses",
+                                     "object": "chat.completion.chunk",
+                                     "created": int(time.time()),
+                                     "model": model,
+                                     "choices": [{"index": 0,
+                                                  "delta": {"role": "assistant",
+                                                            "content": chat},
+                                                  "finish_reason": "stop"}]}
+                            self.send_response(200)
+                            self.send_header("Content-Type", "text/event-stream")
+                            self.send_header("Transfer-Encoding", "chunked")
+                            self.end_headers()
+                            self._chunk(("data: %s\n\n" % json.dumps(chunk)).encode())
+                            self._chunk(b"data: [DONE]\n\n")
+                            self._chunk(b"")
+                        else:
+                            self._send(200, {
+                                "id": "chatcmpl-responses",
+                                "object": "chat.completion",
+                                "created": int(time.time()),
+                                "model": model,
+                                "choices": [{"index": 0, "finish_reason": "stop",
+                                             "message": {"role": "assistant",
+                                                         "content": chat}}]})
+                        log("OK  %s via %s (responses mode) %.1fs"
+                            % (model, row["name"], time.time() - t0))
+                        return
                     resp = upstream(row["base"], row["key"],
                                     "/v1/chat/completions", body, row=row)
                     if stream:
