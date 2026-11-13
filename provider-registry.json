@@ -9,6 +9,29 @@
         "gpt-6-astra",
         "deepseek/deepseek-v4.1-flash-1017"
       ]
+    },
+    "kilocode": {
+      "label": "Kilo Code",
+      "base_url": "https://api.kilo.ai/api/openrouter",
+      "models": [
+        "kilo-auto/efficient",
+        "kilo-auto/free",
+        "nvidia/nemotron-3.5-super-vl:free",
+        "inclusionai/ling-3.2-flash:free",
+        "baidu/ernie-5.5-flash-preview:free",
+        "liquid/lfm-3-1.7b:free"
+      ],
+      "authorize_url": "https://api.kilo.ai/api/device-auth/codes",
+      "token_url": "https://api.kilo.ai/api/device-auth/codes",
+      "poll_method": "GET"
+    },
+    "omnirush": {
+      "label": "OmniRush",
+      "base_url": "https://omnirush.ai/omnirush/v1",
+      "models": [],
+      "api_mode": "responses",
+      "authorize_url": "https://omnirush.ai/omnirush/device/authorize",
+      "token_url": "https://omnirush.ai/omnirush/device/token"
     }
   }
 }

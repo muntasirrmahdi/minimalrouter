@@ -1405,19 +1405,33 @@ def main():
             label = entry.get("label") or ask("display label: ", pid)
 
             print("  discovering device login on %s ..." % _origin(base_url))
-            found = discover_device_endpoints(base_url)
-            authorize_url = token_url = refresh_url = ""
-            if found.get("authorize_url"):
-                print("  authorize : %s" % found["authorize_url"])
-                if found.get("token_url"):
-                    print("  token     : %s" % found["token_url"])
-                if found.get("refresh_url"):
-                    print("  refresh   : %s" % found["refresh_url"])
-                use = ask("  use the discovered endpoints? [Y/n] ", "y").lower()
-                if not use.startswith("n"):
-                    authorize_url = found["authorize_url"]
-                    token_url = found.get("token_url", "")
-                    refresh_url = found.get("refresh_url", "")
+            found = {}
+            # Curated registry values are authoritative; discovery fills gaps.
+            for k in ("authorize_url", "token_url", "refresh_url"):
+                if entry.get(k):
+                    found[k] = entry[k]
+            missing = [k for k in ("authorize_url", "token_url") if not found.get(k)]
+            if missing:
+                found2 = discover_device_endpoints(base_url)
+                for k in missing:
+                    if found2.get(k):
+                        found[k] = found2[k]
+                found2.get("source") and print("  (discovered: %s)" % found2["source"])
+            found = found or {}
+            authorize_url = found.get("authorize_url", "")
+            token_url = found.get("token_url", "")
+            refresh_url = found.get("refresh_url", "")
+            if authorize_url:
+                print("  authorize : %s" % authorize_url)
+                if token_url:
+                    print("  token     : %s" % token_url)
+                if refresh_url:
+                    print("  refresh   : %s" % refresh_url)
+                if authorize_url == token_url and entry.get("poll_method"):
+                    print("  poll      : %s <code>" % entry.get("poll_method"))
+                use = ask("  use the resolved endpoints? [Y/n] ", "y").lower()
+                if use.startswith("n"):
+                    authorize_url = token_url = refresh_url = ""
             if not token_url:
                 if authorize_url:
                     print("  token endpoint not identified — enter it (source: the"
@@ -1450,7 +1464,8 @@ def main():
                 print("cancelled: at least one model id is required")
                 return 2
 
-            api_mode = ask("  api_mode [chat_completions/responses] ", "chat_completions")
+            api_mode = ask("  api_mode [chat_completions/responses] ",
+                           entry.get("api_mode", "chat_completions"))
 
             spec = {
                 "label": label,
@@ -1465,6 +1480,8 @@ def main():
                 spec["refresh_url"] = refresh_url
             if api_mode:
                 spec["api_mode"] = api_mode
+            if entry.get("poll_method"):
+                spec["poll_method"] = entry["poll_method"]
             profiles[pid] = spec
             write_oauth_profiles(profiles)
             # Remember name -> endpoints so the next add is a single word.
