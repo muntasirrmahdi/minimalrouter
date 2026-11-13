@@ -1342,9 +1342,12 @@ def main():
                     return ""
                 return v or default
             print("New OAuth provider profile — paste the base URL and I find the rest.\n")
-            pid = ask("profile id (letters, e.g. myprovider): ")
+            pid = ask("profile id (letters, e.g. myprovider): ").strip().lower()
             if not pid:
                 print("cancelled")
+                return 2
+            if not pid.replace("-", "").replace("_", "").isalnum():
+                print("cancelled: use letters, digits, - or _ only")
                 return 2
             if pid in profiles:
                 print("profile %r already exists; use another id" % pid)
@@ -1419,12 +1422,12 @@ def main():
             print("next: minimalrouter oauth %s" % pid)
             return 0
 
-        if len(args) != 2 or args[1] not in profiles:
+        if len(args) != 2 or args[1].lower() not in profiles:
             print("Usage: minimalrouter oauth <profile-id> | add | list | rm <id>")
             print("Profiles in %s: %s"
                   % (OAUTH_PROFILES_PATH, ", ".join(sorted(profiles)) or "(none)"))
             return 2
-        provider = args[1]
+        provider = args[1].lower()
         print("Starting %s OAuth device flow..." % profiles[provider].get("label", provider))
         try:
             flow = oauth_start(provider)
