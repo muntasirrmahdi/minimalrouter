@@ -9,6 +9,7 @@
       "models": [
         {"model": "provider/model", "aliases": ["provider/free-model"]}
       ],
+      "api_mode": "chat_completions",
       "authorize_body": {"device_name": "minimalrouter"},
       "headers": {},
       "refresh_body": {"refresh_token": "{refresh_token}"}

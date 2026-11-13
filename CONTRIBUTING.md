@@ -6,10 +6,12 @@ Small, focused changes are welcome.
 
 - This project is one Python file using only the standard library. A pull
   request that adds a dependency will be closed.
-- The server stays bound to `127.0.0.1` and stays unauthenticated. It is a
-  local tool, not a hosted service.
+- The server stays bound to `127.0.0.1` and stays unauthenticated as a server.
+  Provider logins are OAuth device flows, stored outside the repo.
 - No web UI and no desktop wrapper. The dashboard is the terminal.
-- Keep the code readable: no clever abstractions for a 700-line file.
+- OAuth support must stay generic: no provider names or endpoints hardcoded in
+  the source, example profile, or defaults.
+- Keep the code readable: no clever abstractions for a 1,200-line file.
 
 ## Before you open a pull request
 

@@ -1,26 +1,46 @@
 #!/usr/bin/env python3
-"""MinimalRouter — one clean OpenAI-compatible endpoint over N free API rows.
+"""MinimalRouter — one clean OpenAI-compatible endpoint over N API rows.
 
-Single file, stdlib only. No auth, no web UI. Binds 127.0.0.1 only.
+Single file, stdlib only. No server authentication, no web UI. Binds 127.0.0.1.
 Terminal dashboard (curses) in the same process.
 
-Usage:
-  minimalrouter          server + terminal dashboard
-  minimalrouter serve    server only (for tmux / systemd)
+Two ways to add a provider:
+  1. API key row  — dashboard `a`, paste base URL + key, pick a model.
+  2. OAuth row    — `minimalrouter oauth add` (writes a provider profile),
+                    then `minimalrouter oauth <profile-id>` (device sign-in).
 
-Home:   ~/.minimalrouter/   (minimalrouter.py, rows.json, minimalrouter.log)
+Usage:
+  minimalrouter              server + terminal dashboard
+  minimalrouter serve        server only (for tmux / systemd)
+  minimalrouter oauth add    create an OAuth provider profile interactively
+  minimalrouter oauth list   profiles and their connection state
+  minimalrouter oauth <id>   device-code sign-in for that profile
+  minimalrouter oauth rm <id>  delete a profile and its stored token
+
+Home:   ~/.minimalrouter/
+          minimalrouter.py            this file
+          rows.json                   API-key rows
+          oauth-providers.json        OAuth provider profiles (user-authored)
+          oauth.json                  OAuth tokens, chmod 600
+          minimalrouter.log           request log
 Rows:   [{name, base, model, key_env|key, aliases?}]
 Keys:   key_env rows resolve from ~/.hermes/.env at runtime.
+
+OAuth profiles are generic: authorize_url, token_url, optional refresh_url,
+base_url, models, optional headers, optional api_mode (chat_completions or
+responses). No provider is hardcoded. Tokens are refreshed on demand.
 
 HTTP API:
   POST /v1/chat/completions   stream + non-stream, ordered fallback per model
   GET  /v1/models             union of configured models/aliases
   GET  /health
+  GET  /api/state             rows + live per-row state
+  GET  /api/oauth/providers   configured OAuth profiles
+  GET  /api/oauth/status      per-profile connected state
   POST /api/test              {base, key, model} -> probe result (no save)
   POST /api/fetch_models      {base, key} -> upstream model ids
   POST /api/add               {base, key, model, name?} -> test, then save
   POST /api/remove            {name} -> drop row
-  GET  /api/state             rows + live per-row state
 """
 import json
 import os
@@ -72,6 +92,19 @@ ENV = load_env()
 OAUTH_PATH = os.path.join(MR_HOME, "oauth.json")
 OAUTH_PROFILES_PATH = os.path.join(MR_HOME, "oauth-providers.json")
 OAUTH_EXAMPLE_PATH = os.path.join(MR_HOME, "oauth-providers.example.json")
+
+
+def write_oauth_profiles(profiles):
+    os.makedirs(MR_HOME, exist_ok=True)
+    tmp = OAUTH_PROFILES_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"profiles": profiles}, f, indent=2)
+        f.write("\n")
+    os.replace(tmp, OAUTH_PROFILES_PATH)
+    try:
+        os.chmod(OAUTH_PROFILES_PATH, 0o600)
+    except OSError:
+        pass
 
 
 def read_oauth_profiles():
@@ -774,7 +807,7 @@ def _curses_main(stdscr, port):
                 "up %dm%02ds  |  %s" % (
                     HOST, port, len(rows), nmodels,
                     up // 60, up % 60,
-                    "no auth / localhost only" if online
+                    "no server auth / localhost only" if online
                     else "SERVER OFFLINE"))
         _putw(stdscr, 0, head, w, curses.A_REVERSE | curses.A_BOLD)
         if h < 16 or w < 60:  # tiny terminal: rows + legend only
@@ -1046,11 +1079,16 @@ def usage():
 Usage:
   minimalrouter              terminal dashboard + server (one process)
   minimalrouter serve        server only (tmux / systemd / background)
+  minimalrouter oauth add    create an OAuth provider profile
+  minimalrouter oauth list   show profiles and connection state
+  minimalrouter oauth <id>   sign in to that provider (device code)
+  minimalrouter oauth rm <id>  delete a profile and its token
   minimalrouter -h|--help    show this help
   minimalrouter -v           show version
 
 Endpoint: http://127.0.0.1:%d/v1     (env MINIMALROUTER_PORT overrides the port)
-No auth. Localhost only. OpenAI format only (/v1/messages is not served).
+No server authentication. Localhost only. OAuth provider logins are supported
+through profiles; the client-facing format is OpenAI Chat Completions.
 
 Dashboard keys:
   up/down  select row     t  re-test row      a  add a row
@@ -1059,6 +1097,8 @@ Dashboard keys:
 
 Add a row: run `minimalrouter`, press a, paste base URL + API key,
 pick a model from the fetched list; the row is saved only if the test passes.
+
+Add an OAuth provider: `minimalrouter oauth add`, then `minimalrouter oauth <id>`.
 
 Files:
   ~/.minimalrouter/rows.json           rows: {name, base, model, key_env|key}
@@ -1081,10 +1121,83 @@ def main():
         return 0
     if args and args[0].lower() == "oauth":
         profiles = read_oauth_profiles()
+        sub = args[1].lower() if len(args) > 1 else ""
+
+        if sub == "list":
+            auth = read_oauth()
+            if not profiles:
+                print("No OAuth profiles yet. Add one: minimalrouter oauth add")
+                return 0
+            for pid, spec in sorted(profiles.items()):
+                state = "connected" if (auth.get(pid) or {}).get("access_token") else "not connected"
+                print("%-14s %-24s %-12s models: %s"
+                      % (pid, spec.get("label", pid), state,
+                         ", ".join(m if isinstance(m, str) else m.get("model", "")
+                                   for m in spec.get("models", []))))
+            return 0
+
+        if sub == "rm":
+            if len(args) != 3 or args[2] not in profiles:
+                print("Usage: minimalrouter oauth rm <profile-id>")
+                return 2
+            pid = args[2]
+            profiles.pop(pid, None)
+            write_oauth_profiles(profiles)
+            auth = read_oauth()
+            if pid in auth:
+                auth.pop(pid)
+                write_oauth(auth)
+            print("removed profile %s" % pid)
+            return 0
+
+        if sub == "add":
+            def ask(prompt, default=""):
+                try:
+                    v = input(prompt).strip()
+                except EOFError:
+                    return ""
+                return v or default
+            print("New OAuth provider profile (blank lines cancel)\n")
+            pid = ask("profile id (letters, e.g. myprovider): ")
+            if not pid:
+                print("cancelled")
+                return 2
+            if pid in profiles:
+                print("profile %r already exists; use another id" % pid)
+                return 2
+            label = ask("display label: ", pid)
+            authorize_url = ask("authorize URL (device code endpoint): ")
+            token_url = ask("token URL (poll endpoint): ")
+            refresh_url = ask("refresh URL (blank if none): ")
+            base_url = ask("OpenAI-compatible base URL: ")
+            models = ask("models, comma separated: ")
+            api_mode = ask("api_mode [chat_completions/responses] ", "chat_completions")
+            if not (authorize_url and token_url and base_url and models):
+                print("cancelled: authorize, token, base URL and models are required")
+                return 2
+            spec = {
+                "label": label,
+                "authorize_url": authorize_url,
+                "token_url": token_url,
+                "base_url": base_url,
+                "models": [m.strip() for m in models.split(",") if m.strip()],
+                "authorize_body": {},
+                "refresh_body": {"refresh_token": "{refresh_token}"},
+            }
+            if refresh_url:
+                spec["refresh_url"] = refresh_url
+            if api_mode:
+                spec["api_mode"] = api_mode
+            profiles[pid] = spec
+            write_oauth_profiles(profiles)
+            print("\nprofile %s saved to %s" % (pid, OAUTH_PROFILES_PATH))
+            print("next: minimalrouter oauth %s" % pid)
+            return 0
+
         if len(args) != 2 or args[1] not in profiles:
-            print("Usage: minimalrouter oauth <provider>")
-            print("Providers configured in ~/.minimalrouter/oauth-providers.json:",
-                  ", ".join(sorted(profiles)) or "(none)")
+            print("Usage: minimalrouter oauth <profile-id> | add | list | rm <id>")
+            print("Profiles in %s: %s"
+                  % (OAUTH_PROFILES_PATH, ", ".join(sorted(profiles)) or "(none)"))
             return 2
         provider = args[1]
         print("Starting %s OAuth device flow..." % profiles[provider].get("label", provider))

@@ -2,7 +2,8 @@
 
 One OpenAI-compatible endpoint over as many API providers as you want, with a
 terminal dashboard. One file, Python standard library only, no dependencies,
-no authentication, localhost only.
+no server authentication, localhost only. Provider logins (OAuth device flow)
+are supported through profiles.
 
 Free tiers are scattered across a dozen providers: each has its own base URL,
 its own key, its own rate limit, and its own way of dying quietly. MinimalRouter
@@ -10,7 +11,7 @@ puts them behind a single endpoint, keeps trying the next one when a row fails,
 and shows you the state of every row in your terminal.
 
 ```
- MINIMALROUTER  |  http://127.0.0.1:8790/v1  |  8 rows  8 models  |  up 4m12s  |  no auth / localhost only
+ MINIMALROUTER  |  http://127.0.0.1:8790/v1  |  8 rows  8 models  |  up 4m12s  |  no server auth / localhost only
    NAME                        MODEL                          HOST               LAT      LAST
 ------------------------------------------------------------------------------------------------------
  > * groq-qwen3.8-27b          qwen/qwen3.8-27b                api.groq.com      343ms     0s
@@ -43,7 +44,8 @@ endpoints and no single place to use them. MinimalRouter gives you:
 - **an add flow in three keystrokes** that tests before it saves
 
 It is deliberately small: one Python file, no pip install, no database, no web
-UI, no auth layer, nothing to configure beyond a JSON file of rows.
+UI, no server auth layer, nothing to configure beyond a JSON file of rows and,
+if you want provider logins, an OAuth profile.
 
 ## Requirements
 
@@ -93,21 +95,8 @@ Add your first provider:
 4. The model list is fetched from the provider: type to filter, Enter to pick
 5. The row is tested; it is saved only if the test passes
 
-For any OAuth-backed provider, put its device-flow profile in
-`~/.minimalrouter/oauth-providers.json` (copy the shipped
-`oauth-providers.example.json`), then run:
-
-```sh
-minimalrouter oauth <profile-id>
-```
-
-The command prints a provider-generated browser URL and code, waits for your
-approval, stores the returned token in `~/.minimalrouter/oauth.json` (chmod 600),
-and exposes the provider's aliases through `/v1/models`. There are **no tool
-names or provider accounts in the default configuration**. The OAuth layer is
-generic: base URL, device authorize/token/refresh URLs, models, aliases and
-optional headers all come from your profile. It does not copy another app's
-credentials.
+Quickstart for OAuth instead of a key: `minimalrouter oauth add` once, then
+`minimalrouter oauth <profile-id>`, and the profile's models join `/v1/models`.
 
 Press `t` to re-test the selected row at any time. Press `q` to quit.
 
@@ -135,7 +124,9 @@ error), and a live tail of the request log.
 
 ## API
 
-Base URL: `http://127.0.0.1:8790/v1`. No auth: any string works as an API key.
+Base URL: `http://127.0.0.1:8790/v1`. There is no server authentication: any
+string works as an API key from your own machine. Provider logins are separate —
+see [OAuth providers](#oauth-providers).
 
 | Method | Path | Purpose |
 |---|---|---|
@@ -241,30 +232,55 @@ custom_providers:
 
 ## OAuth providers
 
-MinimalRouter can hold OAuth-backed coding-tool connections as first-class
-rows. Tokens live only in `~/.minimalrouter/oauth.json` (mode 600), never in
-the repository or `rows.json`.
+The router ships **no** provider profiles and never names a specific tool. You
+create a profile for whatever service you want, then sign in to it. Two ways:
+
+**Interactive (recommended):**
 
 ```sh
-minimalrouter oauth dl          # Directionally Local device OAuth
-minimalrouter oauth omnirush    # OmniRush device OAuth + Responses translation
-minimalrouter oauth kilocode    # Kilo Code device OAuth
+minimalrouter oauth add
 ```
 
-The command prints a browser URL and code, waits for approval, then exposes
-provider aliases through `/v1/models`:
+It asks for a profile id, a label, the device authorize URL, the token/poll URL,
+an optional refresh URL, the OpenAI-compatible base URL, the model ids, and an
+optional `api_mode` (`chat_completions` by default, or `responses`). Then:
 
-Profiles can point at any service that exposes a legitimate device-code flow.
-The shipped example is intentionally generic; it contains no named tool or
-provider.
+```sh
+minimalrouter oauth myprovider     # prints a URL + code, waits for approval
+minimalrouter oauth list           # profile + connected state
+minimalrouter oauth rm myprovider  # remove profile and its token
+```
+
+**By hand:** copy `~/.minimalrouter/oauth-providers.example.json` to
+`~/.minimalrouter/oauth-providers.json` and edit the `profiles` object. Same
+fields as the prompts above.
+
+Profile fields:
+
+| Field | Meaning |
+|---|---|
+| `authorize_url` | device-code endpoint that returns a code and a verification URL |
+| `token_url` | endpoint polled with `device_code` until it returns an access token |
+| `refresh_url` | optional; called with the refresh token when the access token expires |
+| `base_url` | OpenAI-compatible base for chat requests |
+| `models` | list of model ids, or objects with `model` + `aliases` |
+| `api_mode` | `chat_completions` (default) or `responses` for Responses-style upstreams |
+| `headers` | optional extra headers; `{token}` is replaced at request time |
+| `authorize_body` | optional extra JSON sent to `authorize_url` |
+
+Tokens land in `~/.minimalrouter/oauth.json` (mode 600, gitignored) and the
+profile's models appear in `/v1/models`. Expired tokens are refreshed on demand
+through `refresh_url`. Rows that come from a profile are never written into
+`rows.json`; delete the profile to remove them.
 
 Claude Code is the one notable format exception: it speaks the Anthropic
 `/v1/messages` format, which this router does not serve. Pointing Claude Code at
 it will fail with 404. Use an Anthropic-format router for that client, or wait
 for the shim on the roadmap.
 
-Because the server binds `127.0.0.1` and has no auth, it is reachable only from
-your own machine. Do not expose it to a network.
+Because the server binds `127.0.0.1` and has no server auth, it is reachable only from
+your own machine. Do not expose it to a network. OAuth tokens stay in
+`~/.minimalrouter/oauth.json` (600) and never enter the repo.
 
 OAuth-backed rows use the saved access token and rotate it when the profile
 provides a refresh endpoint. A background refresh scheduler is still a
@@ -313,6 +329,7 @@ rm -rf ~/.minimalrouter
 
 - Anthropic `/v1/messages` shim so Claude Code can use the pool
 - a systemd user unit for always-on use
+- a background token-refresh scheduler
 - weights or latency-based chain ordering
 - a config flag for per-row concurrency limits
 
