@@ -14,16 +14,15 @@
       "label": "Kilo Code",
       "base_url": "https://api.kilo.ai/api/openrouter",
       "models": [
-        "kilo-auto/efficient",
         "kilo-auto/free",
+        "kilo-auto/efficient",
         "nvidia/nemotron-3.5-super-vl:free",
-        "inclusionai/ling-3.2-flash:free",
-        "baidu/ernie-5.5-flash-preview:free",
-        "liquid/lfm-3-1.7b:free"
+        "inclusionai/ling-3.2-flash:free"
       ],
       "authorize_url": "https://api.kilo.ai/api/device-auth/codes",
       "token_url": "https://api.kilo.ai/api/device-auth/codes",
-      "poll_method": "GET"
+      "poll_method": "GET",
+      "note": "Free models also work with NO auth as a plain row: base https://api.kilo.ai/api/openrouter, model kilo-auto/free. Alt gateway: https://ai-gateway.kilo.ai/api/v1 (also verified)."
     },
     "omnirush": {
       "label": "OmniRush",
@@ -31,7 +30,29 @@
       "models": [],
       "api_mode": "responses",
       "authorize_url": "https://omnirush.ai/omnirush/device/authorize",
-      "token_url": "https://omnirush.ai/omnirush/device/token"
+      "token_url": "https://omnirush.ai/omnirush/device/token",
+      "routable": false,
+      "note": "Login flow works, but the server runs a mandatory-update gate on every model call (X-OmniRush-Client) and signs out devices whose tokens look shared. Treat as not routable through a generic router."
+    },
+    "opencode": {
+      "label": "OpenCode",
+      "base_url": "https://opencode.ai/inference/openai/v1",
+      "models": [
+        "big-pickle",
+        "deepseek-v4.1-flash-free",
+        "glm-5.3-flash-free"
+      ],
+      "authorize_url": "https://opencode.ai/console/auth/device/code",
+      "token_url": "https://opencode.ai/console/auth/device/token",
+      "token_body": {
+        "client_id": "opencode-cli",
+        "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+        "device_code": "{device_code}"
+      },
+      "authorize_body": {
+        "client_id": "opencode-cli"
+      },
+      "note": "Device flow verified live. Free Zen models are client-locked to OpenCode itself (429 FreeUsageLimitError from other clients); paid models and OpenCode Go work from any client."
     }
   }
 }

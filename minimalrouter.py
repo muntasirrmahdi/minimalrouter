@@ -880,12 +880,26 @@ def oauth_device_start(provider):
 def oauth_start(provider):
     try:
         d = oauth_device_start(provider)
+        url = (d.get("verification_uri_complete") or d.get("verification_uri")
+               or d.get("verificationUrl") or "")
+        if url.startswith("/"):
+            spec = read_oauth_profiles().get(provider, {})
+            url = _origin(spec.get("authorize_url", "")) + url
         return {"device_code": d.get("device_code") or d.get("code"),
                 "user_code": d.get("user_code") or d.get("code", ""),
-                "url": d.get("verification_uri_complete") or d.get("verification_uri") or d.get("verificationUrl"),
+                "url": url,
                 "interval": d.get("interval", 5), "expires": d.get("expires_in", 600)}
     except Exception as e:
         raise RuntimeError("OAuth start failed for %s: %s" % (provider, e))
+
+
+def _render_body(body, device_code):
+    """Substitute {device_code} in static request bodies from a profile."""
+    out = {}
+    for k, v in (body or {}).items():
+        out[k] = (v.replace("{device_code}", str(device_code))
+                  if isinstance(v, str) else v)
+    return out
 
 
 def oauth_poll(provider, flow):
@@ -894,7 +908,8 @@ def oauth_poll(provider, flow):
     deadline = time.time() + float(flow.get("expires", 600))
     poll_url = spec.get("token_url", "")
     method = spec.get("poll_method", "POST").upper()
-    body = dict(spec.get("token_body") or {"device_code": flow["device_code"]})
+    body = _render_body(spec.get("token_body") or
+                        {"device_code": flow["device_code"]}, flow["device_code"])
     interval = float(flow.get("interval", 5) or 5)
     last_msg = ""
     while time.time() < deadline:
@@ -1482,6 +1497,9 @@ def main():
                 spec["api_mode"] = api_mode
             if entry.get("poll_method"):
                 spec["poll_method"] = entry["poll_method"]
+            for k in ("token_body", "authorize_body", "headers"):
+                if entry.get(k):
+                    spec[k] = entry[k]
             profiles[pid] = spec
             write_oauth_profiles(profiles)
             # Remember name -> endpoints so the next add is a single word.
