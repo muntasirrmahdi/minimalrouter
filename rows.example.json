@@ -1,0 +1,26 @@
+[
+  {
+    "name": "groq-qwen3.8-27b",
+    "base": "https://api.groq.com/openai/v1",
+    "model": "qwen/qwen3.8-27b",
+    "key_env": "GROQ_API_KEY"
+  },
+  {
+    "name": "groq-gpt-oss-20b",
+    "base": "https://api.groq.com/openai/v1",
+    "model": "openai/gpt-oss-20b",
+    "key_env": "GROQ_API_KEY"
+  },
+  {
+    "name": "openrouter-free",
+    "base": "https://openrouter.ai/api/v1",
+    "model": "nvidia/nemotron-3.5-super-vl:free",
+    "key_env": "OPENROUTER_API_KEY"
+  },
+  {
+    "name": "pollinations-openai-fast",
+    "base": "https://text.pollinations.ai/openai",
+    "model": "openai-fast",
+    "key_env": ""
+  }
+]

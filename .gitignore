@@ -1,0 +1,11 @@
+# local state and secrets
+rows.json
+*.log
+__pycache__/
+*.pyc
+
+# editors
+.vscode/
+.idea/
+*.swp
+.DS_Store
