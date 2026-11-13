@@ -26,6 +26,7 @@ import json
 import os
 import sys
 import time
+import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -69,11 +70,62 @@ def load_env():
 
 ENV = load_env()
 
+OAUTH_PATH = os.path.join(MR_HOME, "oauth.json")
+OMNI_CLIENT_VERSION = os.environ.get("MINIMALROUTER_OMNI_CLIENT_VERSION", "2.9.4")
+OAUTH_PROVIDERS = {
+    "dl": {
+        "label": "Directionally Local",
+        "base": "https://free.directionallylocal.com/v1",
+        "models": [
+            ("gpt-6-luna", ["d1/gpt-6-luna"]),
+            ("gpt-6.1-sol", ["d1/gpt-6.1-sol"]),
+            ("gpt-6-astra", ["d1/gpt-6-astra"]),
+            ("deepseek/deepseek-v4.1-flash-1017", ["d1/deepseek/deepseek-v4.1-flash-1017"]),
+        ],
+    },
+    "omnirush": {
+        "label": "OmniRush",
+        "base": "https://omnirush.ai/omnirush/v1",
+        "models": [
+            ("gpt-6-astra", ["omni/gpt-6-astra"]),
+            ("gpt-6.1-sol", ["omni/gpt-6.1-sol"]),
+            ("gpt-6-sol", ["omni/gpt-6-sol"]),
+        ],
+    },
+    "kilocode": {
+        "label": "Kilo Code",
+        "base": "https://api.kilo.ai/api/openrouter",
+        "models": [("kilo-auto/free", ["kilo/free"])],
+    },
+}
+
 
 def log(msg):
     try:
         with open(LOG_PATH, "a") as f:
             f.write("[%s] %s\n" % (time.strftime("%F %T"), msg))
+    except OSError:
+        pass
+
+
+def read_oauth():
+    try:
+        with open(OAUTH_PATH) as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def write_oauth(data):
+    os.makedirs(MR_HOME, exist_ok=True)
+    tmp = OAUTH_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=1)
+        f.write("\n")
+    os.replace(tmp, OAUTH_PATH)
+    try:
+        os.chmod(OAUTH_PATH, 0o600)
     except OSError:
         pass
 
@@ -84,6 +136,24 @@ def read_rows():
     for r in rows:
         r["key"] = r.get("key") or ENV.get(r.get("key_env", ""), "")
     return rows
+
+
+def oauth_rows():
+    rows = []
+    auth = read_oauth()
+    for provider, spec in OAUTH_PROVIDERS.items():
+        token = (auth.get(provider) or {}).get("access_token", "")
+        for model, aliases in spec["models"]:
+            rows.append({"name": "%s-%s" % (provider, model.replace("/", "-")),
+                         "base": spec["base"], "model": model,
+                         "aliases": aliases, "key": token,
+                         "oauth_provider": provider,
+                         "oauth_label": spec["label"]})
+    return rows
+
+
+def all_rows():
+    return read_rows() + oauth_rows()
 
 
 def write_rows(rows):
@@ -107,7 +177,12 @@ def ep(base, path):
     return b + path
 
 
-def upstream(base, key, path, payload=None, timeout=TIMEOUT):
+def upstream(base, key, path, payload=None, timeout=TIMEOUT, row=None):
+    # OAuth rows may require provider-specific client headers.
+    row = row or {}
+    provider = row.get("oauth_provider", "")
+    if provider == "omnirush" and path == "/v1/chat/completions":
+        return oauth_chat(row, payload, timeout)
     url = ep(base, path)
     data = json.dumps(payload).encode() if payload is not None else None
     req = urllib.request.Request(url, data=data,
@@ -116,7 +191,32 @@ def upstream(base, key, path, payload=None, timeout=TIMEOUT):
     if data is not None:
         req.add_header("Content-Type", "application/json")
     if key:
-        req.add_header("Authorization", "Bearer " + key)
+        for hk, hv in oauth_headers(provider, key, row.get("org_id", "")).items():
+            req.add_header(hk, hv)
+    return urllib.request.urlopen(req, timeout=timeout)
+
+
+def oauth_chat(row, payload, timeout=TIMEOUT):
+    """Translate our Chat Completions request to OmniRush Responses."""
+    base = row["base"].rstrip("/")
+    token = row.get("key", "")
+    messages = payload.get("messages", [])
+    system = "\n".join(str(m.get("content", "")) for m in messages
+                        if m.get("role") == "system")
+    inp = [{"role": "user" if m.get("role") == "user" else "assistant",
+            "content": str(m.get("content", ""))}
+           for m in messages if m.get("role") != "system"]
+    body = {"model": payload.get("model", ""), "input": inp,
+            "stream": bool(payload.get("stream", False))}
+    if system:
+        body["instructions"] = system
+    if payload.get("max_tokens") is not None:
+        body["max_output_tokens"] = payload["max_tokens"]
+    req = urllib.request.Request(ep(base, "/v1/responses"),
+                                 data=json.dumps(body).encode(), method="POST")
+    req.add_header("Content-Type", "application/json")
+    for hk, hv in oauth_headers("omnirush", token).items():
+        req.add_header(hk, hv)
     return urllib.request.urlopen(req, timeout=timeout)
 
 
@@ -128,7 +228,7 @@ def probe(base, key, model):
                              "content": "Reply with exactly: OK"}]}
     try:
         resp = upstream(base, key, "/v1/chat/completions", payload,
-                        timeout=PROBE_TIMEOUT)
+                        timeout=PROBE_TIMEOUT, row={"oauth_provider": ""})
         body = json.loads(resp.read() or b"{}")
         ms = (time.time() - t0) * 1000
         if not isinstance(body, dict) or "choices" not in body:
@@ -204,23 +304,33 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         p = self.path.split("?")[0]
+        if p == "/api/oauth/providers":
+            return self._send(200, {"providers": [{"id": k, "label": v["label"],
+                "models": [m for m, _ in v["models"]]} for k, v in OAUTH_PROVIDERS.items()]})
+        if p == "/api/oauth/status":
+            auth = read_oauth()
+            return self._send(200, {"providers": [{"id": k, "label": v["label"],
+                "connected": bool((auth.get(k) or {}).get("access_token")),
+                "models": [m for m, _ in v["models"]]} for k, v in OAUTH_PROVIDERS.items()]})
+        if p == "/api/oauth/start":
+            return self._send(405, {"error": "OAuth is terminal-only. Run: minimalrouter oauth <dl|omnirush|kilocode>"})
         if p == "/":
             msg = ("MinimalRouter — terminal UI: run `minimalrouter`\n"
                    "API: POST http://%s:%d/v1/chat/completions\n"
                    % (HOST, PORT))
             return self._send(200, raw=msg.encode(), ctype="text/plain")
         if p == "/health":
-            rows = read_rows()
+            rows = all_rows()
             return self._send(200, {"ok": True, "rows": len(rows),
                                     "models": len(BY_MODEL(rows)),
                                     "port": PORT})
         if p == "/api/state":
-            rows = read_rows()
+            rows = all_rows()
             return self._send(200, {"rows": state_for(rows),
                                     "models": len(BY_MODEL(rows)),
                                     "port": PORT})
         if p in ("/v1/models", "/models"):
-            bm = BY_MODEL(read_rows())
+            bm = BY_MODEL(all_rows())
             return self._send(200, {"object": "list", "data": [
                 {"id": i, "object": "model", "owned_by": "minimalrouter"}
                 for i in sorted(bm)]})
@@ -240,7 +350,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(400, {"error": "base + model required"})
             with ROW_LOCK:
                 try:
-                    known = read_rows()
+                    known = all_rows()
                 except Exception:
                     known = []
             match = None
@@ -291,7 +401,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(400, {"ok": False,
                                         "error": "test failed: %s" % err})
             with ROW_LOCK:
-                rows = read_rows()
+                rows = all_rows()
                 while any(r["name"] == name for r in rows):
                     name, i = "%s-%d" % (name, i), i + 1
                 rows.append({"name": name, "base": base, "model": model,
@@ -304,7 +414,7 @@ class Handler(BaseHTTPRequestHandler):
         if p == "/api/remove":
             name = body.get("name", "")
             with ROW_LOCK:
-                rows = read_rows()
+                rows = all_rows()
                 kept = [r for r in rows if r["name"] != name]
                 if len(kept) == len(rows):
                     return self._send(404, {"error": "no such row"})
@@ -314,7 +424,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {"ok": True})
 
         if p in ("/v1/chat/completions", "/chat/completions"):
-            bm = BY_MODEL(read_rows())
+            bm = BY_MODEL(all_rows())
             model = body.get("model", "")
             stream = bool(body.get("stream", False))
             chain = bm.get(model)
@@ -327,7 +437,7 @@ class Handler(BaseHTTPRequestHandler):
                 t0 = time.time()
                 try:
                     resp = upstream(row["base"], row["key"],
-                                    "/v1/chat/completions", body)
+                                    "/v1/chat/completions", body, row=row)
                     if stream:
                         self.send_response(200)
                         self.send_header("Content-Type",
@@ -434,6 +544,100 @@ def _age(ts):
     if d < 5400:
         return "%dm" % (d // 60)
     return "%dh" % (d // 3600)
+
+
+def oauth_headers(provider, token, org_id=""):
+    h = {"Authorization": "Bearer " + token, "User-Agent": UA}
+    if provider == "omnirush":
+        h.update({"User-Agent": "omnirush", "X-OmniRush-Client": "cli/" + OMNI_CLIENT_VERSION})
+    if provider == "kilocode" and org_id:
+        h["X-Kilocode-OrganizationID"] = org_id
+    return h
+
+
+def oauth_post(url, provider, token, payload, org_id="", timeout=TIMEOUT):
+    req = urllib.request.Request(url, data=json.dumps(payload).encode(), method="POST")
+    req.add_header("Content-Type", "application/json")
+    req.add_header("Accept", "application/json")
+    for k, v in oauth_headers(provider, token, org_id).items():
+        req.add_header(k, v)
+    return urllib.request.urlopen(req, timeout=timeout)
+
+
+def oauth_device_start(provider):
+    spec = OAUTH_PROVIDERS[provider]
+    if provider == "dl":
+        url = spec["base"] + "/device/code"
+        return oauth_post(url, provider, "", {})
+    if provider == "omnirush":
+        url = spec["base"].replace("/v1", "") + "/device/authorize"
+        return oauth_post(url, provider, "", {"device_name": "minimalrouter", "platform": sys.platform})
+    if provider == "kilocode":
+        return oauth_post("https://api.kilo.ai/api/device-auth/codes", provider, "", {})
+    raise ValueError("unknown OAuth provider")
+
+
+def oauth_start(provider):
+    try:
+        res = oauth_device_start(provider)
+        d = json.loads(res.read() or b"{}")
+        if provider == "dl":
+            return {"device_code": d["device_code"], "user_code": d["user_code"],
+                    "url": d.get("verification_uri_complete") or d["verification_uri"],
+                    "interval": d.get("interval", 5), "expires": d.get("expires_in", 600)}
+        if provider == "omnirush":
+            return {"device_code": d["device_code"], "user_code": d.get("user_code", ""),
+                    "url": d.get("verification_uri_complete") or d.get("verification_uri"),
+                    "interval": d.get("interval", 5), "expires": d.get("expires_in", 600)}
+        return {"device_code": d.get("code"), "user_code": d.get("code"),
+                "url": d.get("verificationUrl"), "interval": 3, "expires": 300}
+    except Exception as e:
+        raise RuntimeError("OAuth start failed for %s: %s" % (provider, e))
+
+
+def oauth_poll(provider, flow):
+    deadline = time.time() + flow["expires"]
+    while time.time() < deadline:
+        time.sleep(flow["interval"])
+        try:
+            if provider == "dl":
+                url = OAUTH_PROVIDERS[provider]["base"] + "/device/token"
+                res = oauth_post(url, provider, "", {"device_code": flow["device_code"]})
+                d = json.loads(res.read() or b"{}")
+                if d.get("access_token"):
+                    return {"access_token": d["access_token"], "refresh_token": d.get("refresh_token", "")}
+                if d.get("error") not in ("authorization_pending", "slow_down"):
+                    raise RuntimeError(d.get("error_description", d.get("error", "OAuth failed")))
+            elif provider == "omnirush":
+                url = OAUTH_PROVIDERS[provider]["base"].replace("/v1", "") + "/device/token"
+                res = oauth_post(url, provider, "", {"device_code": flow["device_code"]})
+                d = json.loads(res.read() or b"{}")
+                if d.get("access_token"):
+                    return {"access_token": d["access_token"], "refresh_token": d.get("refresh_token", "")}
+                if d.get("error") not in ("authorization_pending", "slow_down"):
+                    raise RuntimeError(d.get("error_description", d.get("error", "OAuth failed")))
+            else:
+                url = "https://api.kilo.ai/api/device-auth/codes/" + urllib.parse.quote(flow["device_code"], safe="")
+                req = urllib.request.Request(url, headers={"User-Agent": UA})
+                res = urllib.request.urlopen(req, timeout=30)
+                d = json.loads(res.read() or b"{}")
+                if d.get("status") == "approved" and d.get("token"):
+                    profile = {}
+                    try:
+                        req2 = urllib.request.Request("https://api.kilo.ai/api/profile",
+                            headers={"Authorization": "Bearer " + d["token"], "User-Agent": UA})
+                        profile = json.loads(urllib.request.urlopen(req2, timeout=20).read() or b"{}")
+                    except Exception:
+                        pass
+                    return {"access_token": d["token"], "refresh_token": "",
+                            "org_id": (profile.get("organizations") or [{}])[0].get("id", "")}
+        except urllib.error.HTTPError as e:
+            if e.code in (202, 403, 410):
+                if e.code == 403: raise RuntimeError("OAuth denied")
+                continue
+            if e.code >= 500: continue
+            raise
+    raise RuntimeError("OAuth expired before approval")
 
 
 def _curses_main(stdscr, port):
@@ -787,6 +991,28 @@ def main():
     if args and args[0].lower() in ("-v", "--version", "version"):
         print("minimalrouter 1.0")
         return 0
+    if args and args[0].lower() == "oauth":
+        if len(args) != 2 or args[1] not in OAUTH_PROVIDERS:
+            print("Usage: minimalrouter oauth <dl|omnirush|kilocode>")
+            return 2
+        provider = args[1]
+        print("Starting %s OAuth device flow..." % OAUTH_PROVIDERS[provider]["label"])
+        try:
+            flow = oauth_start(provider)
+            print("Open this URL in your browser:\n  %s" % flow["url"])
+            if flow.get("user_code"):
+                print("Code: %s" % flow["user_code"])
+            print("Waiting for approval (tokens are stored only in ~/.minimalrouter/oauth.json)...")
+            token = oauth_poll(provider, flow)
+            auth = read_oauth()
+            auth[provider] = token
+            write_oauth(auth)
+            print("OAuth connected: %s" % OAUTH_PROVIDERS[provider]["label"])
+            print("Models are now exposed through MinimalRouter; start `minimalrouter serve`.")
+            return 0
+        except Exception as e:
+            print("OAuth failed: %s" % e)
+            return 1
     mode = args[0] if args else "tui"
     if mode not in ("tui", "serve"):
         print("minimalrouter: unknown command %r\n" % mode)

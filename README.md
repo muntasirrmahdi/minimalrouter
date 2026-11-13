@@ -223,13 +223,41 @@ custom_providers:
     model: "qwen/qwen3.8-27b"
 ```
 
-Claude Code is the one notable exception: it speaks the Anthropic
+## OAuth providers
+
+MinimalRouter can hold OAuth-backed coding-tool connections as first-class
+rows. Tokens live only in `~/.minimalrouter/oauth.json` (mode 600), never in
+the repository or `rows.json`.
+
+```sh
+minimalrouter oauth dl          # Directionally Local device OAuth
+minimalrouter oauth omnirush    # OmniRush device OAuth + Responses translation
+minimalrouter oauth kilocode    # Kilo Code device OAuth
+```
+
+The command prints a browser URL and code, waits for approval, then exposes
+provider aliases through `/v1/models`:
+
+| Provider | Alias example | Limit |
+|---|---|---|
+| Directionally Local | `d1/gpt-6-luna` | OAuth free tier; official-client restrictions may apply |
+| OmniRush | `omni/gpt-6-astra` | Responses-only upstream; MinimalRouter translates at its boundary |
+| Kilo Code | `kilo/free` | OAuth free tier; organization id attached when returned |
+
+This uses the providers' documented device login for your own account. It is
+not a token-harvesting workaround. Provider terms and account restrictions
+still apply.
+
+Claude Code is the one notable format exception: it speaks the Anthropic
 `/v1/messages` format, which this router does not serve. Pointing Claude Code at
 it will fail with 404. Use an Anthropic-format router for that client, or wait
 for the shim on the roadmap.
 
 Because the server binds `127.0.0.1` and has no auth, it is reachable only from
 your own machine. Do not expose it to a network.
+
+OAuth-backed rows currently use the saved access token; rotating refresh-token
+exchanges and background refresh schedulers remain a follow-up.
 
 ## Troubleshooting
 
