@@ -232,30 +232,42 @@ custom_providers:
 
 ## OAuth providers
 
-The router ships **no** provider profiles and never names a specific tool. You
-create a profile for whatever service you want, then sign in to it. Two ways:
+Adding an OAuth-backed CLI tool is one word when the tool is known, and a short
+guided prompt when it is new. Two paths:
 
-**Easiest — paste the base URL and it finds the rest:**
+**Known tool — type the name:**
 
 ```sh
-minimalrouter oauth add
+minimalrouter oauth add          # then type the tool's name
 ```
 
-It asks for a profile id, a label, and the base URL (the same one you would use
-for chat). It then probes the host's OIDC discovery document and the usual
-device-auth paths, and accepts an authorize endpoint **only when the server
-actually returns a device code for it**; the token endpoint is confirmed by the
-way it answers that code. You see the endpoints it found and confirm them.
-
-If nothing answers, it asks for the authorize and token URLs, so a provider that
-follows no convention is still addable — nothing is ever locked out by a
-built-in list. Then:
+If the tool is in `provider-registry.json`, the base URL and models are
+pre-filled; the router then auto-discovers the device login endpoints, you
+confirm, and you're connected:
 
 ```sh
 minimalrouter oauth myprovider     # prints a URL + code, waits for approval
 minimalrouter oauth list           # profile + connected state
 minimalrouter oauth rm myprovider  # remove profile and its token
 ```
+
+**New tool — paste the base URL once:**
+
+If the name is not in the registry yet, the same command asks for the base URL
+(the one you would use for chat). The router probes the host's OIDC discovery
+document and the usual device-auth paths, and accepts an authorize endpoint
+**only when the server actually returns a device code for it**; the token
+endpoint is confirmed by the way it answers that code. You see what it found
+and confirm. If nothing answers, it asks for the authorize and token URLs, so a
+provider that follows no convention is still addable — nothing is locked out.
+
+The name, base URL and models are then **remembered in
+`~/.minimalrouter/provider-registry.json`**, so the next add of the same tool
+is a single word. The registry is data, not a whitelist: append an entry by
+hand or pull request and the tool becomes one-word-connectable for everyone.
+The repo ships a seed registry; entries are kept minimal (`label`, `base_url`,
+`models`, optional `api_mode`) because the login endpoints are discovered live,
+not frozen in the file.
 
 **By hand:** copy `~/.minimalrouter/oauth-providers.example.json` to
 `~/.minimalrouter/oauth-providers.json` and edit the `profiles` object. Same
@@ -318,6 +330,7 @@ and the resulting token is stored locally.
 ~/.minimalrouter/rows.json           your rows (chmod 600)
 ~/.minimalrouter/rows.example.json          template copied on first install
 ~/.minimalrouter/oauth-providers.example.json generic OAuth profile template
+~/.minimalrouter/provider-registry.json     name -> base URL/model map (seeded on install)
 ~/.minimalrouter/oauth-providers.json        optional personal provider profiles
 ~/.minimalrouter/oauth.json                   local OAuth tokens (chmod 600)
 ~/.minimalrouter/minimalrouter.log            per-request OK/FAIL log

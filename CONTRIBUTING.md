@@ -9,8 +9,11 @@ Small, focused changes are welcome.
 - The server stays bound to `127.0.0.1` and stays unauthenticated as a server.
   Provider logins are OAuth device flows, stored outside the repo.
 - No web UI and no desktop wrapper. The dashboard is the terminal.
-- OAuth support must stay generic: no provider names or endpoints hardcoded in
-  the source, example profile, or defaults.
+- OAuth support stays generic in CODE: no provider-specific logic, parsing or
+  endpoints hardcoded in `minimalrouter.py`. `provider-registry.json` is the
+  one allowed place where named tools live, because it is data, not logic —
+  and entries there must keep endpoints out of the file (they are discovered
+  live).
 - Keep the code readable: no clever abstractions for a 1,200-line file.
 
 ## Before you open a pull request
