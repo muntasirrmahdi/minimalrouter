@@ -93,18 +93,21 @@ Add your first provider:
 4. The model list is fetched from the provider: type to filter, Enter to pick
 5. The row is tested; it is saved only if the test passes
 
-For OAuth-backed coding tools, use the terminal device flow instead:
+For any OAuth-backed provider, put its device-flow profile in
+`~/.minimalrouter/oauth-providers.json` (copy the shipped
+`oauth-providers.example.json`), then run:
 
 ```sh
-minimalrouter oauth dl          # Directionally Local
-minimalrouter oauth omnirush    # OmniRush
-minimalrouter oauth kilocode    # Kilo Code
+minimalrouter oauth <profile-id>
 ```
 
 The command prints a provider-generated browser URL and code, waits for your
 approval, stores the returned token in `~/.minimalrouter/oauth.json` (chmod 600),
-and exposes the provider's aliases through `/v1/models`. It does not copy your
-existing 9Router tokens or read another app's credential store.
+and exposes the provider's aliases through `/v1/models`. There are **no tool
+names or provider accounts in the default configuration**. The OAuth layer is
+generic: base URL, device authorize/token/refresh URLs, models, aliases and
+optional headers all come from your profile. It does not copy another app's
+credentials.
 
 Press `t` to re-test the selected row at any time. Press `q` to quit.
 
@@ -251,15 +254,9 @@ minimalrouter oauth kilocode    # Kilo Code device OAuth
 The command prints a browser URL and code, waits for approval, then exposes
 provider aliases through `/v1/models`:
 
-| Provider | Alias example | Limit |
-|---|---|---|
-| Directionally Local | `d1/gpt-6-luna` | OAuth free tier; official-client restrictions may apply |
-| OmniRush | `omni/gpt-6-astra` | Responses-only upstream; MinimalRouter translates at its boundary |
-| Kilo Code | `kilo/free` | OAuth free tier; organization id attached when returned |
-
-This uses the providers' documented device login for your own account. It is
-not a token-harvesting workaround. Provider terms and account restrictions
-still apply.
+Profiles can point at any service that exposes a legitimate device-code flow.
+The shipped example is intentionally generic; it contains no named tool or
+provider.
 
 Claude Code is the one notable format exception: it speaks the Anthropic
 `/v1/messages` format, which this router does not serve. Pointing Claude Code at
@@ -269,8 +266,14 @@ for the shim on the roadmap.
 Because the server binds `127.0.0.1` and has no auth, it is reachable only from
 your own machine. Do not expose it to a network.
 
-OAuth-backed rows currently use the saved access token; rotating refresh-token
-exchanges and background refresh schedulers remain a follow-up.
+OAuth-backed rows use the saved access token and rotate it when the profile
+provides a refresh endpoint. A background refresh scheduler is still a
+follow-up; requests refresh on demand.
+
+Security boundary: MinimalRouter deliberately does not auto-import tokens from
+another app's credential store. Connect an account through
+`minimalrouter oauth <provider>` so the provider's own device flow is visible
+and the resulting token is stored locally.
 
 ## Troubleshooting
 
@@ -291,9 +294,12 @@ exchanges and background refresh schedulers remain a follow-up.
 ```
 ~/.minimalrouter/minimalrouter.py    the whole tool
 ~/.minimalrouter/rows.json           your rows (chmod 600)
-~/.minimalrouter/rows.example.json   template copied on first install
-~/.minimalrouter/minimalrouter.log   per-request OK/FAIL log
-~/.local/bin/minimalrouter           launcher
+~/.minimalrouter/rows.example.json          template copied on first install
+~/.minimalrouter/oauth-providers.example.json generic OAuth profile template
+~/.minimalrouter/oauth-providers.json        optional personal provider profiles
+~/.minimalrouter/oauth.json                   local OAuth tokens (chmod 600)
+~/.minimalrouter/minimalrouter.log            per-request OK/FAIL log
+~/.local/bin/minimalrouter                    launcher
 ```
 
 ## Uninstall

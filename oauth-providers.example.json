@@ -1,0 +1,17 @@
+{
+  "profiles": {
+    "your-provider": {
+      "label": "Your Provider",
+      "authorize_url": "https://provider.example.com/oauth/device/authorize",
+      "token_url": "https://provider.example.com/oauth/device/token",
+      "refresh_url": "https://provider.example.com/oauth/device/refresh",
+      "base_url": "https://provider.example.com/v1",
+      "models": [
+        {"model": "provider/model", "aliases": ["provider/free-model"]}
+      ],
+      "authorize_body": {"device_name": "minimalrouter"},
+      "headers": {},
+      "refresh_body": {"refresh_token": "{refresh_token}"}
+    }
+  }
+}

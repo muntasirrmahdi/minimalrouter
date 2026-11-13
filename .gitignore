@@ -1,6 +1,7 @@
 # local state and secrets
 rows.json
 oauth.json
+oauth-providers.json
 *.log
 __pycache__/
 *.pyc

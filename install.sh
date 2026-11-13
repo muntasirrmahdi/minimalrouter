@@ -43,6 +43,7 @@ fetch() {
 
 fetch minimalrouter.py
 fetch rows.example.json
+fetch oauth-providers.example.json
 chmod 600 "$DEST/minimalrouter.py" 2>/dev/null || true
 # Existing users get the new OAuth-capable code, but their personal rows stay untouched.
 if [ -f "$DEST/oauth.json" ]; then chmod 600 "$DEST/oauth.json"; fi
@@ -52,6 +53,7 @@ if [ ! -f "$DEST/rows.json" ]; then
     say "seeded $DEST/rows.json from the example rows"
 fi
 chmod 600 "$DEST/rows.json"
+if [ -f "$DEST/oauth.json" ]; then chmod 600 "$DEST/oauth.json"; fi
 
 # ---- launcher --------------------------------------------------------------
 printf '#!/bin/sh\nexec python3 "%s/minimalrouter.py" "$@"\n' "$DEST" > "$BIN/minimalrouter"
