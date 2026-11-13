@@ -288,6 +288,8 @@ Profile fields:
 | `api_mode` | `chat_completions` (default) or `responses` for Responses-style upstreams |
 | `headers` | optional extra headers; `{token}` is replaced at request time |
 | `authorize_body` | optional extra JSON sent to `authorize_url` |
+| `token_body` | optional static poll body; `{device_code}` is replaced at poll time |
+| `poll_method` | `POST` (default) or `GET`; GET appends `/<device_code>` to `token_url` |
 
 Tokens land in `~/.minimalrouter/oauth.json` (mode 600, gitignored) and the
 profile's models appear in `/v1/models`. Expired tokens are refreshed on demand
