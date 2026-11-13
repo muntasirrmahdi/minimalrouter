@@ -265,9 +265,11 @@ The name, base URL and models are then **remembered in
 `~/.minimalrouter/provider-registry.json`**, so the next add of the same tool
 is a single word. The registry is data, not a whitelist: append an entry by
 hand or pull request and the tool becomes one-word-connectable for everyone.
-The repo ships a seed registry; entries are kept minimal (`label`, `base_url`,
-`models`, optional `api_mode`) because the login endpoints are discovered live,
-not frozen in the file.
+The repo ships a seed registry; entries are usually minimal (`label`,
+`base_url`, `models`, optional `api_mode`) because the login endpoints are
+discovered live. When a provider's device flow does not follow a convention, the
+entry may also carry curated `authorize_url` / `token_url` / `poll_method`
+values; those override discovery and are still data, not code.
 
 **By hand:** copy `~/.minimalrouter/oauth-providers.example.json` to
 `~/.minimalrouter/oauth-providers.json` and edit the `profiles` object. Same
