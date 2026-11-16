@@ -1,35 +1,34 @@
 # MinimalRouter
 
 One OpenAI-compatible endpoint over as many API providers as you want, with a
-terminal dashboard. One file, Python standard library only, no dependencies,
-no server authentication, localhost only. Provider logins (OAuth device flow)
-are supported through profiles.
+terminal dashboard. One Python file, Python standard library only, no server
+authentication, localhost only. Provider logins (OAuth device flow) are supported
+through profiles.
 
 Free tiers are scattered across a dozen providers: each has its own base URL,
 its own key, its own rate limit, and its own way of dying quietly. MinimalRouter
 puts them behind a single endpoint, keeps trying the next one when a row fails,
-and shows you the state of every row in your terminal.
+and shows you the state of every provider in your terminal.
 
 ```
- MINIMALROUTER  |  http://127.0.0.1:8790/v1  |  8 rows  8 models  |  up 4m12s  |  no server auth / localhost only
-   NAME                        MODEL                          HOST               LAT      LAST
-------------------------------------------------------------------------------------------------------
- > * groq-qwen3.8-27b          qwen/qwen3.8-27b                api.groq.com      343ms     0s
-   * groq-gpt-oss-20b          openai/gpt-oss-20b              api.groq.com      417ms     1m
-   * or-nemotron-free          nvidia/nemotron-3.5-super-vl:free openrouter.ai   816ms     1m
-   * pollinations-openai-fast  openai-fast                     text.pollinations. 4.2s     2m
-   o or-gemma-free             google/gemma-4-31b-it:free      openrouter.ai      -       -
-|- SELECTED --------------------------------------------------------------------------------------------
- name   groq-qwen3.8-27b
- model  qwen/qwen3.8-27b
+ MINIMALROUTER  |  http://127.0.0.1:8790/v1  |  3 providers  5 models  |  up 4m12s  |  no server auth / localhost only
+   PROVIDER                     MODELS / AUTH                        HOST                       LAT      LAST
+├─ PROVIDERS ────────────────────────────────────────────────────────────────────────────────────────────────────┤
+ ▶ ● Groq                       2 models / API                        api.groq.com              343ms     0s
+   ● OpenRouter                 2 models / API                        openrouter.ai             816ms     1m
+   ● Pollinations               1 model / API                         text.pollinations.       4.2s     2m
+├─ SELECTED ─────────────────────────────────────────────────────────────────────────────────────────────────────┤
+ name   Groq
+ models 2 / API
  base   https://api.groq.com/openai/v1
- key    env:GROQ_API_KEY
+ auth   API provider
  state  OK  343ms  last 0s
  error  -
-|- EVENTS ----------------------------------------------------------------------------------------------
- OK  qwen/qwen3.8-27b via groq-qwen3.8-27b 0.3s
- FAIL google/gemma-4-31b-it:free via or-gemma-free: HTTP Error 429 (1.0s) -> next
- up/down select  t test  a add  d delete  r refresh  q quit (stops server)  Esc cancel
+├─ EVENTS ───────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  OK  qwen/qwen3.8-27b via groq-qwen3.8-27b 0.3s
+  FAIL google/gemma-4-31b-it:free via or-gemma-free: HTTP Error 429 (1.0s) -> next
+ ready - press a to add a provider, t to test the selected one
+ ↑↓ select | ENTER models | A add | L login | D delete | R refresh | Q quit
 ```
 
 ## Why
@@ -41,11 +40,33 @@ endpoints and no single place to use them. MinimalRouter gives you:
 - **ordered fallback** per model: 401, 402, 403, 429, 5xx and timeouts move to
   the next row automatically
 - **a live view** of what is alive, how fast, and why something failed
-- **an add flow in three keystrokes** that tests before it saves
+- **provider management in the dashboard**: add a key, sign in with a device code,
+  or drop in a keyless provider, then test individual models without leaving it
+- **quota where the provider reports one**, in the same window
 
-It is deliberately small: one Python file, no pip install, no database, no web
-UI, no server auth layer, nothing to configure beyond a JSON file of rows and,
-if you want provider logins, an OAuth profile.
+It is deliberately small: one Python file, standard library only, no database, no
+web UI, no server auth layer, nothing to configure beyond a JSON file of rows and,
+if you want provider logins, an OAuth profile. The only exceptions are the
+dashboard dependency on Windows (`windows-curses`, installed for you) and the
+optional transport one free provider needs, both of which are optional and never
+required for the rest.
+
+## OpenCode Free
+
+Choose **A → No-auth provider → OpenCode Free**. No login or API key is needed.
+The initial preset includes `big-pickle`, verified with streaming and non-streaming chat.
+Other OpenCode API formats are not supported by this adapter.
+
+This provider requires the optional Python transport `curl_cffi`:
+
+```sh
+python3 -m pip install --target ~/.minimalrouter/python-runtime curl_cffi
+```
+
+Use the same Python version as the MinimalRouter launcher. Other providers remain
+standard-library-only. OpenCode requests stream upstream; non-streaming clients
+receive an aggregated Chat Completions response. The adapter supplies required
+OpenCode tool definitions; it never executes those tools itself.
 
 ## Requirements
 
@@ -88,18 +109,24 @@ keyless free-tier entries — the first row, `kilocode-free`, works with no
 setup at all — plus entries that need a key, which stay `unknown` until you
 give one. A failed row never blocks the others.
 
-Add your first provider:
+The dashboard opens on **providers**, with model counts and OAuth status.
+Use Enter to open a provider's models and Esc to return.
 
-1. Press `a`
-2. Paste the base URL, for example `https://api.groq.com/openai/v1`
-3. Paste your API key, then press Enter
-4. The model list is fetched from the provider: type to filter, Enter to pick
-5. The row is tested; it is saved only if the test passes
+1. Press `a` on the provider screen and pick **API key**, **OAuth**, or **No-auth**.
+2. API key: a preset (Groq, OpenRouter, Pollinations) fills the name and URL; anything
+   else asks for both. The key you type is masked while you enter it.
+3. OAuth: pick a known provider or walk a custom device-flow profile.
+4. Open the provider with Enter, then press `a` to type a model id or pick one from the
+   provider's own list.
+5. Press `l` on an OAuth provider to sign in. The browser opens by itself; the approval
+   URL and any code stay on screen, `o` reopens them, and Esc cancels. A login that is
+   cancelled or never completes does not leave a half-created provider behind.
+6. Press `t` inside a provider to test the selected model. Models save whether or not
+   the account has quota left.
 
-Quickstart for OAuth instead of a key: `minimalrouter oauth add` once, then
-`minimalrouter oauth <profile-id>`, and the profile's models join `/v1/models`.
-
-Press `t` to re-test the selected row at any time. Press `q` to quit.
+`d` removes the selected model or provider after typing `yes`. Provider deletion
+also removes its saved credentials. API providers are stored privately in
+`~/.minimalrouter/api-providers.json`; existing rows and OAuth profiles continue to work.
 
 For a long-running endpoint without the dashboard:
 
@@ -111,17 +138,20 @@ minimalrouter serve
 
 | Key | Action |
 |---|---|
-| Up / Down | select a row |
-| `t` | re-test the selected row (writes state, latency and last-checked) |
-| `a` | add a row: base URL, key, pick a model, auto-test, save |
-| `d` | delete the selected row |
-| `r` | refresh now |
+| Up / Down | select a provider, or a model once inside one |
+| ENTER | open the selected provider's models |
+| ESC | back to the provider list, or cancel a prompt |
+| `a` | add a provider (API key, OAuth, no-auth) or, inside one, a model |
+| `l` | sign in to the selected OAuth provider |
+| `t` | test the selected model (models page only) |
+| `d` | delete the selected model or provider, after typing `yes` |
+| `r` | refresh, and re-read the quota on a provider that reports one |
 | `q` | quit (also stops the server) |
-| Esc | cancel any prompt |
 
-The dashboard shows the header (endpoint, counts, uptime, online state), the row
-table, a details pane for the selected row (full base URL, key source, last
-error), and a live tail of the request log.
+The provider screen shows the header (endpoint, counts, uptime, online state), the
+provider table with each provider's model count and auth kind, a details pane, and a
+live tail of the request log. Opening a provider swaps the table for its models and
+replaces the log with a quota panel when that provider reports a balance.
 
 ## API
 
@@ -342,12 +372,14 @@ and the resulting token is stored locally.
 
 ```
 ~/.minimalrouter/minimalrouter.py    the whole tool
-~/.minimalrouter/rows.json           your rows (chmod 600)
+~/.minimalrouter/rows.json           hand-written rows (chmod 600)
 ~/.minimalrouter/rows.example.json          template copied on first install
 ~/.minimalrouter/oauth-providers.example.json generic OAuth profile template
 ~/.minimalrouter/provider-registry.json     name -> base URL/model map (seeded on install)
 ~/.minimalrouter/oauth-providers.json        optional personal provider profiles
 ~/.minimalrouter/oauth.json                   local OAuth tokens (chmod 600)
+~/.minimalrouter/api-providers.json           providers added from the dashboard
+~/.minimalrouter/python-runtime/              optional transport deps (only if needed)
 ~/.minimalrouter/minimalrouter.log            per-request OK/FAIL log
 ~/.local/bin/minimalrouter                    launcher
 ```

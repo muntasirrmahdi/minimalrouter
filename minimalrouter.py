@@ -52,8 +52,10 @@ import datetime
 import urllib.error
 import urllib.parse
 import urllib.request
+import webbrowser
+import subprocess
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from threading import Lock, Thread
+from threading import Event, Lock, Thread
 
 try:  # single guarded import: every UI helper resolves curses from here
     import curses
@@ -426,9 +428,124 @@ def ep(base, path):
     return b + path
 
 
+def _curl_requests():
+    try:
+        from curl_cffi import requests
+    except ImportError:
+        runtime = os.path.join(MR_HOME, 'python-runtime')
+        if runtime not in sys.path:
+            sys.path.insert(0, runtime)
+        try:
+            from curl_cffi import requests
+        except ImportError:
+            raise RuntimeError('OpenCode Free requires curl_cffi; install with python3 -m pip install --target ~/.minimalrouter/python-runtime curl_cffi') from None
+    return requests
+
+
+OPENCODE_SESSIONS = {}
+
+
+class _CurlStream:
+    def __init__(self, response, session):
+        self.response = response
+        self.session = session
+        self.chunks = iter(response.iter_content())
+        self.closed = False
+
+    def read(self, n=-1):
+        if self.closed:
+            return b''
+        if n < 0:
+            try:
+                return b''.join(self.chunks)
+            finally:
+                self.close()
+        try:
+            return next(self.chunks)
+        except StopIteration:
+            self.close()
+            return b''
+        except Exception:
+            self.close()
+            raise
+
+    def close(self):
+        if not self.closed:
+            self.closed = True
+            self.response.close()
+            self.session.close()
+
+
+def opencode_chat(row, payload, spec, timeout=TIMEOUT):
+    requests = _curl_requests()
+    from curl_cffi import CurlOpt
+    import io
+    with ROW_LOCK:
+        identity = row.get('provider_id') or row['base']
+        sid = OPENCODE_SESSIONS.get(identity)
+        if not sid:
+            sid = 'ses_' + format((~(int(time.time() * 1000) * 4096 + 1)) & ((1 << 48) - 1), '012x') + secrets.token_hex(7)
+            OPENCODE_SESSIONS[identity] = sid
+    body = json.loads(json.dumps(payload))
+    body['model'] = row['model']
+    body['stream'] = True
+    tools = body.setdefault('tools', [])
+    names = {t.get('function', {}).get('name') for t in tools}
+    for tool in spec['required_tools']:
+        if tool['function']['name'] not in names:
+            tools.append(tool)
+    body.setdefault('messages', []).insert(0, {'role': 'system', 'content': spec['system_prompt']})
+    headers = {k: v.replace('{session}', sid) for k, v in spec['headers'].items()}
+    session = requests.Session(default_headers=False, curl_options={CurlOpt.SSL_CIPHER_LIST: spec['cipher_list']})
+    try:
+        response = session.post(ep(row['base'], '/v1/chat/completions'), headers=headers, json=body, stream=True, timeout=timeout)
+        if response.status_code != 200:
+            status = response.status_code
+            response.close()
+            raise RuntimeError('OpenCode Free returned HTTP %d' % status)
+    except Exception:
+        session.close()
+        raise
+    stream = _CurlStream(response, session)
+    if payload.get('stream'):
+        return stream
+    result = {'id': '', 'object': 'chat.completion', 'created': int(time.time()), 'model': payload['model'], 'choices': []}
+    message = {'role': 'assistant', 'content': ''}
+    calls = {}
+    finish = 'stop'
+    try:
+        for line in response.iter_lines():
+            if not line.startswith(b'data: '):
+                continue
+            if line[6:] == b'[DONE]':
+                break
+            event = json.loads(line[6:])
+            result['id'] = event.get('id', result['id'])
+            if event.get('usage'):
+                result['usage'] = event['usage']
+            for choice in event.get('choices', []):
+                delta = choice.get('delta') or {}
+                message['content'] += delta.get('content') or ''
+                for call in delta.get('tool_calls') or []:
+                    target = calls.setdefault(call['index'], {'id': '', 'type': 'function', 'function': {'name': '', 'arguments': ''}})
+                    if call.get('id'): target['id'] = call['id']
+                    for key in ('name', 'arguments'):
+                        target['function'][key] += (call.get('function') or {}).get(key) or ''
+                finish = choice.get('finish_reason') or finish
+    finally:
+        stream.close()
+    if calls:
+        message['tool_calls'] = [calls[k] for k in sorted(calls)]
+    result['choices'] = [{'index': 0, 'message': message, 'finish_reason': finish}]
+    return io.BytesIO(json.dumps(result).encode())
+
+
 def upstream(base, key, path, payload=None, timeout=TIMEOUT, row=None):
     # Per-profile behavior only; no provider is known by name.
     row = row or {}
+    for spec in read_provider_registry().values():
+        if spec.get('transport') == 'curl_cffi' and spec.get('base_url', '').rstrip('/') == base.rstrip('/') and path == '/v1/chat/completions':
+            return opencode_chat(row, payload, spec, timeout)
     provider = row.get("oauth_provider", "")
     api_mode = row.get("api_mode", "chat_completions")
     if api_mode == "responses" and path == "/v1/chat/completions":
@@ -902,6 +1019,10 @@ class Handler(BaseHTTPRequestHandler):
                         except (BrokenPipeError, ConnectionResetError):
                             log("stream client disconnected mid-row %s"
                                 % row["name"])
+                        finally:
+                            close = getattr(resp, 'close', None)
+                            if close:
+                                close()
                         ROW_STATE[row["name"]] = {
                             "status": "ok", "ms": (time.time() - t0) * 1000,
                             "at": time.time()}
@@ -1013,11 +1134,13 @@ def oauth_post(url, provider, token, payload, org_id="", timeout=TIMEOUT):
     return urllib.request.urlopen(req, timeout=timeout)
 
 
-def oauth_device_start(provider):
+def oauth_device_start(provider, options=None):
     spec = read_oauth_profiles().get(provider)
     if not spec:
         raise ValueError("unknown OAuth provider (add it to ~/.minimalrouter/oauth-providers.json first)")
-    body = spec.get("authorize_body", {})
+    body = dict(spec.get("authorize_body", {}))
+    if options:
+        body.update(options)
     token = ""
     if spec.get("client_poll_token"):
         token = secrets.token_hex(32)
@@ -1025,9 +1148,9 @@ def oauth_device_start(provider):
     return json.loads(res.read() or b"{}"), token
 
 
-def oauth_start(provider):
+def oauth_start(provider, options=None):
     try:
-        raw, poll_token = oauth_device_start(provider)
+        raw, poll_token = oauth_device_start(provider, options)
         spec = read_oauth_profiles().get(provider, {})
         d = _envelope(raw, spec)
         url = str(d.get("verification_uri_complete") or d.get("verification_uri")
@@ -1072,10 +1195,10 @@ def _render_body(body, device_code):
     return out
 
 
-def oauth_poll(provider, flow):
+def oauth_poll(provider, flow, cancel_event=None):
     """Poll the token endpoint until approval, honouring pending/400/202 shapes."""
     spec = read_oauth_profiles().get(provider, {})
-    deadline = time.time() + float(flow.get("expires", 600))
+    deadline = time.time() + min(360, float(flow.get("expires", 360)))
     poll_url = spec.get("token_url", "")
     method = spec.get("poll_method", "POST").upper()
     body = _render_body(spec.get("token_body") or
@@ -1088,7 +1211,11 @@ def oauth_poll(provider, flow):
     interval = float(flow.get("interval", 5) or 5)
     last_msg = ""
     while time.time() < deadline:
-        time.sleep(interval)
+        if cancel_event is not None:
+            if cancel_event.wait(interval):
+                return None
+        else:
+            time.sleep(interval)
         status = 0
         d = {}
         try:
@@ -1160,156 +1287,723 @@ def oauth_poll(provider, flow):
     raise RuntimeError(last_msg or "OAuth expired before approval")
 
 
-def _curses_main(stdscr, port):
+API_PROVIDERS_PATH = os.path.join(MR_HOME, "api-providers.json")
+
+
+def _raw_rows():
     try:
-        curses.use_default_colors()
-        curses.start_color()
-        curses.init_pair(1, curses.COLOR_GREEN, -1)
-        curses.init_pair(2, curses.COLOR_RED, -1)
-        curses.init_pair(3, curses.COLOR_YELLOW, -1)
-        curses.init_pair(4, curses.COLOR_CYAN, -1)
-        HAS_COLOR = True
-    except Exception:
-        HAS_COLOR = False
-    curses.curs_set(0)
-    stdscr.nodelay(True)
-    try:
-        stdscr.addstr(0, 0, "\u2500")
-        G = {"tl": "\u250c", "tr": "\u2510", "bl": "\u2514", "br": "\u2518",
-             "h": "\u2500", "v": "\u2502", "lt": "\u251c", "rt": "\u2524",
-             "sel": "\u25b6", "ok": "\u25cf", "bad": "\u25cf",
-             "unk": "\u25cb"}
-    except Exception:
-        G = {"tl": "+", "tr": "+", "bl": "+", "br": "+", "h": "-", "v": "|",
-             "lt": "+", "rt": "+", "sel": ">", "ok": "*", "bad": "x",
-             "unk": "."}
-    sel = 0
-    started = time.time()
-    status = "ready - press a to add a row, t to test the selected one"
-    COLOR = {"ok": curses.color_pair(1) if HAS_COLOR else 0,
-             "fail": curses.color_pair(2) if HAS_COLOR else 0}
-    LABEL = curses.A_DIM
-    while True:
-        online = True
+        with open(ROWS_PATH) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return []
+
+
+def _api_providers(data=None):
+    if data is None:
         try:
-            st = api_get("/api/state")
-            rows = st.get("rows", [])
-            nmodels = st.get("models", 0)
-        except Exception:
-            rows, nmodels, online = [], 0, False
+            with open(API_PROVIDERS_PATH) as f:
+                return json.load(f)
+        except FileNotFoundError:
+            return {}
+    os.makedirs(MR_HOME, exist_ok=True)
+    tmp = API_PROVIDERS_PATH + '.tmp'
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w') as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, API_PROVIDERS_PATH)
+    return data
+
+
+def _provider_id(row):
+    explicit = row.get('provider_id') or row.get('provider')
+    return 'api:' + str(explicit) if explicit else 'base:' + row['base'].rstrip('/')
+
+
+def _provider_label(row):
+    base = row['base'].rstrip('/')
+    for pid, spec in read_provider_registry().items():
+        if spec.get('base_url', '').rstrip('/') == base:
+            return spec.get('label', pid)
+    host = urllib.parse.urlsplit(base).hostname or base
+    return (host[4:] if host.startswith('api.') else host).split('.')[0].title()
+
+
+def provider_groups():
+    groups = {}
+    for pid, spec in _api_providers().items():
+        groups['api:' + pid] = {'id': 'api:' + pid, 'label': spec.get('label', pid),
+                               'base': spec['base'], 'kind': 'API', 'rows': []}
+    for row in _raw_rows():
+        pid = _provider_id(row)
+        group = groups.setdefault(pid, {'id': pid, 'label': row.get('provider_label') or
+                                  row.get('provider_id') or row.get('provider') or
+                                  _provider_label(row), 'base': row['base'],
+                                  'kind': 'API', 'rows': []})
+        group['rows'].append({'name': row['name'], 'model': row['model'],
+                              'state': dict(ROW_STATE.get(row['name'], {}))})
+    auth = read_oauth()
+    for pid, spec in read_oauth_profiles().items():
+        rows = []
+        for item in spec.get('models', []):
+            model = item if isinstance(item, str) else item.get('model', '')
+            name = '%s-%s' % (pid, model.replace('/', '-'))
+            rows.append({'name': name, 'model': model, 'state': dict(ROW_STATE.get(name, {}))})
+        rec = auth.get(pid) or {}
+        connected = bool(rec.get('access_token'))
+        state = 'connected' if connected else 'login required'
+        if connected and rec.get('expires_at') and rec['expires_at'] < time.time():
+            state = 'expired / refresh on use' if spec.get('refresh_url') else 'login expired'
+        groups['oauth:' + pid] = {'id': 'oauth:' + pid, 'label': spec.get('label', pid),
+                                  'base': spec['base_url'], 'kind': 'OAuth',
+                                  'connection': state, 'rows': rows}
+    registry = read_provider_registry()
+    for group in groups.values():
+        if group['kind'] == 'API':
+            for pid, spec in registry.items():
+                if spec.get('no_auth') and spec.get('base_url', '').rstrip('/') == group['base'].rstrip('/'):
+                    group['connection'] = 'No auth required'
+                if (spec.get('base_url', '').rstrip('/') == group['base'].rstrip('/')
+                        and spec.get('authorize_url') and spec.get('token_url')):
+                    group['oauth_available'] = pid
+                    group['connection'] = 'OAuth available / current API or keyless connection; L to log in'
+                    break
+    for group in list(groups.values()):
+        target = groups.get('oauth:' + group.get('oauth_available', ''))
+        if group['kind'] == 'API' and target:
+            target.setdefault('api_groups', []).append(dict(group))
+            for row in group['rows']:
+                target['rows'].append(dict(row, owner=group))
+            groups.pop(group['id'])
+    return list(groups.values())
+
+
+def _save_api_provider(label, base, key):
+    u = urllib.parse.urlsplit(base)
+    if u.scheme not in ('https', 'http') or not u.netloc or u.username or u.password or u.query:
+        raise ValueError('Use an HTTP(S) base URL without credentials or query parameters')
+    pid = uuid.uuid4().hex
+    with ROW_LOCK:
+        providers = _api_providers()
+        providers[pid] = {'label': label, 'base': base.rstrip('/'), 'key': key}
+        _api_providers(providers)
+    return 'api:' + pid
+
+
+def _provider_template(group):
+    pid = group['id']
+    if pid.startswith('api:'):
+        spec = _api_providers().get(pid[4:])
+        if spec:
+            return {'base': spec['base'], 'key': spec.get('key', ''),
+                    'provider_id': pid[4:], 'provider_label': spec.get('label', pid[4:])}
+    return dict(next(r for r in _raw_rows() if _provider_id(r) == pid))
+
+
+def _model_change(group, model, remove=False):
+    with ROW_LOCK:
+        if group['kind'] == 'OAuth':
+            profiles = read_oauth_profiles()
+            spec = profiles[group['id'][6:]]
+            models = spec.setdefault('models', [])
+            ids = [x if isinstance(x, str) else x.get('model') for x in models]
+            if remove:
+                spec['models'] = [x for x, mid in zip(models, ids) if mid != model]
+            elif model not in ids:
+                models.append(model)
+            write_oauth_profiles(profiles)
+        else:
+            rows = _raw_rows()
+            if remove:
+                rows = [r for r in rows if not (_provider_id(r) == group['id'] and r['model'] == model)]
+            elif not any(_provider_id(r) == group['id'] and r['model'] == model for r in rows):
+                row = _provider_template(group)
+                row.pop('aliases', None)
+                stem = group.get('label') or row.get('provider_label') or 'provider'
+                stem = '-'.join(stem.lower().split()) + '-' + model.replace('/', '-')
+                name = stem
+                suffix = 2
+                while any(r['name'] == name for r in rows):
+                    name = '%s-%d' % (stem, suffix)
+                    suffix += 1
+                row.update(name=name, model=model)
+                rows.append(row)
+            write_rows(rows)
+
+
+def _delete_provider(group):
+    for child in group.get('api_groups', []):
+        _delete_provider(child)
+    with ROW_LOCK:
+        if group['kind'] == 'OAuth':
+            pid = group['id'][6:]
+            profiles = read_oauth_profiles()
+            profiles.pop(pid, None)
+            write_oauth_profiles(profiles)
+            auth = read_oauth()
+            auth.pop(pid, None)
+            write_oauth(auth)
+        else:
+            write_rows([r for r in _raw_rows() if _provider_id(r) != group['id']])
+            providers = _api_providers()
+            providers.pop(group['id'][4:], None)
+            _api_providers(providers)
+
+
+def _input_line(stdscr, label, secret=False, default=''):
+    buf = default
+    stdscr.timeout(100)
+    while True:
+        h, w = stdscr.getmaxyx()
+        shown = '*' * len(buf) if secret else buf
+        _putw(stdscr, h - 2, ' ' * (w - 1), w)
+        _putw(stdscr, h - 2, label + ' ' + shown, w, curses.A_BOLD)
+        _putw(stdscr, h - 1, 'Enter save / Esc cancel / Ctrl-U clear'.ljust(w - 1), w, curses.A_DIM)
+        stdscr.refresh()
+        ch = stdscr.getch()
+        if ch in (10, 13, curses.KEY_ENTER):
+            return buf.strip()
+        if ch == 27:
+            return None
+        if ch == 21:
+            buf = ''
+        elif ch in (curses.KEY_BACKSPACE, 127, 8):
+            buf = buf[:-1]
+        elif 32 <= ch < 127:
+            buf += chr(ch)
+
+
+def _pick_list(stdscr, items, title):
+    idx, flt = 0, ''
+    stdscr.timeout(100)
+    while True:
         h, w = stdscr.getmaxyx()
         stdscr.erase()
-        if sel >= len(rows):
-            sel = max(0, len(rows) - 1)
+        shown = [m for m in items if flt.lower() in m.lower()]
+        idx = min(idx, max(0, len(shown) - 1))
+        compact = h < 9
+        start = 2 if compact else 4
+        room = max(1, h - start - 2)
+        top = max(0, idx - room + 1)
+        _putw(stdscr, 0, '  ' + title.upper(), w, curses.A_BOLD)
+        if not compact:
+            _putw(stdscr, 1, '  Choose an option below. Type to filter.', w, curses.A_DIM)
+            _putw(stdscr, 2, '  ' + '─' * max(0, w - 5), w, curses.A_DIM)
+            if flt:
+                _putw(stdscr, 3, '  Filter: ' + flt, w)
+        for i, text in enumerate(shown[top:top + room]):
+            selected = top + i == idx
+            line = ('  ▶ ' if selected else '    ') + text
+            _putw(stdscr, start + i, line.ljust(max(0, w - 2)), w,
+                  curses.A_REVERSE | curses.A_BOLD if selected else 0)
+        if not shown:
+            _putw(stdscr, start, '  No matches. BACKSPACE edits the filter.', w, curses.A_DIM)
+        _putw(stdscr, h - 2, '  %d of %d options%s' %
+              (idx + 1 if shown else 0, len(shown), ' | Filter: ' + flt if compact and flt else ''), w, curses.A_DIM)
+        _putw(stdscr, h - 1, '  ↑↓ select | ENTER continue | ESC back | Type to filter', w, curses.A_DIM)
+        stdscr.refresh()
+        ch = stdscr.getch()
+        if ch in (10, 13, curses.KEY_ENTER):
+            return shown[idx] if shown else None
+        if ch == 27:
+            return None
+        if ch in (curses.KEY_DOWN, curses.KEY_NPAGE):
+            idx = min(idx + (room if ch == curses.KEY_NPAGE else 1), max(0, len(shown) - 1))
+        elif ch in (curses.KEY_UP, curses.KEY_PPAGE):
+            idx = max(0, idx - (room if ch == curses.KEY_PPAGE else 1))
+        elif ch in (curses.KEY_BACKSPACE, 127, 8):
+            flt, idx = flt[:-1], 0
+        elif 32 <= ch < 127:
+            flt, idx = flt + chr(ch), 0
 
-        # ---- header -----------------------------------------------------
-        up = int(time.time() - started)
-        head = (" MINIMALROUTER  |  http://%s:%d/v1  |  %d rows  %d models  |  "
-                "up %dm%02ds  |  %s" % (
-                    HOST, port, len(rows), nmodels,
-                    up // 60, up % 60,
-                    "no server auth / localhost only" if online
-                    else "SERVER OFFLINE"))
-        _putw(stdscr, 0, head, w, curses.A_REVERSE | curses.A_BOLD)
-        if h < 16 or w < 60:  # tiny terminal: rows + legend only
-            maxr = max(1, h - 3)
-            top = max(0, sel - maxr + 1) if sel >= maxr else 0
-            for i, row in enumerate(rows[top:top + maxr]):
-                s = row.get("state", {}) or {}
-                stt = s.get("status", "unknown")
-                line = " %s %-18s %-22s %7s %5s" % (
-                    {"ok": G["ok"], "fail": G["bad"]}.get(stt, G["unk"]),
-                    row["name"][:18], row["model"][:22],
-                    ("%dms" % int(s.get("ms") or 0))
-                    if stt != "unknown" else "-", _age(s.get("at")))
-                _putw(stdscr, 1 + i, line, w,
-                      curses.A_REVERSE if i + top == sel else 0)
-            _putw(stdscr, h - 2, " " + status, w, curses.A_BOLD)
-            _putw(stdscr, h - 1,
-                  " up/down · t test · a add · d delete · r refresh · q quit",
-                  w, curses.A_DIM)
-            stdscr.refresh()
-            ch = stdscr.getch()
-            if ch == -1:
-                time.sleep(0.4)
-                continue
-            if ch in (ord("q"), ord("Q")):
-                return
-            if ch == curses.KEY_DOWN:
-                sel = min(sel + 1, max(0, len(rows) - 1))
-            elif ch == curses.KEY_UP:
-                sel = max(0, sel - 1)
-            continue
 
-        # ---- column header ---------------------------------------------
-        name_w = 26 if w >= 110 else (20 if w >= 92 else 15)
-        rest = w - (4 + name_w + 8 + 6 + 8)   # space left for model+base
-        model_w = max(16, int(rest * 0.62))
-        base_w = max(10, rest - model_w - 1)
-        cols = "   %-*s %-*s %-*s %7s %5s" % (name_w, "NAME", model_w,
-                                             "MODEL", base_w, "HOST",
-                                             "LAT", "LAST")
-        _putw(stdscr, 1, cols, w, curses.A_BOLD)
-        _panel(stdscr, 2, w, G, "")
+def _open_browser(url):
+    try:
+        subprocess.Popen(
+            [sys.executable, '-c', 'import sys, webbrowser; webbrowser.open(sys.argv[1])', url],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError:
+        pass
 
-        # ---- layout budget ---------------------------------------------
-        detail_h = 7
-        table_rows = min(len(rows), max(3, h - (3 + detail_h + 3 + 4)))
-        top = max(0, sel - table_rows + 1) if sel >= table_rows else 0
-        y = 3
-        for i, row in enumerate(rows[top:top + table_rows]):
-            idx = i + top
-            s = row.get("state", {}) or {}
-            stt = s.get("status", "unknown")
-            lat = ("%dms" % int(s.get("ms") or 0)) if stt != "unknown" else "-"
-            host = urllib.parse.urlparse(row["base"]).netloc[:base_w]
-            mark = {"ok": G["ok"], "fail": G["bad"]}.get(stt, G["unk"])
-            line = " %s %s %-*s %-*s %-*s %7s %5s" % (
-                G["sel"] if idx == sel else " ", mark,
-                name_w, row["name"][:name_w],
-                model_w, row["model"][:model_w],
-                base_w, host, lat, _age(s.get("at")))
-            _putw(stdscr, y + i, line, w,
-                  curses.A_REVERSE if idx == sel else 0)
-            if idx != sel and HAS_COLOR and stt in COLOR:
-                try:
-                    stdscr.addnstr(y + i, 3, mark, 1, COLOR[stt])
-                except Exception:
-                    pass
-        y = 3 + table_rows
 
-        # ---- selected row details --------------------------------------
-        _panel(stdscr, y, w, G, "SELECTED")
-        y += 1
-        if rows:
-            row = rows[sel]
-            s = row.get("state", {}) or {}
-            stt = s.get("status", "unknown")
+def _work(stdscr, title, fn, lines=(), browser_url='', cancel=None):
+    done = Event()
+    result = {}
+    def run():
+        try:
+            result['value'] = fn()
+        except Exception as exc:
+            result['error'] = exc
+        finally:
+            done.set()
+    Thread(target=run, daemon=True).start()
+    offset = 0
+    stdscr.timeout(100)
+    while True:
+        h, w = stdscr.getmaxyx()
+        stdscr.erase()
+        _putw(stdscr, 0, title, w, curses.A_REVERSE)
+        wrapped = []
+        for line in lines:
+            width = max(1, w - 1)
+            wrapped.extend(str(line)[i:i + width] for i in range(0, len(str(line)), width))
+        for i, line in enumerate(wrapped[offset:offset + max(1, h - 3)]):
+            _putw(stdscr, i + 1, line, w)
+        _putw(stdscr, h - 1, 'Esc cancel / arrows scroll' + (' / o open browser' if browser_url else ''), w)
+        stdscr.refresh()
+        ch = stdscr.getch()
+        if ch in (27, ord('q')):
+            if cancel:
+                cancel.set()
+            return None
+        if ch == curses.KEY_DOWN:
+            offset = min(offset + 1, max(0, len(wrapped) - 1))
+        elif ch == curses.KEY_UP:
+            offset = max(0, offset - 1)
+        elif ch == ord('o') and browser_url:
+            _open_browser(browser_url)
+        if done.is_set():
+            if 'error' in result:
+                raise result['error']
+            return result.get('value')
+
+
+def _login_flow(stdscr, group):
+    pid = group['id'][6:]
+    try:
+        options = {}
+        field = read_oauth_profiles().get(pid, {}).get('referral_field')
+        if field:
+            referral = _input_line(stdscr, 'Referral code (optional, ENTER skips):')
+            if referral is None:
+                return 'Login cancelled'
+            if referral:
+                options[field] = referral
+        flow = _work(stdscr, 'Starting OAuth login', lambda: oauth_start(pid, options))
+        if flow is None:
+            return 'Login cancelled'
+        url = flow.get('url', '')
+        if not flow.get('device_code') or urllib.parse.urlsplit(url).scheme not in ('http', 'https'):
+            return 'Login failed: provider did not return a valid verification URL and device code'
+        _open_browser(url)
+        cancel = Event()
+        token = _work(stdscr, 'Waiting for browser approval (up to 6 minutes; Esc cancels)',
+                      lambda: oauth_poll(pid, flow, cancel_event=cancel),
+                      ['Open this URL:', url, 'Code: ' + str(flow.get('user_code', ''))], url, cancel)
+        if token is None:
+            return 'Login cancelled; no tokens saved'
+        with ROW_LOCK:
+            if pid not in read_oauth_profiles():
+                return 'Profile removed; login discarded'
+            auth = read_oauth()
+            auth[pid] = token
+            write_oauth(auth)
+        return 'OAuth connected'
+    except Exception:
+        return 'OAuth login failed or expired; retry with l'
+
+
+def _setup_oauth(stdscr, pid, spec):
+    with ROW_LOCK:
+        profiles = read_oauth_profiles()
+        created = pid not in profiles
+        if created:
+            profiles[pid] = spec
+            write_oauth_profiles(profiles)
+    result = 'Login cancelled'
+    try:
+        result = _login_flow(stdscr, {'id': 'oauth:' + pid, 'kind': 'OAuth'})
+        return ('OAuth provider saved. ' if created and result == 'OAuth connected' else '') + result
+    finally:
+        if created and result != 'OAuth connected':
+            with ROW_LOCK:
+                profiles = read_oauth_profiles()
+                if profiles.get(pid) == spec:
+                    profiles.pop(pid, None)
+                    write_oauth_profiles(profiles)
+
+
+def _add_flow(stdscr):
+    kind = _pick_list(stdscr, ['API key provider', 'OAuth provider', 'No-auth provider'], 'Add provider')
+    if kind is None:
+        return 'Add cancelled'
+    if kind.startswith('API') or kind == 'No-auth provider':
+        presets = {spec.get('label', pid): spec for pid, spec in read_provider_registry().items()
+                   if (spec.get('no_auth') if kind == 'No-auth provider' else
+                       not spec.get('no_auth') and (spec.get('api_key_supported') or not spec.get('authorize_url')))}
+        selected = _pick_list(stdscr, sorted(presets) + ['Custom API provider'], 'API provider')
+        if selected is None:
+            return 'Add cancelled'
+        preset = presets.get(selected)
+        if preset:
+            label, base = selected, preset['base_url']
+        else:
+            label = _input_line(stdscr, 'Provider name:')
+            if not label:
+                return 'Add cancelled'
+            base = _input_line(stdscr, 'Base URL (https://host/v1):')
+            if not base:
+                return 'Add cancelled'
+        key = '' if preset and preset.get('no_auth') else _input_line(stdscr, 'API key (blank for keyless):', secret=True)
+        if key is None:
+            return 'Add cancelled'
+        pid = _save_api_provider(label, base, key)
+        if preset:
+            group = {'id': pid, 'kind': 'API', 'base': base}
+            for item in preset.get('models', []):
+                model = item if isinstance(item, str) else item.get('model', '')
+                if model:
+                    _model_change(group, model)
+        return 'Provider saved; Enter opens models, a adds models'
+    registry = read_provider_registry()
+    options = {pid + ' - ' + spec.get('label', pid): (pid, spec)
+               for pid, spec in registry.items() if spec.get('authorize_url') and spec.get('token_url')}
+    selected = _pick_list(stdscr, list(options) + ['Custom OAuth'], 'OAuth provider')
+    if not selected:
+        return 'Add cancelled'
+    seed, entry = options.get(selected, ('', {}))
+    pid = seed or _input_line(stdscr, 'Profile ID (letters, digits, - or _):')
+    if not pid:
+        return 'Add cancelled'
+    if not pid.replace('-', '').replace('_', '').isalnum():
+        return 'Invalid profile ID'
+    if pid in read_oauth_profiles():
+        return _login_flow(stdscr, {'id': 'oauth:' + pid, 'kind': 'OAuth'})
+    spec = json.loads(json.dumps(entry))
+    if not entry:
+        for key, label in [('label', 'Display name:'), ('base_url', 'Chat base URL:'),
+                           ('authorize_url', 'Device authorization URL:'),
+                           ('token_url', 'Token polling URL:'), ('refresh_url', 'Refresh URL (optional):')]:
+            value = _input_line(stdscr, label)
+            if value is None or (not value and key != 'refresh_url'):
+                return 'Add cancelled'
+            if key.endswith('url') and value:
+                parsed = urllib.parse.urlsplit(value)
+                if parsed.scheme not in ('http', 'https') or not parsed.netloc or parsed.username:
+                    return 'Invalid HTTP(S) URL'
+            spec[key] = value
+        client = _input_line(stdscr, 'OAuth client ID (optional):')
+        if client is None:
+            return 'Add cancelled'
+        spec['authorize_body'] = {'client_id': client} if client else {}
+        spec['token_body'] = {'device_code': '{device_code}', 'grant_type': 'urn:ietf:params:oauth:grant-type:device_code'}
+        if client:
+            spec['token_body']['client_id'] = client
+        spec['api_mode'] = _pick_list(stdscr, ['chat_completions', 'responses', 'anthropic'], 'Upstream format')
+        if not spec['api_mode']:
+            return 'Add cancelled'
+        spec['poll_method'] = _pick_list(stdscr, ['POST', 'GET'], 'Token polling method')
+        if not spec['poll_method']:
+            return 'Add cancelled'
+        models = _input_line(stdscr, 'Model IDs, comma separated (optional):')
+        if models is None:
+            return 'Add cancelled'
+        spec['models'] = list(dict.fromkeys(x.strip() for x in models.split(',') if x.strip()))
+    return _setup_oauth(stdscr, pid, spec)
+
+
+def _add_model_flow(stdscr, group):
+    choice = _pick_list(stdscr, ['Enter model ID', 'Fetch model list'], 'Add model')
+    if choice is None:
+        return 'Add cancelled'
+    if choice == 'Fetch model list':
+        def fetch():
+            if group['kind'] == 'OAuth':
+                pid = group['id'][6:]
+                spec = read_oauth_profiles()[pid]
+                curated = read_provider_registry().get(pid, {}).get('models', [])
+                if curated:
+                    return [x if isinstance(x, str) else x['model'] for x in curated]
+                token = oauth_access_token(pid)
+                row = {'oauth_provider': pid}
+                response = upstream(group['base'], token, '/v1/models', row=row, timeout=PROBE_TIMEOUT)
+                body = json.loads(response.read())
+                data = body if isinstance(body, list) else body.get('data', [])
+                return [x if isinstance(x, str) else x['id'] for x in data]
+            row = _provider_template(group)
+            key = row.get('key') or ENV.get(row.get('key_env', ''), '')
+            return fetch_models(row['base'], key)
+        try:
+            ids = _work(stdscr, 'Fetching models', fetch)
+        except Exception:
+            ids = []
+        if ids is None:
+            return 'Fetch cancelled'
+        if ids:
+            model = _pick_list(stdscr, ids, 'Select model')
+        else:
+            model = _input_line(stdscr, 'No model list available; enter model ID:')
+    else:
+        model = _input_line(stdscr, 'Model ID:')
+    if not model:
+        return 'Add cancelled'
+    _model_change(group, model)
+    return 'Model saved; t tests it (quota failures do not remove it)'
+
+
+def _test_model(group, model):
+    if group['kind'] == 'OAuth':
+        row = next(r for r in oauth_rows() if r['oauth_provider'] == group['id'][6:] and r['model'] == model)
+    else:
+        row = next(r for r in read_rows() if _provider_id(r) == group['id'] and r['model'] == model)
+    ok, ms, error, content = probe(row['base'], row.get('key', ''), model, row=row)
+    ROW_STATE[row['name']] = {'status': 'ok' if ok else 'fail', 'ms': ms, 'at': time.time()}
+    return 'Test OK (%dms)' % ms if ok else 'Test failed; check provider access, quota or model ID'
+
+
+QUOTA_STATE = {}
+QUOTA_LOCK = Lock()
+
+
+def _quota_spec(group):
+    if not group or group['kind'] != 'OAuth':
+        return None
+    pid = group['id'][6:]
+    profile = read_oauth_profiles().get(pid, {})
+    if profile.get('quota'):
+        return profile['quota']
+    for spec in read_provider_registry().values():
+        if spec.get('base_url', '').rstrip('/') == group['base'].rstrip('/'):
+            return spec.get('quota')
+    return None
+
+
+def _quota_refresh(group):
+    spec = _quota_spec(group)
+    if not spec:
+        return
+    key = group['id']
+    with QUOTA_LOCK:
+        previous = QUOTA_STATE.get(key, {})
+        if previous.get('loading'):
+            return
+        QUOTA_STATE[key] = dict(previous, loading=True, error='')
+    def fetch():
+        try:
+            token = oauth_access_token(key[6:])
+            if not token:
+                raise ValueError('Login required')
+            headers = {k: str(v).replace('{uuid}', str(uuid.uuid4()))
+                       for k, v in spec.get('headers', {}).items()}
+            headers['Authorization'] = 'Bearer ' + token
+            req = urllib.request.Request(spec['url'], headers=headers)
+            with urllib.request.urlopen(req, timeout=20) as response:
+                payload = json.loads(response.read())
+            details = []
+            if spec.get('format') == 'weekly_budgets':
+                allowance = payload.get('allowance') or {}
+                budgets = payload.get('budgets') or allowance.get('budgets') or {}
+                reset = allowance.get('resetsAt')
+                if isinstance(reset, str) and reset:
+                    reset = datetime.datetime.fromisoformat(reset.replace('Z', '+00:00')).timestamp()
+                items = []
+                for family, budget in budgets.items():
+                    cap = budget.get('usdPerWeek')
+                    used = budget.get('spentUsd', 0)
+                    items.append({'show_name': 'GPT-6' if family == 'gpt6' else family.title(),
+                                  'total_units': cap or 0, 'used_units': used,
+                                  'period_end': reset, 'unit': 'USD', 'unlimited': cap is None,
+                                  'usage_tokens': budget.get('tokensThisWeek')})
+                if not items and 'tokensPerWeek' in allowance:
+                    items.append({'show_name': 'Weekly allowance', 'total_units': allowance['tokensPerWeek'],
+                                  'used_units': allowance.get('usedThisWeek', 0), 'period_end': reset})
+                if not items:
+                    raise ValueError('No weekly budget available')
+                details.append('Plan: ' + str(payload.get('plan', 'unknown')).title())
+                referral = payload.get('referral') or {}
+                if referral:
+                    details.append('Invite bonus: +%s / +%s tokens weekly | %s joined, %s active' % (
+                        format(referral.get('bonusTokensPerWeek', 0), ',.0f'),
+                        format(referral.get('bonusCapPerWeek', 0), ',.0f'),
+                        referral.get('joined', 0), referral.get('activeThisWeek', 0)))
+                payload = {'code': 0, 'data': {'balances': items}}
+            if spec.get('format') == 'shared_daily':
+                if not isinstance(payload.get('freeTokenLimit'), (int, float)) or not isinstance(payload.get('freeTokensToday'), (int, float)):
+                    raise ValueError('Missing shared quota balance')
+                reset = (payload.get('resetTimes') or {}).get('dailyFree')
+                if isinstance(reset, str):
+                    reset = datetime.datetime.fromisoformat(reset.replace('Z', '+00:00')).timestamp()
+                payload = {'code': 0, 'data': {'balances': [{
+                    'show_name': 'Daily Free Tokens (shared)',
+                    'total_units': payload['freeTokenLimit'],
+                    'used_units': payload['freeTokensToday'],
+                    'period_end': reset}]}}
+            if payload.get('code') != 0 or not isinstance(payload.get('data'), dict):
+                raise ValueError('Quota unavailable; check login or plan')
+            balances = []
+            for item in payload['data'].get('balances', []):
+                total = float(item.get('total_units') or 0)
+                used = float(item.get('used_units') or 0)
+                remaining = float(item.get('remaining_units', max(0, total - used)))
+                balances.append({'name': item.get('show_name') or item.get('entitlement_id') or 'Model',
+                                 'total': total, 'remaining': remaining,
+                                 'percent': min(100, max(0, remaining / total * 100)) if total else 0,
+                                 'reset': item.get('period_end'), 'unit': item.get('unit', 'tokens'),
+                                 'used': used, 'unlimited': item.get('unlimited', False),
+                                 'usage_tokens': item.get('usage_tokens')})
+            with QUOTA_LOCK:
+                QUOTA_STATE[key] = {'loading': False, 'at': time.time(), 'balances': balances, 'details': details}
+        except urllib.error.HTTPError as exc:
+            message = 'Quota request failed (HTTP %d); R retry' % exc.code
+            if exc.code == 401:
+                message = 'Quota authorization rejected (401); L login / R retry'
+            elif exc.code == 403:
+                message = 'Quota access blocked by provider (403); R retry'
+            with QUOTA_LOCK:
+                QUOTA_STATE[key] = dict(previous, loading=False, error=message)
+        except Exception:
+            with QUOTA_LOCK:
+                QUOTA_STATE[key] = dict(previous, loading=False, error='Quota fetch failed; R retry')
+    Thread(target=fetch, daemon=True).start()
+
+
+def _draw_dashboard(stdscr, port, groups, group, entries, sel, status, started, G, COLOR):
+    LABEL = curses.A_DIM
+    h, w = stdscr.getmaxyx()
+    stdscr.erase()
+    rows = []
+    for item in entries:
+        states = [r.get("state", {}) for r in item.get("rows", [])]
+        state = item.get("state") or max(states, key=lambda x: x.get("at", 0), default={})
+        rows.append({"name": item["model"] if group else item["label"],
+                     "model": item["name"] if group else "%d %s / %s" % (len(item["rows"]), "model" if len(item["rows"]) == 1 else "models", 'API+OAuth' if item.get('oauth_available') else item["kind"]),
+                     "model_id": item.get("model", item.get("label", "")), "row_name": item.get("name", item.get("label", "")),
+                     "base": group["base"] if group else item["base"],
+                     "state": state, "key_src": (group or item).get("connection", "API provider")})
+    up = int(time.time() - started)
+    head = " MINIMALROUTER  |  http://%s:%d/v1  |  %d providers  %d models  |  up %dm%02ds  |  no server auth / localhost only" % (HOST, port, len(groups), sum(len(g["rows"]) for g in groups), up // 60, up % 60)
+    _putw(stdscr, 0, head, w, curses.A_REVERSE | curses.A_BOLD)
+    if h < 16 or w < 60:
+        room = max(1, h - 4)
+        top = max(0, sel - room + 1)
+        _putw(stdscr, 1, "PROVIDERS > " + group["label"] if group else "PROVIDERS", w, curses.A_BOLD)
+        for i, row in enumerate(rows[top:top + room]):
+            text = row.get("model_id", row["model"]) if group else row["name"]
+            _putw(stdscr, i + 2, " " + text, w, curses.A_REVERSE if top + i == sel else 0)
+        _putw(stdscr, h - 2, status, w)
+        _putw(stdscr, h - 1, "Enter models / a add / l login / Esc back / q quit", w)
+        stdscr.refresh()
+        return
+    HAS_COLOR = bool(COLOR.get("ok"))
+    name_w = max(26, min(44, w // 3)) if group else (26 if w >= 110 else (20 if w >= 92 else 15))
+    rest = w - (4 + name_w + 8 + 6 + 8)   # space left for model+base
+    model_w = max(16, int(rest * 0.62))
+    base_w = max(10, rest - model_w - 1)
+    cols = "   %-*s %-*s %-*s %7s %5s" % (name_w, "MODEL" if group else "PROVIDER", model_w,
+                                             "ROW" if group else "MODELS / AUTH", base_w, "HOST",
+                                         "LAT", "LAST")
+    _putw(stdscr, 1, cols, w, curses.A_BOLD)
+    _panel(stdscr, 2, w, G, "PROVIDERS > " + group["label"] if group else "PROVIDERS")
+
+    detail_h = 7
+    quota = QUOTA_STATE.get(group['id'], {}) if group and _quota_spec(group) else {}
+    quota_height = 2 + len(quota.get('details', [])) + 3 * len(quota.get('balances', [])) if group and _quota_spec(group) else 4
+    table_rows = min(len(rows), max(1, h - (3 + detail_h + 2 + quota_height)))
+    top = max(0, sel - table_rows + 1) if sel >= table_rows else 0
+    y = 3
+    for i, row in enumerate(rows[top:top + table_rows]):
+        idx = i + top
+        s = row.get("state", {}) or {}
+        stt = s.get("status", "unknown")
+        lat = ("%dms" % int(s.get("ms") or 0)) if stt != "unknown" else "-"
+        host = urllib.parse.urlparse(row["base"]).netloc[:base_w]
+        mark = {"ok": G["ok"], "fail": G["bad"]}.get(stt, G["unk"])
+        line = " %s %s %-*s %-*s %-*s %7s %5s" % (
+            G["sel"] if idx == sel else " ", mark,
+            name_w, row["name"][:name_w],
+            model_w, row["model"][:model_w],
+            base_w, host, lat, _age(s.get("at")))
+        _putw(stdscr, y + i, line, w,
+              curses.A_REVERSE if idx == sel else 0)
+        if idx != sel and HAS_COLOR and stt in COLOR:
+            try:
+                stdscr.addnstr(y + i, 3, mark, 1, COLOR[stt])
+            except Exception:
+                pass
+    y = 3 + table_rows
+
+    _panel(stdscr, y, w, G, "SELECTED")
+    y += 1
+    if rows:
+        row = rows[sel]
+        s = row.get("state", {}) or {}
+        stt = s.get("status", "unknown")
+        if group:
             pairs = [
-                ("name", row["name"]),
-                ("model", row["model"]),
+                ("model", row.get("model_id", row["model"])),
+                ("row", row.get("row_name", row["name"])),
                 ("base", row["base"]),
                 ("key", row.get("key_src", "-")),
-                ("state", "%s  %s  last %s" % (
-                    stt.upper(),
-                    ("%dms" % int(s.get("ms") or 0))
-                    if stt != "unknown" else "-", _age(s.get("at")))),
-                ("error", (s.get("error") or "-")),
             ]
-            for lbl, val in pairs:
-                try:
-                    stdscr.addnstr(y, 2, lbl, 6, LABEL)
-                    stdscr.addnstr(y, 9, str(val), max(1, w - 11),
-                                   COLOR[stt] if (lbl == "state" and
-                                                  stt in COLOR) else 0)
-                except Exception:
-                    pass
-                y += 1
         else:
-            _putw(stdscr, y, "  no rows - press a to add one", w, LABEL)
-            y += detail_h - 1
+            pairs = [
+                ("name", row["name"]),
+                ("models", "%d / %s" % (len(entries[sel]["rows"]), "API+OAuth" if entries[sel].get("oauth_available") else entries[sel]["kind"])),
+                ("base", row["base"]),
+                ("auth", row.get("key_src", "-")),
+            ]
+        pairs += [
+            ("state", "%s  %s  last %s" % (
+                stt.upper(),
+                ("%dms" % int(s.get("ms") or 0))
+                if stt != "unknown" else "-", _age(s.get("at")))),
+            ("error", (s.get("error") or "-")),
+        ]
+        for lbl, val in pairs:
+            try:
+                stdscr.addnstr(y, 2, lbl, 6, LABEL)
+                stdscr.addnstr(y, 9, str(val), max(1, w - 11),
+                               COLOR[stt] if (lbl == "state" and
+                                              stt in COLOR) else 0)
+            except Exception:
+                pass
+            y += 1
+    else:
+        _putw(stdscr, y, "  no rows - press a to add one", w, LABEL)
+        y += detail_h - 1
 
-        # ---- live events from the log ----------------------------------
+    if group and _quota_spec(group):
+        _panel(stdscr, y, w, G, "QUOTA  [R refresh]")
+        y += 1
+        snapshot = QUOTA_STATE.get(group['id'], {})
+        message = ('Refreshing...' if snapshot.get('loading') else snapshot.get('error') or
+                   'Updated ' + _age(snapshot.get('at')) if snapshot else 'R refresh quota')
+        for detail in snapshot.get('details', []):
+            _putw(stdscr, y, '  ' + detail, w, LABEL)
+            y += 1
+        _putw(stdscr, y, '  ' + message, w, LABEL)
+        y += 1
+        balances = snapshot.get('balances', [])
+        detailed = h - 2 - y >= len(balances) * 3
+        for balance in balances:
+            if y >= h - 2:
+                break
+            pct = max(0, min(100, balance['percent']))
+            blocks = min(24, max(8, w // 5))
+            filled = round(pct * blocks / 100)
+            bar = '█' * filled + '░' * (blocks - filled)
+            color = COLOR['ok'] if pct > 20 else COLOR.get('warn', COLOR['fail']) if pct > 0 else COLOR['fail']
+            remaining = format(balance['remaining'], ',.0f')
+            total = format(balance['total'], ',.0f')
+            used = format(max(0, balance['total'] - balance['remaining']), ',.0f')
+            unit = balance.get('unit', 'tokens')
+            if unit == 'USD':
+                remaining = '$%.2f' % balance['remaining']
+                total = 'Unlimited' if balance.get('unlimited') else '$%.2f' % balance['total']
+                used = '$%.2f' % balance.get('used', 0)
+            usage_tokens = balance.get('usage_tokens')
+            usage_text = (' | ' + format(usage_tokens, ',.0f') + ' tokens') if usage_tokens is not None else ''
+            reset = time.strftime('%b %d %H:%M %Z', time.localtime(balance['reset'])) if balance.get('reset') else 'Unknown'
+            if detailed:
+                _putw(stdscr, y, '  ' + balance['name'], w, curses.A_BOLD)
+                _putw(stdscr, y + 1, '  %s  %5.1f%% remaining  |  %s %s left%s' % (bar, pct, remaining, unit, usage_text), w, color)
+                _putw(stdscr, y + 2, '  Used %s / %s %s  |  Resets %s' % (used, total, unit, reset), w, LABEL)
+                y += 3
+            else:
+                text = '  %s  %s  %.0f%%  |  %s / %s left' % (balance['name'], bar, pct, remaining, total)
+                _putw(stdscr, y, text, w, color)
+                y += 1
+    if not group:
         _panel(stdscr, y, w, G, "EVENTS")
         y += 1
         room = max(1, (h - 2) - y)
@@ -1322,148 +2016,120 @@ def _curses_main(stdscr, port):
                   COLOR["ok"] if " OK " in ln else
                   (COLOR["fail"] if "FAIL" in ln else LABEL))
 
-        # ---- status + legend -------------------------------------------
-        _putw(stdscr, h - 2, " " + status, w, curses.A_BOLD)
-        _putw(stdscr, h - 1,
-              " up/down select  t test  a add  d delete  r refresh  "
-              "q quit (stops server)  Esc cancel", w, curses.A_DIM)
-        stdscr.refresh()
-
-        ch = stdscr.getch()
-        if ch == -1:
-            time.sleep(0.4)
-            continue
-        if ch in (ord("q"), ord("Q")):
-            return
-        if ch == curses.KEY_DOWN:
-            sel = min(sel + 1, max(0, len(rows) - 1))
-        elif ch == curses.KEY_UP:
-            sel = max(0, sel - 1)
-        elif ch in (ord("r"), ord("R")):
-            status = "refreshed %s" % time.strftime("%H:%M:%S")
-        elif ch in (ord("t"), ord("T")):
-            if rows:
-                row = rows[sel]
-                status = "testing %s ..." % row["name"]
-                _draw_status(stdscr, status, w, h)
-                r = api_post("/api/test", {"base": row["base"],
-                                           "key": "",
-                                           "model": row["model"]})
-                status = (("%s: OK %dms %s" % (row["name"], r.get("ms", 0),
-                                               r.get("content", "")))
-                          if r.get("ok") else
-                          ("%s: %s" % (row["name"], r.get("error", "fail"))))
-        elif ch in (ord("a"), ord("A")):
-            res = _add_flow(stdscr)
-            status = res or "add cancelled"
-        elif ch in (ord("d"), ord("D")):
-            if rows:
-                row = rows[sel]
-                conf = _input_line(stdscr, 'delete "%s"? (y/n) '
-                                   % row["name"])
-                if conf and conf.lower().startswith("y"):
-                    r = api_post("/api/remove", {"name": row["name"]})
-                    status = ("removed %s" % row["name"]) if r.get("ok") \
-                        else r.get("error", "remove failed")
-        stdscr.nodelay(True)
-
-
-def _draw_status(stdscr, msg, w, h):
-    stdscr.addnstr(h - 2, 0, (" " * (w - 1)), w - 1)
-    stdscr.addnstr(h - 2, 0, msg[:w - 1], w - 1, curses.A_BOLD)
+    _putw(stdscr, h - 2, " " + status, w, curses.A_BOLD)
+    _putw(stdscr, h - 1,
+          (" ↑↓ select | A add | L login | T test | D delete | R refresh | ESC back | Q quit"
+           if group else
+           " ↑↓ select | ENTER models | A add | L login | D delete | R refresh | Q quit"), w, curses.A_DIM)
     stdscr.refresh()
 
 
-def _input_line(stdscr, label):
-    h, w = stdscr.getmaxyx()
-    buf = ""
-    stdscr.nodelay(False)
+
+def _curses_main(stdscr, port):
     try:
-        while True:
-            stdscr.addnstr(h - 2, 0, " " * (w - 1), w - 1)
-            stdscr.addnstr(h - 2, 0, label + buf, w - 1, curses.A_BOLD)
-            stdscr.refresh()
-            ch = stdscr.getch()
-            if ch in (10, 13):
-                break
-            if ch == 27:
-                buf = None
-                break
-            if ch in (curses.KEY_BACKSPACE, 127, 8):
-                buf = buf[:-1]
-            elif 32 <= ch < 127:
-                buf += chr(ch)
-    finally:
-        stdscr.nodelay(True)
-    return None if buf is None else buf.strip()
-
-
-def _pick_list(stdscr, items, title):
-    idx, flt = 0, ""
+        curses.start_color()
+        curses.use_default_colors()
+        curses.init_pair(1, curses.COLOR_GREEN, -1)
+        curses.init_pair(2, curses.COLOR_RED, -1)
+        curses.init_pair(3, curses.COLOR_YELLOW, -1)
+        curses.init_pair(4, curses.COLOR_CYAN, -1)
+        HAS_COLOR = True
+    except Exception:
+        HAS_COLOR = False
+    try:
+        curses.curs_set(0)
+    except Exception:
+        pass
+    stdscr.nodelay(True)
+    try:
+        stdscr.addstr(0, 0, "\u2500")
+        G = {"tl": "\u250c", "tr": "\u2510", "bl": "\u2514", "br": "\u2518",
+             "h": "\u2500", "v": "\u2502", "lt": "\u251c", "rt": "\u2524",
+             "sel": "\u25b6", "ok": "\u25cf", "bad": "\u25cf",
+             "unk": "\u25cb"}
+    except Exception:
+        G = {"tl": "+", "tr": "+", "bl": "+", "br": "+", "h": "-", "v": "|",
+             "lt": "+", "rt": "+", "sel": ">", "ok": "*", "bad": "x",
+             "unk": "."}
+    COLOR = {"ok": curses.color_pair(1) if HAS_COLOR else 0,
+             "fail": curses.color_pair(2) if HAS_COLOR else 0}
+    LABEL = curses.A_DIM
+    started = time.time()
+    stdscr.keypad(True)
+    stdscr.timeout(200)
+    selected, model_sel, current = 0, 0, None
+    status = 'Enter opens provider models; a adds a provider'
     while True:
-        h, w = stdscr.getmaxyx()
-        stdscr.erase()
-        head = title
-        if flt:
-            head += "   filter: " + flt
-        stdscr.addnstr(0, 0, head, w - 1, curses.A_BOLD | curses.A_REVERSE)
-        shown = [m for m in items if flt.lower() in m.lower()]
-        maxr = h - 4
-        if len(shown) > maxr and idx >= maxr:
-            top = idx - maxr + 1
-        else:
-            top = 0
-        for i, m in enumerate(shown[top:top + maxr]):
-            attr = curses.A_REVERSE if i + top == idx else curses.A_NORMAL
-            stdscr.addnstr(2 + i, 1, " " + m[:w - 4], w - 2, attr)
-        stdscr.addnstr(h - 2, 0,
-                       "type to filter · Enter pick · Esc cancel · %d models"
-                       % len(shown), w - 1, curses.A_DIM)
-        stdscr.refresh()
+        try:
+            groups = provider_groups()
+        except Exception:
+            groups = []
+            status = 'Could not read provider configuration'
+        selected = min(selected, max(0, len(groups) - 1))
+        group = next((g for g in groups if g['id'] == current), None)
+        if current and group is None:
+            current = None
+        entries = group['rows'] if group else groups
+        model_sel = min(model_sel, max(0, len(entries) - 1))
+        idx = model_sel if group else selected
+        _draw_dashboard(stdscr, port, groups, group, entries, idx, status, started, G, COLOR)
         ch = stdscr.getch()
-        if ch in (10, 13):
-            return shown[idx] if shown else None
-        if ch == 27:
-            return None
-        if ch == curses.KEY_DOWN:
-            idx = min(idx + 1, max(0, len(shown) - 1))
-        elif ch == curses.KEY_UP:
-            idx = max(0, idx - 1)
-        elif ch == curses.KEY_NPAGE:
-            idx = min(idx + maxr, max(0, len(shown) - 1))
-        elif ch == curses.KEY_PPAGE:
-            idx = max(0, idx - maxr)
-        elif ch in (curses.KEY_BACKSPACE, 127, 8):
-            flt, idx = flt[:-1], 0
-        elif 32 <= ch < 127:
-            flt, idx = flt + chr(ch), 0
+        if ord('A') <= ch <= ord('Z'):
+            ch = ord(chr(ch).lower())
+        if ch in (ord('q'), ord('Q')):
+            return
+        if ch in (27, curses.KEY_LEFT, curses.KEY_BACKSPACE, 127):
+            current = None
+        elif ch in (curses.KEY_DOWN, ord('j')):
+            if group: model_sel = min(idx + 1, max(0, len(entries) - 1))
+            else: selected = min(idx + 1, max(0, len(entries) - 1))
+        elif ch in (curses.KEY_UP, ord('k')):
+            if group: model_sel = max(0, idx - 1)
+            else: selected = max(0, idx - 1)
+        else:
+            try:
+                if ch in (10, 13, curses.KEY_ENTER, curses.KEY_RIGHT) and not group and groups:
+                    current, model_sel = groups[selected]['id'], 0
+                    if _quota_spec(groups[selected]):
+                        cached = QUOTA_STATE.get(current, {})
+                        if time.time() - cached.get('at', 0) > 30:
+                            _quota_refresh(groups[selected])
+                    status = 'a add model / t test / d remove model / Esc providers'
+                elif ch == ord('a'):
+                    status = _add_model_flow(stdscr, group) if group else _add_flow(stdscr)
+                elif ch == ord('l'):
+                    active = group or (groups[selected] if groups else None)
+                    if active and active.get('oauth_available'):
+                        pid = active['oauth_available']
+                        spec = json.loads(json.dumps(read_provider_registry()[pid]))
+                        status = _setup_oauth(stdscr, pid, spec)
+                    else:
+                        status = _login_flow(stdscr, active) if active and active['kind'] == 'OAuth' else 'No OAuth endpoints configured for this provider'
+                elif ch == ord('t') and group and entries:
+                    item = entries[idx]
+                    owner = item.get('owner', group)
+                    status = _work(stdscr, 'Testing model', lambda: _test_model(owner, item['model'])) or 'Test cancelled'
+                elif ch == ord('d') and entries:
+                    target = entries[idx]['model'] if group else entries[idx]['label']
+                    answer = _input_line(stdscr, 'Delete %s%s? Type yes:' % (target, '' if group else ' and all models / saved credentials'))
+                    if answer == 'yes':
+                        if group: _model_change(entries[idx].get('owner', group), target, remove=True)
+                        else: _delete_provider(entries[idx])
+                        status = 'Deleted'
+                    else:
+                        status = 'Delete cancelled'
+                elif ch == ord('r'):
+                    if group and _quota_spec(group):
+                        _quota_refresh(group)
+                        status = 'Refreshing quota...'
+                    else:
+                        status = 'Refreshed'
+            except ValueError as exc:
+                status = str(exc) if str(exc).startswith('Use an HTTP') else 'Invalid input'
+            except Exception:
+                status = 'Action failed; check configuration and retry'
+        stdscr.timeout(200)
 
-
-def _add_flow(stdscr):
-    base = _input_line(stdscr, "Base URL (https://.../v1): ")
-    if not base:
-        return None
-    key = _input_line(stdscr, "API key (blank if none): ")
-    if key is None:
-        return None
-    _draw_status(stdscr, "fetching model list ...", *stdscr.getmaxyx()[::-1])
-    r = api_post("/api/fetch_models", {"base": base, "key": key})
-    model = None
-    if r.get("ok") and r.get("models"):
-        model = _pick_list(stdscr, r["models"], "pick a model")
-    if not model:
-        model = _input_line(stdscr, "model id: ")
-    if not model:
-        return None
-    _draw_status(stdscr, "testing %s ..." % model, *stdscr.getmaxyx()[::-1])
-    t = api_post("/api/test", {"base": base, "key": key, "model": model})
-    if not t.get("ok"):
-        return "test failed: %s" % t.get("error", "?")
-    a = api_post("/api/add", {"base": base, "key": key, "model": model})
-    if a.get("ok"):
-        return "added %s (test OK %dms)" % (a.get("name"),
-                                            t.get("ms", 0))
-    return "add failed: %s" % a.get("error", "?")
 
 
 def run_server():
@@ -1492,12 +2158,13 @@ No server authentication. Localhost only. OAuth provider logins are supported
 through profiles; the client-facing format is OpenAI Chat Completions.
 
 Dashboard keys:
-  up/down  select row     t  re-test row      a  add a row
-  d        delete row     r  refresh          q  quit (stops the server)
-  Esc      cancel a prompt
+  up/down  select provider/model   Enter  open provider models
+  a        add provider/model      l      OAuth login (o opens browser)
+  t        test selected model     d      delete with confirmation
+  Esc      back/cancel             q      quit (stops the server)
 
-Add a row: run `minimalrouter`, press a, paste base URL + API key,
-pick a model from the fetched list; the row is saved only if the test passes.
+Run `minimalrouter`, press a to add an API or OAuth provider. Enter opens
+its models; a adds models manually or from discovery. Testing is optional.
 
 Add an OAuth provider: `minimalrouter oauth add`, then `minimalrouter oauth <id>`.
 
@@ -1681,7 +2348,7 @@ def main():
                 spec["api_mode"] = api_mode
             if entry.get("poll_method"):
                 spec["poll_method"] = entry["poll_method"]
-            for k in ("token_body", "authorize_body", "headers", "envelope",
+            for k in ("referral_field", "refresh_body", "quota", "token_body", "authorize_body", "headers", "envelope",
                       "client_poll_token", "verify_url_key", "expires_at_key",
                       "token_key", "status_key", "pending_status",
                       "failed_status", "poll_interval", "expires_in",
