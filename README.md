@@ -370,7 +370,9 @@ and the resulting token is stored locally.
 | `cannot bind 127.0.0.1:8790` | another instance is running | stop it, or set `MINIMALROUTER_PORT` |
 | dashboard shows SERVER OFFLINE | the API is not answering | the process died; check `~/.minimalrouter/minimalrouter.log` |
 
-`minimalrouter -h` prints usage; `minimalrouter -v` prints the version.
+`minimalrouter -h` prints usage; `minimalrouter -v` prints the version;
+`minimalrouter doctor` prints the environment, config, providers, port and
+provider reachability without exposing any key.
 
 ## Files
 

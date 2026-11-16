@@ -442,7 +442,7 @@ def _curl_requests():
         try:
             from curl_cffi import requests
         except ImportError:
-            raise RuntimeError('OpenCode Free requires curl_cffi; install with python3 -m pip install --target ~/.minimalrouter/python-runtime curl_cffi') from None
+            raise RuntimeError('this provider needs the optional curl_cffi transport: python3 -m pip install --target %s curl_cffi' % RUNTIME_DIR) from None
     return requests
 
 
@@ -2377,6 +2377,68 @@ def _curses_main(stdscr, port):
 
 
 
+def doctor():
+    ok = True
+    print("MinimalRouter doctor\n")
+    version = sys.version_info
+    good = version >= (3, 8)
+    ok &= good
+    print("  python        %d.%d.%d%s" % (version[0], version[1], version[2], "" if good else "  (3.8+ required)"))
+    print("  dashboard     %s" % ("curses available" if curses is not None
+                                 else "curses missing" + ("; install windows-curses" if os.name == "nt" else "")))
+    try:
+        _curl_requests()
+        print("  tls transport curl_cffi available")
+    except Exception:
+        print("  tls transport curl_cffi missing (optional: OpenCode Free only)")
+        print("                python3 -m pip install --target %s curl_cffi" % RUNTIME_DIR)
+    print("  home          %s" % MR_HOME)
+    for name, path in (("rows", ROWS_PATH), ("api providers", API_PROVIDERS_PATH),
+                       ("oauth profiles", OAUTH_PROFILES_PATH), ("oauth tokens", OAUTH_PATH)):
+        if os.path.exists(path):
+            mode = "" if os.name == "nt" else " %o" % (os.stat(path).st_mode & 0o777)
+            print("  %-13s %s%s" % (name, path, mode))
+        else:
+            print("  %-13s %s (missing)" % (name, path))
+    try:
+        groups = provider_groups()
+    except Exception as exc:
+        print("  config        unreadable: %s" % exc)
+        return 1
+    models = len(all_rows())
+    auth = read_oauth()
+    profiles = read_oauth_profiles()
+    connected = [p for p in profiles if (auth.get(p) or {}).get("access_token")]
+    print("  content       %d providers, %d models, %d oauth profiles (%d connected)"
+          % (len(groups), models, len(profiles), len(connected)))
+    missing = [r["name"] for r in read_rows() if not r.get("key")]
+    if missing:
+        print("  no key        %s" % ", ".join(missing[:6]) + (" ..." if len(missing) > 6 else ""))
+    try:
+        probe = ThreadingHTTPServer((HOST, PORT), Handler)
+        probe.server_close()
+        print("  port %-8d free (server not running)" % PORT)
+    except OSError:
+        try:
+            with urllib.request.urlopen("http://%s:%d/health" % (HOST, PORT), timeout=5) as r:
+                print("  port %-8d in use by MinimalRouter %s" % (PORT, r.read().decode()[:80]))
+        except Exception:
+            print("  port %-8d in use by something else" % PORT)
+            ok = False
+    for group in groups[:6]:
+        host = urllib.parse.urlsplit(group["base"]).netloc
+        try:
+            req = urllib.request.Request(group["base"], method="HEAD")
+            with urllib.request.urlopen(req, timeout=6) as r:
+                print("  reach %-14s reachable (HTTP %d)" % (host[:14], r.status))
+        except urllib.error.HTTPError as exc:
+            print("  reach %-14s reachable (HTTP %d)" % (host[:14], exc.code))
+        except Exception:
+            print("  reach %-14s unreachable" % host[:14])
+    print("\n%s" % ("all checks passed" if ok else "some checks need attention"))
+    return 0 if ok else 1
+
+
 def run_server():
     ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()
 
@@ -2395,6 +2457,7 @@ Usage:
   minimalrouter oauth list   show profiles and connection state
   minimalrouter oauth <id>   sign in to that provider (device code)
   minimalrouter oauth rm <id>  delete a profile and its token
+  minimalrouter doctor      check python, dashboard, optional transport, config and reachability
   minimalrouter -h|--help    show this help
   minimalrouter -v           show version
 
@@ -2651,6 +2714,8 @@ def main():
             print("OAuth failed: %s" % e)
             return 1
     mode = args[0] if args else "tui"
+    if mode == "doctor":
+        return doctor()
     if mode not in ("tui", "serve"):
         print("minimalrouter: unknown command %r\n" % mode)
         print(usage())
