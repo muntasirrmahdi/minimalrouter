@@ -5,6 +5,15 @@
 
 set -eu
 
+# Native Windows has its own installer; this script is POSIX shells only.
+case "$(uname -s 2>/dev/null || true)" in
+    MINGW*|MSYS*|CYGWIN*)
+        printf '%s\n' "This looks like Windows. Use the PowerShell installer instead:"
+        printf '%s\n' '  powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/muntasirrmahdi/minimalrouter/main/install.ps1 | iex"'
+        exit 1
+        ;;
+esac
+
 REPO="muntasirrmahdi/minimalrouter"
 BRANCH="main"
 RAW="https://raw.githubusercontent.com/$REPO/$BRANCH"

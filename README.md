@@ -54,15 +54,23 @@ required for the rest.
 ## Requirements
 
 - Python 3.8 or newer (standard library only)
-- Linux or macOS. On Windows, use WSL.
-- A terminal. That is the whole user interface.
+- Linux, macOS, or native Windows 10/11. WSL is no longer required.
+- A terminal. That is the whole user interface. On Windows the dashboard needs the
+  `windows-curses` wheel; both installers put it in place.
 
 ## Install
 
-One line (installs to `~/.minimalrouter`, launcher to `~/.local/bin`):
+Linux and macOS, one line (installs to `~/.minimalrouter`, launcher to `~/.local/bin`):
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/muntasirrmahdi/minimalrouter/main/install.sh | sh
+```
+
+Windows, one line in **PowerShell** (installs to `%USERPROFILE%\.minimalrouter`,
+launcher to `%USERPROFILE%\.local\bin`, adds that folder to your user `PATH`):
+
+```powershell
+irm https://raw.githubusercontent.com/muntasirrmahdi/minimalrouter/main/install.ps1 | iex
 ```
 
 Or clone and install from the checkout:
@@ -70,16 +78,29 @@ Or clone and install from the checkout:
 ```sh
 git clone https://github.com/muntasirrmahdi/minimalrouter
 cd minimalrouter
-sh install.sh
+sh install.sh          # Linux / macOS
+powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1   # Windows
 ```
 
-If `~/.local/bin` is not on your `PATH`, add it:
+If `~/.local/bin` is not on your `PATH` on Linux/macOS, add it:
 
 ```sh
 echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc && exec $SHELL
 ```
 
 Requirements check and install, start to finish, takes under a minute.
+
+## Windows notes
+
+- Use **Windows Terminal** or Windows 11's console for the dashboard; the legacy
+  console host has weak UTF-8 support. The TUI falls back to ASCII borders if the
+  console rejects the box-drawing glyphs.
+- Credentials live in `%USERPROFILE%\.minimalrouter` (`rows.json`,
+  `oauth.json`, `api-providers.json`). Windows has no `chmod`, so MinimalRouter
+  relies on the default owner-only ACL of your profile folder instead of file
+  modes. Anyone who can read your Windows profile can read those files.
+- `minimalrouter serve` behaves the same; use it for a background/startup task.
+
 
 ## Quickstart
 
