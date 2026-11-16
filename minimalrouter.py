@@ -1015,11 +1015,13 @@ def oauth_post(url, provider, token, payload, org_id="", timeout=TIMEOUT):
     return urllib.request.urlopen(req, timeout=timeout)
 
 
-def oauth_device_start(provider):
+def oauth_device_start(provider, options=None):
     spec = read_oauth_profiles().get(provider)
     if not spec:
         raise ValueError("unknown OAuth provider (add it to ~/.minimalrouter/oauth-providers.json first)")
-    body = spec.get("authorize_body", {})
+    body = dict(spec.get("authorize_body", {}))
+    if options:
+        body.update(options)
     token = ""
     if spec.get("client_poll_token"):
         token = secrets.token_hex(32)
@@ -1027,9 +1029,9 @@ def oauth_device_start(provider):
     return json.loads(res.read() or b"{}"), token
 
 
-def oauth_start(provider):
+def oauth_start(provider, options=None):
     try:
-        raw, poll_token = oauth_device_start(provider)
+        raw, poll_token = oauth_device_start(provider, options)
         spec = read_oauth_profiles().get(provider, {})
         d = _envelope(raw, spec)
         url = str(d.get("verification_uri_complete") or d.get("verification_uri")
@@ -1441,7 +1443,15 @@ def _work(stdscr, title, fn, lines=(), browser_url='', cancel=None):
 def _login_flow(stdscr, group):
     pid = group['id'][6:]
     try:
-        flow = _work(stdscr, 'Starting OAuth login', lambda: oauth_start(pid))
+        options = {}
+        field = read_oauth_profiles().get(pid, {}).get('referral_field')
+        if field:
+            referral = _input_line(stdscr, 'Referral code (optional, ENTER skips):')
+            if referral is None:
+                return 'Login cancelled'
+            if referral:
+                options[field] = referral
+        flow = _work(stdscr, 'Starting OAuth login', lambda: oauth_start(pid, options))
         if flow is None:
             return 'Login cancelled'
         url = flow.get('url', '')
@@ -1650,6 +1660,34 @@ def _quota_refresh(group):
             req = urllib.request.Request(spec['url'], headers=headers)
             with urllib.request.urlopen(req, timeout=20) as response:
                 payload = json.loads(response.read())
+            details = []
+            if spec.get('format') == 'weekly_budgets':
+                allowance = payload.get('allowance') or {}
+                budgets = payload.get('budgets') or allowance.get('budgets') or {}
+                reset = allowance.get('resetsAt')
+                if isinstance(reset, str) and reset:
+                    reset = datetime.datetime.fromisoformat(reset.replace('Z', '+00:00')).timestamp()
+                items = []
+                for family, budget in budgets.items():
+                    cap = budget.get('usdPerWeek')
+                    used = budget.get('spentUsd', 0)
+                    items.append({'show_name': 'GPT-6' if family == 'gpt6' else family.title(),
+                                  'total_units': cap or 0, 'used_units': used,
+                                  'period_end': reset, 'unit': 'USD', 'unlimited': cap is None,
+                                  'usage_tokens': budget.get('tokensThisWeek')})
+                if not items and 'tokensPerWeek' in allowance:
+                    items.append({'show_name': 'Weekly allowance', 'total_units': allowance['tokensPerWeek'],
+                                  'used_units': allowance.get('usedThisWeek', 0), 'period_end': reset})
+                if not items:
+                    raise ValueError('No weekly budget available')
+                details.append('Plan: ' + str(payload.get('plan', 'unknown')).title())
+                referral = payload.get('referral') or {}
+                if referral:
+                    details.append('Invite bonus: +%s / +%s tokens weekly | %s joined, %s active' % (
+                        format(referral.get('bonusTokensPerWeek', 0), ',.0f'),
+                        format(referral.get('bonusCapPerWeek', 0), ',.0f'),
+                        referral.get('joined', 0), referral.get('activeThisWeek', 0)))
+                payload = {'code': 0, 'data': {'balances': items}}
             if spec.get('format') == 'shared_daily':
                 if not isinstance(payload.get('freeTokenLimit'), (int, float)) or not isinstance(payload.get('freeTokensToday'), (int, float)):
                     raise ValueError('Missing shared quota balance')
@@ -1671,9 +1709,11 @@ def _quota_refresh(group):
                 balances.append({'name': item.get('show_name') or item.get('entitlement_id') or 'Model',
                                  'total': total, 'remaining': remaining,
                                  'percent': min(100, max(0, remaining / total * 100)) if total else 0,
-                                 'reset': item.get('period_end')})
+                                 'reset': item.get('period_end'), 'unit': item.get('unit', 'tokens'),
+                                 'used': used, 'unlimited': item.get('unlimited', False),
+                                 'usage_tokens': item.get('usage_tokens')})
             with QUOTA_LOCK:
-                QUOTA_STATE[key] = {'loading': False, 'at': time.time(), 'balances': balances}
+                QUOTA_STATE[key] = {'loading': False, 'at': time.time(), 'balances': balances, 'details': details}
         except urllib.error.HTTPError as exc:
             message = 'Quota request failed (HTTP %d); R retry' % exc.code
             if exc.code == 401:
@@ -1728,7 +1768,7 @@ def _draw_dashboard(stdscr, port, groups, group, entries, sel, status, started, 
 
     detail_h = 7
     quota = QUOTA_STATE.get(group['id'], {}) if group and _quota_spec(group) else {}
-    quota_height = 2 + 3 * len(quota.get('balances', [])) if group and _quota_spec(group) else 4
+    quota_height = 2 + len(quota.get('details', [])) + 3 * len(quota.get('balances', [])) if group and _quota_spec(group) else 4
     table_rows = min(len(rows), max(1, h - (3 + detail_h + 2 + quota_height)))
     top = max(0, sel - table_rows + 1) if sel >= table_rows else 0
     y = 3
@@ -1799,6 +1839,9 @@ def _draw_dashboard(stdscr, port, groups, group, entries, sel, status, started, 
         snapshot = QUOTA_STATE.get(group['id'], {})
         message = ('Refreshing...' if snapshot.get('loading') else snapshot.get('error') or
                    'Updated ' + _age(snapshot.get('at')) if snapshot else 'R refresh quota')
+        for detail in snapshot.get('details', []):
+            _putw(stdscr, y, '  ' + detail, w, LABEL)
+            y += 1
         _putw(stdscr, y, '  ' + message, w, LABEL)
         y += 1
         balances = snapshot.get('balances', [])
@@ -1814,11 +1857,18 @@ def _draw_dashboard(stdscr, port, groups, group, entries, sel, status, started, 
             remaining = format(balance['remaining'], ',.0f')
             total = format(balance['total'], ',.0f')
             used = format(max(0, balance['total'] - balance['remaining']), ',.0f')
+            unit = balance.get('unit', 'tokens')
+            if unit == 'USD':
+                remaining = '$%.2f' % balance['remaining']
+                total = 'Unlimited' if balance.get('unlimited') else '$%.2f' % balance['total']
+                used = '$%.2f' % balance.get('used', 0)
+            usage_tokens = balance.get('usage_tokens')
+            usage_text = (' | ' + format(usage_tokens, ',.0f') + ' tokens') if usage_tokens is not None else ''
             reset = time.strftime('%b %d %H:%M %Z', time.localtime(balance['reset'])) if balance.get('reset') else 'Unknown'
             if detailed:
                 _putw(stdscr, y, '  ' + balance['name'], w, curses.A_BOLD)
-                _putw(stdscr, y + 1, '  %s  %5.1f%% remaining  |  %s tokens left' % (bar, pct, remaining), w, color)
-                _putw(stdscr, y + 2, '  Used %s / %s  |  Resets %s' % (used, total, reset), w, LABEL)
+                _putw(stdscr, y + 1, '  %s  %5.1f%% remaining  |  %s %s left%s' % (bar, pct, remaining, unit, usage_text), w, color)
+                _putw(stdscr, y + 2, '  Used %s / %s %s  |  Resets %s' % (used, total, unit, reset), w, LABEL)
                 y += 3
             else:
                 text = '  %s  %s  %.0f%%  |  %s / %s left' % (balance['name'], bar, pct, remaining, total)
@@ -2169,7 +2219,7 @@ def main():
                 spec["api_mode"] = api_mode
             if entry.get("poll_method"):
                 spec["poll_method"] = entry["poll_method"]
-            for k in ("refresh_body", "quota", "token_body", "authorize_body", "headers", "envelope",
+            for k in ("referral_field", "refresh_body", "quota", "token_body", "authorize_body", "headers", "envelope",
                       "client_poll_token", "verify_url_key", "expires_at_key",
                       "token_key", "status_key", "pending_status",
                       "failed_status", "poll_interval", "expires_in",

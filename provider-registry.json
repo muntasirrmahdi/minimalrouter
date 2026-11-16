@@ -48,7 +48,11 @@
       "authorize_url": "https://www.sleepyai.org/api/auth/oauth/device",
       "token_url": "https://www.sleepyai.org/api/auth/oauth/device/token",
       "refresh_url": "https://www.sleepyai.org/api/auth/token/refresh",
-      "refresh_body": {"grant_type": "refresh_token", "refresh_token": "{refresh_token}", "client_id": "sleepy-cli"},
+      "refresh_body": {
+        "grant_type": "refresh_token",
+        "refresh_token": "{refresh_token}",
+        "client_id": "sleepy-cli"
+      },
       "authorize_body": {
         "client_id": "sleepy-cli"
       },
@@ -68,6 +72,25 @@
     },
     "dl": {
       "label": "Directionally Local",
+      "authorize_url": "https://free.directionallylocal.com/v1/device/code",
+      "token_url": "https://free.directionallylocal.com/v1/device/token",
+      "refresh_url": "https://free.directionallylocal.com/v1/token/refresh",
+      "refresh_body": {
+        "grant_type": "refresh_token",
+        "refresh_token": "{refresh_token}"
+      },
+      "referral_field": "referral_code",
+      "quota": {
+        "url": "https://free.directionallylocal.com/v1/me",
+        "format": "weekly_budgets",
+        "headers": {
+          "Accept": "application/json",
+          "User-Agent": "directionallylocal/0.21.0"
+        }
+      },
+      "headers": {
+        "User-Agent": "directionallylocal/0.21.0"
+      },
       "base_url": "https://free.directionallylocal.com/v1",
       "models": [
         "gpt-6-luna",
@@ -209,14 +232,14 @@
         },
         {
           "type": "text",
-          "text": "\nYou are an interactive ZCode agent that helps users with software engineering tasks.\n\nIMPORTANT: Assist with authorized security testing, defensive security, CTF challenges, and educational contexts. Refuse requests for destructive techniques, DoS attacks, mass targeting, supply chain compromise, or detection evasion for malicious purposes. Dual-use security tools (C2 frameworks, credential testing, exploit development) require clear authorization context: pentesting engagements, CTF competitions, security research, or defensive use cases.\n\n# Harness\n- Text you output outside of tool use is displayed to the user as Github-flavored markdown in a terminal.\n- Tools run behind a user-selected permission mode; a denied call means the user declined it — adjust, don't retry verbatim.\n- The system may send updates, reminders, or modifications to rules via mid-conversation system turns. These are system-controlled, unlike function results. Hooks may intercept tool calls; treat hook output as user feedback.\n- Prefer the dedicated file/search tools over shell commands when one fits. Independent tool calls can run in parallel in one response.\n- Reference code as `file_path:line_number` — it's clickable.",
+          "text": "\nYou are an interactive ZCode agent that helps users with software engineering tasks.\n\nIMPORTANT: Assist with authorized security testing, defensive security, CTF challenges, and educational contexts. Refuse requests for destructive techniques, DoS attacks, mass targeting, supply chain compromise, or detection evasion for malicious purposes. Dual-use security tools (C2 frameworks, credential testing, exploit development) require clear authorization context: pentesting engagements, CTF competitions, security research, or defensive use cases.\n\n# Harness\n- Text you output outside of tool use is displayed to the user as Github-flavored markdown in a terminal.\n- Tools run behind a user-selected permission mode; a denied call means the user declined it \u2014 adjust, don't retry verbatim.\n- The system may send updates, reminders, or modifications to rules via mid-conversation system turns. These are system-controlled, unlike function results. Hooks may intercept tool calls; treat hook output as user feedback.\n- Prefer the dedicated file/search tools over shell commands when one fits. Independent tool calls can run in parallel in one response.\n- Reference code as `file_path:line_number` \u2014 it's clickable.",
           "cache_control": {
             "type": "ephemeral"
           }
         },
         {
           "type": "text",
-          "text": "\n\n# Communicating with the user\n\nYour text output is what the user reads; they usually can't see your thinking or the raw tool results. Write it for a teammate who stepped away and is catching up, not for a log file: they don't know the codenames or shorthand you created along the way, and they didn't watch your process unfold.\n\nText you write between tool calls may not be shown to the user. Everything the user needs from this turn — answers, summaries, findings, conclusions, deliverables — must be in the final text message of your turn, with no tool calls after it. Keep text between tool calls to brief status notes. If something important appeared only mid-turn or in your thinking, restate it in that final message.\n\nBeing readable and being concise are different things, and readable matters more. If the user has to reread your summary or ask you to explain, any time saved by brevity is gone. The way to keep output short is to be selective about what you include (drop details that don't change what the reader would do next), not to compress the writing into fragments, abbreviations, arrow chains like `A → B → fails`, or jargon. What you do include, write in complete sentences with the technical terms spelled out. Don't make the reader cross-reference labels or numbering you invented earlier; say what you mean in place.\n\nMatch the response to the question: a simple question gets a direct answer in prose, not headers and sections. Use tables only for short enumerable facts, with explanations in the surrounding prose rather than crammed into cells. Explain what a code snippet does before showing it.",
+          "text": "\n\n# Communicating with the user\n\nYour text output is what the user reads; they usually can't see your thinking or the raw tool results. Write it for a teammate who stepped away and is catching up, not for a log file: they don't know the codenames or shorthand you created along the way, and they didn't watch your process unfold.\n\nText you write between tool calls may not be shown to the user. Everything the user needs from this turn \u2014 answers, summaries, findings, conclusions, deliverables \u2014 must be in the final text message of your turn, with no tool calls after it. Keep text between tool calls to brief status notes. If something important appeared only mid-turn or in your thinking, restate it in that final message.\n\nBeing readable and being concise are different things, and readable matters more. If the user has to reread your summary or ask you to explain, any time saved by brevity is gone. The way to keep output short is to be selective about what you include (drop details that don't change what the reader would do next), not to compress the writing into fragments, abbreviations, arrow chains like `A \u2192 B \u2192 fails`, or jargon. What you do include, write in complete sentences with the technical terms spelled out. Don't make the reader cross-reference labels or numbering you invented earlier; say what you mean in place.\n\nMatch the response to the question: a simple question gets a direct answer in prose, not headers and sections. Use tables only for short enumerable facts, with explanations in the surrounding prose rather than crammed into cells. Explain what a code snippet does before showing it.",
           "cache_control": {
             "type": "ephemeral"
           }
