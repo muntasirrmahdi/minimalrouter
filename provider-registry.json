@@ -1,5 +1,108 @@
 {
   "providers": {
+    "opencode-free": {
+      "label": "OpenCode Free",
+      "base_url": "https://opencode.ai/inference/v1",
+      "no_auth": true,
+      "transport": "curl_cffi",
+      "models_url": "https://opencode.ai/zen/v1/models",
+      "models_impersonate": "chrome",
+      "free_only": true,
+      "models": [
+        "big-pickle",
+        "mimo-v2.6-flash-free",
+        "deepseek-v4.1-flash-free",
+        "glm-5.3-flash-free",
+        "longcat-2.5-free",
+        "iceman-free",
+        "inkling-2-small-free",
+        "beam-free",
+        "flint-40b-free",
+        "nemotron-3.5-super-vl-free",
+        "nemotron-3.5-lightning-free",
+        "minimax-m3.1-flash-free",
+        "hy4-flash-free"
+      ],
+      "cipher_list": "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:ECDHE-ECDSA-AES128-SHA:ECDHE-RSA-AES128-SHA:ECDHE-ECDSA-AES256-SHA:ECDHE-RSA-AES256-SHA:AES128-GCM-SHA256:AES256-GCM-SHA384:AES128-SHA:AES256-SHA",
+      "required_tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "read",
+            "description": "Read the contents of a file or directory. Supports text files, images, and PDFs. Images and PDFs are presented directly to the model. Each text line is prefixed by its 1-based line number as <line>: <content>. The prefix is for reference and is not part of the file content. Directory entries are returned one per line. Use offset and limit to read large files or directories in sections. Prefer one larger read over many small slices, and use grep to find specific content in large files.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string",
+                  "description": "File or directory to read"
+                },
+                "offset": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "description": "The line or directory entry to start reading from (1-based)"
+                },
+                "limit": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "description": "The maximum number of lines or directory entries to read (defaults to and capped at 2000)"
+                }
+              },
+              "required": [
+                "path"
+              ],
+              "additionalProperties": false
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "shell",
+            "description": "Execute a shell command and return its output. Commands run on Linux using bash. Quote file paths containing spaces or special characters. Prefer dedicated tools over shell commands when possible. When output is large, the full result is saved to a file and a truncated preview is returned. Rely on automatic truncation unless filtering the output is more useful. Commands accept an optional timeout, background commands have no timeout by default. Background commands return immediately, and you will be notified when they complete.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "command": {
+                  "type": "string",
+                  "description": "Shell command string to execute"
+                },
+                "workdir": {
+                  "type": "string",
+                  "description": "Working directory to execute the command in. Defaults to the current working directory. When possible, avoid changing directories in the command and set the working directory here instead."
+                },
+                "timeout": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "description": "Timeout in milliseconds. Set to 0 to disable the timeout. Defaults to 120000 for foreground commands. Background commands have no timeout by default."
+                },
+                "background": {
+                  "type": "boolean",
+                  "description": "Run the command in the background and return immediately (useful for dev servers and long-running builds). You do not need to use '&' at the end of the command when using this parameter. You will be notified when it completes. DO NOT poll for completion."
+                }
+              },
+              "required": [
+                "command"
+              ],
+              "additionalProperties": false
+            }
+          }
+        }
+      ],
+      "system_prompt": "Do not call the `read` or `shell` tools; they are placeholders that do nothing. Use the other tools you have been given instead.\n\nHere is some useful information about the environment you are running in:\n<env>\n  Working directory: /\n  Workspace root folder: /\n  Is directory a git repo: no\n  Platform: linux\n</env>",
+      "headers": {
+        "Content-Type": "application/json",
+        "Authorization": "Bearer public",
+        "User-Agent": "opencode/latest/2.0.26/cli",
+        "x-opencode-client": "cli",
+        "x-opencode-session": "{session}",
+        "x-opencode-session-id": "{session}",
+        "x-session-affinity": "{session}",
+        "x-session-id": "{session}",
+        "x-opencode-project": "global",
+        "Accept": "text/event-stream"
+      }
+    },
     "groq": {
       "label": "Groq",
       "base_url": "https://api.groq.com/openai/v1",

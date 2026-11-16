@@ -44,6 +44,7 @@ HTTP API:
 """
 import json
 import os
+import re
 import secrets
 import uuid
 import sys
@@ -57,13 +58,17 @@ import subprocess
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Event, Lock, Thread
 
+HOME = os.path.expanduser("~")
+MR_HOME = os.path.join(HOME, ".minimalrouter")
+RUNTIME_DIR = os.path.join(MR_HOME, "python-runtime")
+if os.path.isdir(RUNTIME_DIR) and RUNTIME_DIR not in sys.path:
+    sys.path.insert(0, RUNTIME_DIR)
+
 try:  # single guarded import: every UI helper resolves curses from here
     import curses
 except ImportError:  # platform without curses -> main() degrades to serve
     curses = None
 
-HOME = os.path.expanduser("~")
-MR_HOME = os.path.join(HOME, ".minimalrouter")
 ROWS_PATH = os.path.join(MR_HOME, "rows.json")
 ENV_PATH = os.path.join(HOME, ".hermes", ".env")
 LOG_PATH = os.path.join(MR_HOME, "minimalrouter.log")
@@ -102,6 +107,15 @@ OAUTH_EXAMPLE_PATH = os.path.join(MR_HOME, "oauth-providers.example.json")
 PROVIDER_REGISTRY_PATH = os.path.join(MR_HOME, "provider-registry.json")
 
 
+def _restrict(path):
+    if os.name == "nt":
+        return
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
 def write_oauth_profiles(profiles):
     os.makedirs(MR_HOME, exist_ok=True)
     tmp = OAUTH_PROFILES_PATH + ".tmp"
@@ -109,10 +123,7 @@ def write_oauth_profiles(profiles):
         json.dump({"profiles": profiles}, f, indent=2)
         f.write("\n")
     os.replace(tmp, OAUTH_PROFILES_PATH)
-    try:
-        os.chmod(OAUTH_PROFILES_PATH, 0o600)
-    except OSError:
-        pass
+    _restrict(OAUTH_PROFILES_PATH)
 
 
 def read_oauth_profiles():
@@ -326,10 +337,7 @@ def write_oauth(data):
         json.dump(data, f, indent=1)
         f.write("\n")
     os.replace(tmp, OAUTH_PATH)
-    try:
-        os.chmod(OAUTH_PATH, 0o600)
-    except OSError:
-        pass
+    _restrict(OAUTH_PATH)
 
 
 def read_rows():
@@ -414,10 +422,7 @@ def write_rows(rows):
         json.dump(rows, f, indent=1)
         f.write("\n")
     os.replace(tmp, ROWS_PATH)
-    try:
-        os.chmod(ROWS_PATH, 0o600)
-    except OSError:
-        pass
+    _restrict(ROWS_PATH)
 
 
 def ep(base, path):
@@ -428,9 +433,324 @@ def ep(base, path):
     return b + path
 
 
+def _curl_requests():
+    try:
+        from curl_cffi import requests
+    except ImportError:
+        if RUNTIME_DIR not in sys.path:
+            sys.path.insert(0, RUNTIME_DIR)
+        try:
+            from curl_cffi import requests
+        except ImportError:
+            raise RuntimeError('OpenCode Free requires curl_cffi; install with python3 -m pip install --target ~/.minimalrouter/python-runtime curl_cffi') from None
+    return requests
+
+
+TLS_SESSIONS = {}
+TLS_GATE_TOOLS = ("read", "shell")
+TLS_GATE_ALIAS = "run_command"
+TLS_RETRY_ATTEMPTS = 6
+
+
+def _tool_name(tool):
+    if not isinstance(tool, dict):
+        return ""
+    name = tool.get("name")
+    if isinstance(name, str) and name.strip():
+        return name.strip()
+    fn = tool.get("function")
+    if isinstance(fn, dict) and isinstance(fn.get("name"), str):
+        return fn["name"].strip()
+    return ""
+
+
+def _with_tool_name(tool, name):
+    fn = tool.get("function")
+    if isinstance(fn, dict):
+        return dict(tool, function=dict(fn, name=name))
+    return dict(tool, name=name)
+
+
+def _with_tool_def(tool, definition):
+    patch = {"description": definition.get("description", ""),
+             "parameters": definition.get("parameters") or {"type": "object", "properties": {}}}
+    fn = tool.get("function")
+    if isinstance(fn, dict):
+        return dict(tool, function=dict(fn, **patch))
+    return dict(tool, **patch)
+
+
+def _tool_def(tool):
+    fn = tool.get("function")
+    return fn if isinstance(fn, dict) else tool
+
+
+def _tls_tools(spec, tools):
+    """Rewrite declared tools to satisfy the free-tier gate.
+
+    Returns (tools, alias_map, declared_names). alias_map maps the name sent
+    upstream back to the caller's original spelling.
+    """
+    defs = {t["function"]["name"]: t["function"] for t in spec["required_tools"]}
+    tools = [t for t in tools if isinstance(t, dict) and _tool_name(t)]
+    taken = {_tool_name(t) for t in tools}
+    declared, mapping, seen, sent, out = set(), {}, set(), set(), []
+    for tool in tools:
+        name = _tool_name(tool)
+        if name in TLS_GATE_TOOLS:
+            if name in seen:
+                continue
+            seen.add(name)
+            mine = _tool_def(tool)
+            want = defs[name]
+            if mine.get("description") == want.get("description") and mine.get("parameters") == want.get("parameters"):
+                sent.add(name)
+                declared.add(name)
+                out.append(tool)
+                continue
+            props = (mine.get("parameters") or {}).get("properties") or {}
+            wanted = set((want.get("parameters") or {}).get("properties") or {})
+            required = (want.get("parameters") or {}).get("required") or []
+            if isinstance(props, dict) and set(props) <= wanted and set(required) <= set(props):
+                sent.add(name)
+                declared.add(name)
+                out.append(_with_tool_def(tool, want))
+                continue
+            alias = name + "_client"
+            n = 2
+            while alias in taken:
+                alias = "%s_client%d" % (name, n)
+                n += 1
+            taken.add(alias)
+            mapping[alias] = name
+            out.append(_with_tool_name(tool, alias))
+            continue
+        alias = name
+        if re.search("terminal", name, re.I):
+            declared.add(name)
+            alias = TLS_GATE_ALIAS
+            n = 2
+            while alias in taken:
+                alias = "%s%d" % (TLS_GATE_ALIAS, n)
+                n += 1
+            taken.add(alias)
+            mapping[alias] = name
+            out.append(_with_tool_name(tool, alias))
+            continue
+        declared.add(name)
+        out.append(tool)
+    for name, definition in defs.items():
+        if name not in sent:
+            out.append({"type": "function", "function": json.loads(json.dumps(definition))})
+    return out, mapping, declared
+
+
+def _tls_shape(frame, state):
+    """Rename aliases back, drop calls to gate-only tools the client never declared."""
+    mapping = state["mapping"]
+    declared = state["declared"]
+    blocked = state["blocked"]
+    for choice in frame.get("choices") or []:
+        holder = choice.get("delta")
+        if not isinstance(holder, dict):
+            holder = choice.get("message")
+        if not isinstance(holder, dict):
+            continue
+        calls = holder.get("tool_calls")
+        if isinstance(calls, list):
+            kept = []
+            for call in calls:
+                if not isinstance(call, dict):
+                    kept.append(call)
+                    continue
+                index = call.get("index", 0)
+                fn = call.get("function") or {}
+                name = fn.get("name")
+                if isinstance(name, str) and name in mapping:
+                    call = dict(call, function=dict(fn, name=mapping[name]))
+                    name = mapping[name]
+                if isinstance(name, str) and name in TLS_GATE_TOOLS and name not in declared:
+                    blocked.add(index)
+                    continue
+                if index in blocked:
+                    continue
+                kept.append(call)
+            if kept:
+                holder["tool_calls"] = kept
+            else:
+                holder.pop("tool_calls", None)
+        if choice.get("finish_reason") in ("tool_calls", "function_call") and not holder.get("tool_calls") and not holder.get("function_call"):
+            choice["finish_reason"] = "stop"
+    return frame
+
+
+class _CurlStream:
+    def __init__(self, response, session, state):
+        self.response = response
+        self.session = session
+        self.state = state
+        self.closed = False
+        self.lines = response.iter_lines()
+        self.pending = []
+
+    def _next_frame(self):
+        for line in self.lines:
+            if not line.startswith(b"data: "):
+                continue
+            raw = line[6:].strip()
+            if raw == b"[DONE]":
+                return b"data: [DONE]\n\n"
+            try:
+                frame = json.loads(raw)
+            except ValueError:
+                return line + b"\n\n"
+            _tls_shape(frame, self.state)
+            return b"data: " + json.dumps(frame).encode() + b"\n\n"
+        return b""
+
+    def read(self, n=-1):
+        if self.closed:
+            return b""
+        try:
+            frame = self._next_frame()
+        except Exception:
+            self.close()
+            raise
+        if not frame:
+            self.close()
+            return b""
+        return frame
+
+    def close(self):
+        if not self.closed:
+            self.closed = True
+            self.response.close()
+            self.session.close()
+
+
+def _curl_tls_chat(row, payload, spec, timeout=TIMEOUT):
+    requests = _curl_requests()
+    from curl_cffi import CurlOpt
+    import io
+    with ROW_LOCK:
+        identity = row.get("provider_id") or row["base"]
+        sid = TLS_SESSIONS.get(identity)
+        if not sid:
+            sid = "ses_" + format((~(int(time.time() * 1000) * 4096 + 1)) & ((1 << 48) - 1), "012x") + secrets.token_hex(7)
+            TLS_SESSIONS[identity] = sid
+    body = json.loads(json.dumps(payload))
+    body["model"] = row["model"]
+    body["stream"] = True
+    tools, mapping, declared = _tls_tools(spec, body.get("tools") or [])
+    body["tools"] = tools
+    choice = body.get("tool_choice")
+    if isinstance(choice, dict):
+        name = choice.get("name") or (choice.get("function") or {}).get("name")
+        if name in mapping:
+            target = mapping[name]
+            body["tool_choice"] = dict(choice, name=target) if choice.get("name") else dict(choice, function=dict(choice.get("function") or {}, name=target))
+        elif name and name not in declared and name not in TLS_GATE_TOOLS:
+            body.pop("tool_choice", None)
+    if choice == "none":
+        body.pop("tool_choice", None)
+    messages = body.setdefault("messages", [])
+    for message in messages:
+        if message.get("role") == "assistant" and not message.get("reasoning_content"):
+            message["reasoning_content"] = " "
+    messages.insert(0, {"role": "system", "content": spec["system_prompt"]})
+    state = {"mapping": mapping, "declared": declared, "blocked": set()}
+    headers = {k: v.replace("{session}", sid) for k, v in spec["headers"].items()}
+    url = ep(row["base"], "/v1/chat/completions")
+    last = None
+    for attempt in range(1, TLS_RETRY_ATTEMPTS + 1):
+        session = requests.Session(default_headers=False, curl_options={CurlOpt.SSL_CIPHER_LIST: spec["cipher_list"]})
+        try:
+            response = session.post(url, headers=headers, json=body, stream=True, timeout=timeout)
+        except Exception:
+            session.close()
+            raise
+        if response.status_code == 200:
+            break
+        status = response.status_code
+        detail = b""
+        try:
+            detail = response.content or b""
+        except Exception:
+            pass
+        response.close()
+        session.close()
+        text = detail.decode("utf-8", "replace")
+        last = "OpenCode Free returned HTTP %d%s" % (status, (": " + text[:200]) if text else "")
+        overloaded = status == 429 and re.search("overload", text, re.I)
+        if overloaded and attempt < TLS_RETRY_ATTEMPTS:
+            time.sleep(min(0.8 * attempt, 4.0))
+            continue
+        if status in (403, 429) and attempt < TLS_RETRY_ATTEMPTS:
+            with ROW_LOCK:
+                TLS_SESSIONS.pop(identity, None)
+                sid = "ses_" + format((~(int(time.time() * 1000) * 4096 + 1)) & ((1 << 48) - 1), "012x") + secrets.token_hex(7)
+                TLS_SESSIONS[identity] = sid
+            headers = {k: v.replace("{session}", sid) for k, v in spec["headers"].items()}
+            continue
+        raise RuntimeError(last)
+    stream = _CurlStream(response, session, state)
+    if payload.get("stream"):
+        return stream
+    result = {"id": "", "object": "chat.completion", "created": int(time.time()), "model": payload.get("model", row["model"]), "choices": []}
+    message = {"role": "assistant", "content": ""}
+    calls = {}
+    finish = "stop"
+    try:
+        for line in response.iter_lines():
+            if not line.startswith(b"data: "):
+                continue
+            raw = line[6:].strip()
+            if raw == b"[DONE]":
+                break
+            frame = json.loads(raw)
+            result["id"] = frame.get("id") or result["id"]
+            if frame.get("usage"):
+                result["usage"] = frame["usage"]
+            for item in frame.get("choices") or []:
+                delta = item.get("delta") or {}
+                message["content"] += delta.get("content") or ""
+                if delta.get("reasoning_content"):
+                    message["reasoning_content"] = message.get("reasoning_content", "") + delta["reasoning_content"]
+                for call in delta.get("tool_calls") or []:
+                    index = call.get("index", 0)
+                    fn = call.get("function") or {}
+                    name = fn.get("name")
+                    if isinstance(name, str) and name in mapping:
+                        name = mapping[name]
+                    if isinstance(name, str) and name in TLS_GATE_TOOLS and name not in declared:
+                        state["blocked"].add(index)
+                        continue
+                    if index in state["blocked"]:
+                        continue
+                    target = calls.setdefault(index, {"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
+                    if call.get("id"):
+                        target["id"] = call["id"]
+                    if name:
+                        target["function"]["name"] = name
+                    target["function"]["arguments"] += fn.get("arguments") or ""
+                finish = item.get("finish_reason") or finish
+    finally:
+        stream.close()
+    if calls:
+        message["tool_calls"] = [calls[k] for k in sorted(calls)]
+        finish = "tool_calls" if finish in ("stop", None) else finish
+    if not message["content"]:
+        message.pop("content")
+    result["choices"] = [{"index": 0, "message": message, "finish_reason": finish}]
+    return io.BytesIO(json.dumps(result).encode())
+
+
 def upstream(base, key, path, payload=None, timeout=TIMEOUT, row=None):
     # Per-profile behavior only; no provider is known by name.
     row = row or {}
+    for spec in read_provider_registry().values():
+        if spec.get('transport') == 'curl_cffi' and spec.get('base_url', '').rstrip('/') == base.rstrip('/') and path == '/v1/chat/completions':
+            return _curl_tls_chat(row, payload, spec, timeout)
     provider = row.get("oauth_provider", "")
     api_mode = row.get("api_mode", "chat_completions")
     if api_mode == "responses" and path == "/v1/chat/completions":
@@ -904,6 +1224,10 @@ class Handler(BaseHTTPRequestHandler):
                         except (BrokenPipeError, ConnectionResetError):
                             log("stream client disconnected mid-row %s"
                                 % row["name"])
+                        finally:
+                            close = getattr(resp, 'close', None)
+                            if close:
+                                close()
                         ROW_STATE[row["name"]] = {
                             "status": "ok", "ms": (time.time() - t0) * 1000,
                             "at": time.time()}
@@ -1192,6 +1516,7 @@ def _api_providers(data=None):
     with os.fdopen(fd, 'w') as f:
         json.dump(data, f, indent=2)
     os.replace(tmp, API_PROVIDERS_PATH)
+    _restrict(API_PROVIDERS_PATH)
     return data
 
 
@@ -1241,6 +1566,8 @@ def provider_groups():
     for group in groups.values():
         if group['kind'] == 'API':
             for pid, spec in registry.items():
+                if spec.get('no_auth') and spec.get('base_url', '').rstrip('/') == group['base'].rstrip('/'):
+                    group['connection'] = 'No auth required'
                 if (spec.get('base_url', '').rstrip('/') == group['base'].rstrip('/')
                         and spec.get('authorize_url') and spec.get('token_url')):
                     group['oauth_available'] = pid
@@ -1297,7 +1624,14 @@ def _model_change(group, model, remove=False):
             elif not any(_provider_id(r) == group['id'] and r['model'] == model for r in rows):
                 row = _provider_template(group)
                 row.pop('aliases', None)
-                row.update(name=uuid.uuid4().hex, model=model)
+                stem = group.get('label') or row.get('provider_label') or 'provider'
+                stem = '-'.join(stem.lower().split()) + '-' + model.replace('/', '-')
+                name = stem
+                suffix = 2
+                while any(r['name'] == name for r in rows):
+                    name = '%s-%d' % (stem, suffix)
+                    suffix += 1
+                row.update(name=name, model=model)
                 rows.append(row)
             write_rows(rows)
 
@@ -1389,11 +1723,16 @@ def _pick_list(stdscr, items, title):
 
 
 def _open_browser(url):
+    kwargs = {}
+    if os.name == 'nt':
+        kwargs['creationflags'] = 0x00000008 | 0x00000200
+    else:
+        kwargs['start_new_session'] = True
     try:
         subprocess.Popen(
             [sys.executable, '-c', 'import sys, webbrowser; webbrowser.open(sys.argv[1])', url],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL, start_new_session=True)
+            stderr=subprocess.DEVNULL, **kwargs)
     except OSError:
         pass
 
@@ -1496,12 +1835,13 @@ def _setup_oauth(stdscr, pid, spec):
 
 
 def _add_flow(stdscr):
-    kind = _pick_list(stdscr, ['API key provider', 'OAuth provider'], 'Add provider')
+    kind = _pick_list(stdscr, ['API key provider', 'OAuth provider', 'No-auth provider'], 'Add provider')
     if kind is None:
         return 'Add cancelled'
-    if kind.startswith('API'):
+    if kind.startswith('API') or kind == 'No-auth provider':
         presets = {spec.get('label', pid): spec for pid, spec in read_provider_registry().items()
-                   if spec.get('api_key_supported') or not spec.get('authorize_url')}
+                   if (spec.get('no_auth') if kind == 'No-auth provider' else
+                       not spec.get('no_auth') and (spec.get('api_key_supported') or not spec.get('authorize_url')))}
         selected = _pick_list(stdscr, sorted(presets) + ['Custom API provider'], 'API provider')
         if selected is None:
             return 'Add cancelled'
@@ -1515,7 +1855,7 @@ def _add_flow(stdscr):
             base = _input_line(stdscr, 'Base URL (https://host/v1):')
             if not base:
                 return 'Add cancelled'
-        key = _input_line(stdscr, 'API key (blank for keyless):', secret=True)
+        key = '' if preset and preset.get('no_auth') else _input_line(stdscr, 'API key (blank for keyless):', secret=True)
         if key is None:
             return 'Add cancelled'
         pid = _save_api_provider(label, base, key)
@@ -1573,12 +1913,46 @@ def _add_flow(stdscr):
     return _setup_oauth(stdscr, pid, spec)
 
 
+def _discover_models(spec):
+    requests = _curl_requests()
+    session = requests.Session(default_headers=False,
+                               impersonate=spec.get('models_impersonate') or None)
+    try:
+        response = session.get(spec['models_url'], timeout=PROBE_TIMEOUT)
+        if response.status_code != 200:
+            raise RuntimeError('model list returned HTTP %d' % response.status_code)
+        body = response.json()
+    finally:
+        session.close()
+    entries = body.get('data') if isinstance(body, dict) else body
+    ids = []
+    for entry in entries or []:
+        if isinstance(entry, str):
+            if not spec.get('free_only'):
+                ids.append(entry)
+            continue
+        if not isinstance(entry, dict):
+            continue
+        if spec.get('free_only'):
+            cost = ((entry.get('cost') or {}).get('text') or {})
+            price = ((cost.get('input') or {}).get('price'), (cost.get('output') or {}).get('price'))
+            if any(isinstance(x, (int, float)) and x > 0 for x in price):
+                continue
+        model_id = entry.get('id')
+        if model_id and model_id not in ids:
+            ids.append(model_id)
+    return ids
+
+
 def _add_model_flow(stdscr, group):
     choice = _pick_list(stdscr, ['Enter model ID', 'Fetch model list'], 'Add model')
     if choice is None:
         return 'Add cancelled'
     if choice == 'Fetch model list':
         def fetch():
+            for spec in read_provider_registry().values():
+                if spec.get('models_url') and spec.get('base_url', '').rstrip('/') == group['base'].rstrip('/'):
+                    return _discover_models(spec)
             if group['kind'] == 'OAuth':
                 pid = group['id'][6:]
                 spec = read_oauth_profiles()[pid]
@@ -1749,19 +2123,19 @@ def _draw_dashboard(stdscr, port, groups, group, entries, sel, status, started, 
         top = max(0, sel - room + 1)
         _putw(stdscr, 1, "PROVIDERS > " + group["label"] if group else "PROVIDERS", w, curses.A_BOLD)
         for i, row in enumerate(rows[top:top + room]):
-            text = row["model"] if group else row["name"]
+            text = row.get("model_id", row["model"]) if group else row["name"]
             _putw(stdscr, i + 2, " " + text, w, curses.A_REVERSE if top + i == sel else 0)
         _putw(stdscr, h - 2, status, w)
         _putw(stdscr, h - 1, "Enter models / a add / l login / Esc back / q quit", w)
         stdscr.refresh()
         return
     HAS_COLOR = bool(COLOR.get("ok"))
-    name_w = 26 if w >= 110 else (20 if w >= 92 else 15)
+    name_w = max(26, min(44, w // 3)) if group else (26 if w >= 110 else (20 if w >= 92 else 15))
     rest = w - (4 + name_w + 8 + 6 + 8)   # space left for model+base
     model_w = max(16, int(rest * 0.62))
     base_w = max(10, rest - model_w - 1)
-    cols = "   %-*s %-*s %-*s %7s %5s" % (name_w, "NAME" if group else "PROVIDER", model_w,
-                                         "MODEL" if group else "MODELS / AUTH", base_w, "HOST",
+    cols = "   %-*s %-*s %-*s %7s %5s" % (name_w, "MODEL" if group else "PROVIDER", model_w,
+                                             "ROW" if group else "MODELS / AUTH", base_w, "HOST",
                                          "LAT", "LAST")
     _putw(stdscr, 1, cols, w, curses.A_BOLD)
     _panel(stdscr, 2, w, G, "PROVIDERS > " + group["label"] if group else "PROVIDERS")
@@ -2049,6 +2423,12 @@ Files:
 
 def main():
     os.makedirs(MR_HOME, exist_ok=True)
+    if os.name == 'nt':
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                stream.reconfigure(encoding='utf-8', errors='replace')
+            except Exception:
+                pass
     if not os.path.exists(ROWS_PATH):
         write_rows([])
     args = sys.argv[1:]
@@ -2297,6 +2677,10 @@ def main():
         log("curses unavailable; server-only")
         print("curses not available on this Python — server running on "
               "http://%s:%d/v1 (Ctrl-C to stop)" % (HOST, PORT))
+        if os.name == 'nt':
+            print("dashboard needs windows-curses: "
+                  "python -m pip install --target "
+                  "\"%s\" windows-curses" % RUNTIME_DIR)
         try:
             while True:
                 time.sleep(60)
