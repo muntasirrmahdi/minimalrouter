@@ -51,23 +51,6 @@ dashboard dependency on Windows (`windows-curses`, installed for you) and the
 optional transport one free provider needs, both of which are optional and never
 required for the rest.
 
-## OpenCode Free
-
-Choose **A → No-auth provider → OpenCode Free**. No login or API key is needed.
-The initial preset includes `big-pickle`, verified with streaming and non-streaming chat.
-Other OpenCode API formats are not supported by this adapter.
-
-This provider requires the optional Python transport `curl_cffi`:
-
-```sh
-python3 -m pip install --target ~/.minimalrouter/python-runtime curl_cffi
-```
-
-Use the same Python version as the MinimalRouter launcher. Other providers remain
-standard-library-only. OpenCode requests stream upstream; non-streaming clients
-receive an aggregated Chat Completions response. The adapter supplies required
-OpenCode tool definitions; it never executes those tools itself.
-
 ## Requirements
 
 - Python 3.8 or newer (standard library only)

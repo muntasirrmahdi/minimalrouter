@@ -1,5 +1,71 @@
 {
   "providers": {
+    "groq": {
+      "label": "Groq",
+      "base_url": "https://api.groq.com/openai/v1",
+      "api_key_supported": true,
+      "models": [
+        "qwen/qwen3.8-27b",
+        "openai/gpt-oss-20b"
+      ]
+    },
+    "openrouter": {
+      "label": "OpenRouter",
+      "base_url": "https://openrouter.ai/api/v1",
+      "api_key_supported": true,
+      "models": [
+        "nvidia/nemotron-3.5-super-vl:free"
+      ]
+    },
+    "pollinations": {
+      "label": "Pollinations",
+      "base_url": "https://text.pollinations.ai/openai",
+      "api_key_supported": true,
+      "models": [
+        "openai-fast"
+      ]
+    },
+    "sleepyai": {
+      "label": "SleepyAI",
+      "base_url": "https://www.sleepyai.org/api/v1",
+      "models": [
+        "auto:free",
+        "deepseek-v4.1-flash:free",
+        "glm-5.3:free",
+        "glm-5.3-flash:free",
+        "step-5-preview-free",
+        "minimax-m3.1-flash:free",
+        "mistral-large-4-1t-a52b",
+        "nemotron-3.5-lightning:free",
+        "nemotron-3.5-super-vl-120b-a12b",
+        "nemotron-3-nano-omni-30b-a3b-reasoning",
+        "qwen-3.8-27b",
+        "glyph-cluster",
+        "dots-3-note-preview",
+        "north-mini-code",
+        "muse-glimmer-30b:free"
+      ],
+      "authorize_url": "https://www.sleepyai.org/api/auth/oauth/device",
+      "token_url": "https://www.sleepyai.org/api/auth/oauth/device/token",
+      "refresh_url": "https://www.sleepyai.org/api/auth/token/refresh",
+      "refresh_body": {"grant_type": "refresh_token", "refresh_token": "{refresh_token}", "client_id": "sleepy-cli"},
+      "authorize_body": {
+        "client_id": "sleepy-cli"
+      },
+      "token_body": {
+        "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+        "device_code": "{device_code}",
+        "client_id": "sleepy-cli"
+      },
+      "quota": {
+        "url": "https://www.sleepyai.org/api/usage?days=30",
+        "format": "shared_daily",
+        "headers": {
+          "Accept": "application/json",
+          "User-Agent": "node"
+        }
+      }
+    },
     "dl": {
       "label": "Directionally Local",
       "base_url": "https://free.directionallylocal.com/v1",
@@ -56,6 +122,26 @@
     },
     "zcode": {
       "label": "ZCode (Start Plan)",
+      "quota": {
+        "url": "https://zcode.z.ai/api/v1/zcode-plan/billing/balance?app_version=3.17.1",
+        "headers": {
+          "Accept": "*/*",
+          "Accept-Language": "*",
+          "User-Agent": "ZCode/3.17.1",
+          "HTTP-Referer": "https://zcode.z.ai",
+          "X-Title": "Z Code@electron",
+          "X-ZCode-App-Version": "3.17.1",
+          "X-Os-Category": "macos",
+          "X-Os-Version": "Darwin Kernel Version 21.6.0: Mon Jun 24 00:56:10 PDT 2024; root:xnu-8020.240.18.709.2~1/RELEASE_X86_64",
+          "X-Platform": "darwin-x64",
+          "X-Release-Channel": "production",
+          "X-Client-Language": "en-US",
+          "X-Client-Timezone": "Asia/Dhaka",
+          "sec-fetch-mode": "cors",
+          "X-Device-Mid": "{uuid}",
+          "x-request-id": "{uuid}"
+        }
+      },
       "base_url": "https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages",
       "models": [
         {

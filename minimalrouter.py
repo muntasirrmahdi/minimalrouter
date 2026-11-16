@@ -428,124 +428,9 @@ def ep(base, path):
     return b + path
 
 
-def _curl_requests():
-    try:
-        from curl_cffi import requests
-    except ImportError:
-        runtime = os.path.join(MR_HOME, 'python-runtime')
-        if runtime not in sys.path:
-            sys.path.insert(0, runtime)
-        try:
-            from curl_cffi import requests
-        except ImportError:
-            raise RuntimeError('OpenCode Free requires curl_cffi; install with python3 -m pip install --target ~/.minimalrouter/python-runtime curl_cffi') from None
-    return requests
-
-
-OPENCODE_SESSIONS = {}
-
-
-class _CurlStream:
-    def __init__(self, response, session):
-        self.response = response
-        self.session = session
-        self.chunks = iter(response.iter_content())
-        self.closed = False
-
-    def read(self, n=-1):
-        if self.closed:
-            return b''
-        if n < 0:
-            try:
-                return b''.join(self.chunks)
-            finally:
-                self.close()
-        try:
-            return next(self.chunks)
-        except StopIteration:
-            self.close()
-            return b''
-        except Exception:
-            self.close()
-            raise
-
-    def close(self):
-        if not self.closed:
-            self.closed = True
-            self.response.close()
-            self.session.close()
-
-
-def opencode_chat(row, payload, spec, timeout=TIMEOUT):
-    requests = _curl_requests()
-    from curl_cffi import CurlOpt
-    import io
-    with ROW_LOCK:
-        identity = row.get('provider_id') or row['base']
-        sid = OPENCODE_SESSIONS.get(identity)
-        if not sid:
-            sid = 'ses_' + format((~(int(time.time() * 1000) * 4096 + 1)) & ((1 << 48) - 1), '012x') + secrets.token_hex(7)
-            OPENCODE_SESSIONS[identity] = sid
-    body = json.loads(json.dumps(payload))
-    body['model'] = row['model']
-    body['stream'] = True
-    tools = body.setdefault('tools', [])
-    names = {t.get('function', {}).get('name') for t in tools}
-    for tool in spec['required_tools']:
-        if tool['function']['name'] not in names:
-            tools.append(tool)
-    body.setdefault('messages', []).insert(0, {'role': 'system', 'content': spec['system_prompt']})
-    headers = {k: v.replace('{session}', sid) for k, v in spec['headers'].items()}
-    session = requests.Session(default_headers=False, curl_options={CurlOpt.SSL_CIPHER_LIST: spec['cipher_list']})
-    try:
-        response = session.post(ep(row['base'], '/v1/chat/completions'), headers=headers, json=body, stream=True, timeout=timeout)
-        if response.status_code != 200:
-            status = response.status_code
-            response.close()
-            raise RuntimeError('OpenCode Free returned HTTP %d' % status)
-    except Exception:
-        session.close()
-        raise
-    stream = _CurlStream(response, session)
-    if payload.get('stream'):
-        return stream
-    result = {'id': '', 'object': 'chat.completion', 'created': int(time.time()), 'model': payload['model'], 'choices': []}
-    message = {'role': 'assistant', 'content': ''}
-    calls = {}
-    finish = 'stop'
-    try:
-        for line in response.iter_lines():
-            if not line.startswith(b'data: '):
-                continue
-            if line[6:] == b'[DONE]':
-                break
-            event = json.loads(line[6:])
-            result['id'] = event.get('id', result['id'])
-            if event.get('usage'):
-                result['usage'] = event['usage']
-            for choice in event.get('choices', []):
-                delta = choice.get('delta') or {}
-                message['content'] += delta.get('content') or ''
-                for call in delta.get('tool_calls') or []:
-                    target = calls.setdefault(call['index'], {'id': '', 'type': 'function', 'function': {'name': '', 'arguments': ''}})
-                    if call.get('id'): target['id'] = call['id']
-                    for key in ('name', 'arguments'):
-                        target['function'][key] += (call.get('function') or {}).get(key) or ''
-                finish = choice.get('finish_reason') or finish
-    finally:
-        stream.close()
-    if calls:
-        message['tool_calls'] = [calls[k] for k in sorted(calls)]
-    result['choices'] = [{'index': 0, 'message': message, 'finish_reason': finish}]
-    return io.BytesIO(json.dumps(result).encode())
-
-
 def upstream(base, key, path, payload=None, timeout=TIMEOUT, row=None):
     # Per-profile behavior only; no provider is known by name.
     row = row or {}
-    for spec in read_provider_registry().values():
-        if spec.get('transport') == 'curl_cffi' and spec.get('base_url', '').rstrip('/') == base.rstrip('/') and path == '/v1/chat/completions':
-            return opencode_chat(row, payload, spec, timeout)
     provider = row.get("oauth_provider", "")
     api_mode = row.get("api_mode", "chat_completions")
     if api_mode == "responses" and path == "/v1/chat/completions":
@@ -1019,10 +904,6 @@ class Handler(BaseHTTPRequestHandler):
                         except (BrokenPipeError, ConnectionResetError):
                             log("stream client disconnected mid-row %s"
                                 % row["name"])
-                        finally:
-                            close = getattr(resp, 'close', None)
-                            if close:
-                                close()
                         ROW_STATE[row["name"]] = {
                             "status": "ok", "ms": (time.time() - t0) * 1000,
                             "at": time.time()}
@@ -1134,13 +1015,11 @@ def oauth_post(url, provider, token, payload, org_id="", timeout=TIMEOUT):
     return urllib.request.urlopen(req, timeout=timeout)
 
 
-def oauth_device_start(provider, options=None):
+def oauth_device_start(provider):
     spec = read_oauth_profiles().get(provider)
     if not spec:
         raise ValueError("unknown OAuth provider (add it to ~/.minimalrouter/oauth-providers.json first)")
-    body = dict(spec.get("authorize_body", {}))
-    if options:
-        body.update(options)
+    body = spec.get("authorize_body", {})
     token = ""
     if spec.get("client_poll_token"):
         token = secrets.token_hex(32)
@@ -1148,9 +1027,9 @@ def oauth_device_start(provider, options=None):
     return json.loads(res.read() or b"{}"), token
 
 
-def oauth_start(provider, options=None):
+def oauth_start(provider):
     try:
-        raw, poll_token = oauth_device_start(provider, options)
+        raw, poll_token = oauth_device_start(provider)
         spec = read_oauth_profiles().get(provider, {})
         d = _envelope(raw, spec)
         url = str(d.get("verification_uri_complete") or d.get("verification_uri")
@@ -1360,8 +1239,6 @@ def provider_groups():
     for group in groups.values():
         if group['kind'] == 'API':
             for pid, spec in registry.items():
-                if spec.get('no_auth') and spec.get('base_url', '').rstrip('/') == group['base'].rstrip('/'):
-                    group['connection'] = 'No auth required'
                 if (spec.get('base_url', '').rstrip('/') == group['base'].rstrip('/')
                         and spec.get('authorize_url') and spec.get('token_url')):
                     group['oauth_available'] = pid
@@ -1418,14 +1295,7 @@ def _model_change(group, model, remove=False):
             elif not any(_provider_id(r) == group['id'] and r['model'] == model for r in rows):
                 row = _provider_template(group)
                 row.pop('aliases', None)
-                stem = group.get('label') or row.get('provider_label') or 'provider'
-                stem = '-'.join(stem.lower().split()) + '-' + model.replace('/', '-')
-                name = stem
-                suffix = 2
-                while any(r['name'] == name for r in rows):
-                    name = '%s-%d' % (stem, suffix)
-                    suffix += 1
-                row.update(name=name, model=model)
+                row.update(name=uuid.uuid4().hex, model=model)
                 rows.append(row)
             write_rows(rows)
 
@@ -1571,15 +1441,7 @@ def _work(stdscr, title, fn, lines=(), browser_url='', cancel=None):
 def _login_flow(stdscr, group):
     pid = group['id'][6:]
     try:
-        options = {}
-        field = read_oauth_profiles().get(pid, {}).get('referral_field')
-        if field:
-            referral = _input_line(stdscr, 'Referral code (optional, ENTER skips):')
-            if referral is None:
-                return 'Login cancelled'
-            if referral:
-                options[field] = referral
-        flow = _work(stdscr, 'Starting OAuth login', lambda: oauth_start(pid, options))
+        flow = _work(stdscr, 'Starting OAuth login', lambda: oauth_start(pid))
         if flow is None:
             return 'Login cancelled'
         url = flow.get('url', '')
@@ -1624,13 +1486,12 @@ def _setup_oauth(stdscr, pid, spec):
 
 
 def _add_flow(stdscr):
-    kind = _pick_list(stdscr, ['API key provider', 'OAuth provider', 'No-auth provider'], 'Add provider')
+    kind = _pick_list(stdscr, ['API key provider', 'OAuth provider'], 'Add provider')
     if kind is None:
         return 'Add cancelled'
-    if kind.startswith('API') or kind == 'No-auth provider':
+    if kind.startswith('API'):
         presets = {spec.get('label', pid): spec for pid, spec in read_provider_registry().items()
-                   if (spec.get('no_auth') if kind == 'No-auth provider' else
-                       not spec.get('no_auth') and (spec.get('api_key_supported') or not spec.get('authorize_url')))}
+                   if spec.get('api_key_supported') or not spec.get('authorize_url')}
         selected = _pick_list(stdscr, sorted(presets) + ['Custom API provider'], 'API provider')
         if selected is None:
             return 'Add cancelled'
@@ -1644,7 +1505,7 @@ def _add_flow(stdscr):
             base = _input_line(stdscr, 'Base URL (https://host/v1):')
             if not base:
                 return 'Add cancelled'
-        key = '' if preset and preset.get('no_auth') else _input_line(stdscr, 'API key (blank for keyless):', secret=True)
+        key = _input_line(stdscr, 'API key (blank for keyless):', secret=True)
         if key is None:
             return 'Add cancelled'
         pid = _save_api_provider(label, base, key)
@@ -1789,34 +1650,6 @@ def _quota_refresh(group):
             req = urllib.request.Request(spec['url'], headers=headers)
             with urllib.request.urlopen(req, timeout=20) as response:
                 payload = json.loads(response.read())
-            details = []
-            if spec.get('format') == 'weekly_budgets':
-                allowance = payload.get('allowance') or {}
-                budgets = payload.get('budgets') or allowance.get('budgets') or {}
-                reset = allowance.get('resetsAt')
-                if isinstance(reset, str) and reset:
-                    reset = datetime.datetime.fromisoformat(reset.replace('Z', '+00:00')).timestamp()
-                items = []
-                for family, budget in budgets.items():
-                    cap = budget.get('usdPerWeek')
-                    used = budget.get('spentUsd', 0)
-                    items.append({'show_name': 'GPT-6' if family == 'gpt6' else family.title(),
-                                  'total_units': cap or 0, 'used_units': used,
-                                  'period_end': reset, 'unit': 'USD', 'unlimited': cap is None,
-                                  'usage_tokens': budget.get('tokensThisWeek')})
-                if not items and 'tokensPerWeek' in allowance:
-                    items.append({'show_name': 'Weekly allowance', 'total_units': allowance['tokensPerWeek'],
-                                  'used_units': allowance.get('usedThisWeek', 0), 'period_end': reset})
-                if not items:
-                    raise ValueError('No weekly budget available')
-                details.append('Plan: ' + str(payload.get('plan', 'unknown')).title())
-                referral = payload.get('referral') or {}
-                if referral:
-                    details.append('Invite bonus: +%s / +%s tokens weekly | %s joined, %s active' % (
-                        format(referral.get('bonusTokensPerWeek', 0), ',.0f'),
-                        format(referral.get('bonusCapPerWeek', 0), ',.0f'),
-                        referral.get('joined', 0), referral.get('activeThisWeek', 0)))
-                payload = {'code': 0, 'data': {'balances': items}}
             if spec.get('format') == 'shared_daily':
                 if not isinstance(payload.get('freeTokenLimit'), (int, float)) or not isinstance(payload.get('freeTokensToday'), (int, float)):
                     raise ValueError('Missing shared quota balance')
@@ -1838,11 +1671,9 @@ def _quota_refresh(group):
                 balances.append({'name': item.get('show_name') or item.get('entitlement_id') or 'Model',
                                  'total': total, 'remaining': remaining,
                                  'percent': min(100, max(0, remaining / total * 100)) if total else 0,
-                                 'reset': item.get('period_end'), 'unit': item.get('unit', 'tokens'),
-                                 'used': used, 'unlimited': item.get('unlimited', False),
-                                 'usage_tokens': item.get('usage_tokens')})
+                                 'reset': item.get('period_end')})
             with QUOTA_LOCK:
-                QUOTA_STATE[key] = {'loading': False, 'at': time.time(), 'balances': balances, 'details': details}
+                QUOTA_STATE[key] = {'loading': False, 'at': time.time(), 'balances': balances}
         except urllib.error.HTTPError as exc:
             message = 'Quota request failed (HTTP %d); R retry' % exc.code
             if exc.code == 401:
@@ -1878,26 +1709,26 @@ def _draw_dashboard(stdscr, port, groups, group, entries, sel, status, started, 
         top = max(0, sel - room + 1)
         _putw(stdscr, 1, "PROVIDERS > " + group["label"] if group else "PROVIDERS", w, curses.A_BOLD)
         for i, row in enumerate(rows[top:top + room]):
-            text = row.get("model_id", row["model"]) if group else row["name"]
+            text = row["model"] if group else row["name"]
             _putw(stdscr, i + 2, " " + text, w, curses.A_REVERSE if top + i == sel else 0)
         _putw(stdscr, h - 2, status, w)
         _putw(stdscr, h - 1, "Enter models / a add / l login / Esc back / q quit", w)
         stdscr.refresh()
         return
     HAS_COLOR = bool(COLOR.get("ok"))
-    name_w = max(26, min(44, w // 3)) if group else (26 if w >= 110 else (20 if w >= 92 else 15))
+    name_w = 26 if w >= 110 else (20 if w >= 92 else 15)
     rest = w - (4 + name_w + 8 + 6 + 8)   # space left for model+base
     model_w = max(16, int(rest * 0.62))
     base_w = max(10, rest - model_w - 1)
-    cols = "   %-*s %-*s %-*s %7s %5s" % (name_w, "MODEL" if group else "PROVIDER", model_w,
-                                             "ROW" if group else "MODELS / AUTH", base_w, "HOST",
+    cols = "   %-*s %-*s %-*s %7s %5s" % (name_w, "NAME" if group else "PROVIDER", model_w,
+                                         "MODEL" if group else "MODELS / AUTH", base_w, "HOST",
                                          "LAT", "LAST")
     _putw(stdscr, 1, cols, w, curses.A_BOLD)
     _panel(stdscr, 2, w, G, "PROVIDERS > " + group["label"] if group else "PROVIDERS")
 
     detail_h = 7
     quota = QUOTA_STATE.get(group['id'], {}) if group and _quota_spec(group) else {}
-    quota_height = 2 + len(quota.get('details', [])) + 3 * len(quota.get('balances', [])) if group and _quota_spec(group) else 4
+    quota_height = 2 + 3 * len(quota.get('balances', [])) if group and _quota_spec(group) else 4
     table_rows = min(len(rows), max(1, h - (3 + detail_h + 2 + quota_height)))
     top = max(0, sel - table_rows + 1) if sel >= table_rows else 0
     y = 3
@@ -1968,9 +1799,6 @@ def _draw_dashboard(stdscr, port, groups, group, entries, sel, status, started, 
         snapshot = QUOTA_STATE.get(group['id'], {})
         message = ('Refreshing...' if snapshot.get('loading') else snapshot.get('error') or
                    'Updated ' + _age(snapshot.get('at')) if snapshot else 'R refresh quota')
-        for detail in snapshot.get('details', []):
-            _putw(stdscr, y, '  ' + detail, w, LABEL)
-            y += 1
         _putw(stdscr, y, '  ' + message, w, LABEL)
         y += 1
         balances = snapshot.get('balances', [])
@@ -1986,18 +1814,11 @@ def _draw_dashboard(stdscr, port, groups, group, entries, sel, status, started, 
             remaining = format(balance['remaining'], ',.0f')
             total = format(balance['total'], ',.0f')
             used = format(max(0, balance['total'] - balance['remaining']), ',.0f')
-            unit = balance.get('unit', 'tokens')
-            if unit == 'USD':
-                remaining = '$%.2f' % balance['remaining']
-                total = 'Unlimited' if balance.get('unlimited') else '$%.2f' % balance['total']
-                used = '$%.2f' % balance.get('used', 0)
-            usage_tokens = balance.get('usage_tokens')
-            usage_text = (' | ' + format(usage_tokens, ',.0f') + ' tokens') if usage_tokens is not None else ''
             reset = time.strftime('%b %d %H:%M %Z', time.localtime(balance['reset'])) if balance.get('reset') else 'Unknown'
             if detailed:
                 _putw(stdscr, y, '  ' + balance['name'], w, curses.A_BOLD)
-                _putw(stdscr, y + 1, '  %s  %5.1f%% remaining  |  %s %s left%s' % (bar, pct, remaining, unit, usage_text), w, color)
-                _putw(stdscr, y + 2, '  Used %s / %s %s  |  Resets %s' % (used, total, unit, reset), w, LABEL)
+                _putw(stdscr, y + 1, '  %s  %5.1f%% remaining  |  %s tokens left' % (bar, pct, remaining), w, color)
+                _putw(stdscr, y + 2, '  Used %s / %s  |  Resets %s' % (used, total, reset), w, LABEL)
                 y += 3
             else:
                 text = '  %s  %s  %.0f%%  |  %s / %s left' % (balance['name'], bar, pct, remaining, total)
@@ -2348,7 +2169,7 @@ def main():
                 spec["api_mode"] = api_mode
             if entry.get("poll_method"):
                 spec["poll_method"] = entry["poll_method"]
-            for k in ("referral_field", "refresh_body", "quota", "token_body", "authorize_body", "headers", "envelope",
+            for k in ("refresh_body", "quota", "token_body", "authorize_body", "headers", "envelope",
                       "client_poll_token", "verify_url_key", "expires_at_key",
                       "token_key", "status_key", "pending_status",
                       "failed_status", "poll_interval", "expires_in",
