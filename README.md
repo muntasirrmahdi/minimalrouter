@@ -285,11 +285,21 @@ Profile fields:
 | `refresh_url` | optional; called with the refresh token when the access token expires |
 | `base_url` | OpenAI-compatible base for chat requests |
 | `models` | list of model ids, or objects with `model` + `aliases` |
-| `api_mode` | `chat_completions` (default) or `responses` for Responses-style upstreams |
+| `api_mode` | `chat_completions` (default), `responses` for Responses-style upstreams, or `anthropic` for `/v1/messages` upstreams |
 | `headers` | optional extra headers; `{token}` is replaced at request time |
 | `authorize_body` | optional extra JSON sent to `authorize_url` |
 | `token_body` | optional static poll body; `{device_code}` is replaced at poll time |
 | `poll_method` | `POST` (default) or `GET`; GET appends `/<device_code>` to `token_url` |
+| `envelope` | dot path to the payload object when responses wrap it, e.g. `data` for `{code, data}` |
+| `client_poll_token` | `true` when the authorize call needs an Authorization token this client mints; it is reused on every poll |
+| `verify_url_key` | key inside the (unwrapped) authorize payload that holds the verification URL |
+| `expires_at_key` | key holding an absolute expiry (epoch or ISO) when the payload has no `expires_in` |
+| `token_key` | path to the access token in the (unwrapped) poll payload, default `access_token` |
+| `status_key` / `pending_status` / `failed_status` | poll-status field and its waiting/failed values when the server signals progress in the body |
+| `poll_interval` / `expires_in` | fallbacks for the poll cadence and flow lifetime |
+| `system_blocks` | for `api_mode: anthropic`: the system prompt blocks sent upstream; `{client_system}` is replaced with the client's own system text |
+| `model_map` | optional upstream model id per exposed model id |
+| `user_metadata` | `true` to send `metadata.user_id` with a device/session id on anthropic upstreams |
 
 Tokens land in `~/.minimalrouter/oauth.json` (mode 600, gitignored) and the
 profile's models appear in `/v1/models`. Expired tokens are refreshed on demand

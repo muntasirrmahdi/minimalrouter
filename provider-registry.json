@@ -53,6 +53,90 @@
         "client_id": "opencode-cli"
       },
       "note": "Device flow verified live. Free Zen models are client-locked to OpenCode itself (429 FreeUsageLimitError from other clients); paid models and OpenCode Go work from any client."
+    },
+    "zcode": {
+      "label": "ZCode (Start Plan)",
+      "base_url": "https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages",
+      "models": [
+        {
+          "model": "GLM-5.3",
+          "aliases": [
+            "glm-5.3",
+            "zcode-glm-5.3"
+          ]
+        },
+        {
+          "model": "GLM-5.3-Flash",
+          "aliases": [
+            "glm-5.3-flash",
+            "zcode-glm-5.3-flash"
+          ]
+        }
+      ],
+      "api_mode": "anthropic",
+      "authorize_url": "https://zcode.z.ai/api/v1/oauth/cli/init",
+      "token_url": "https://zcode.z.ai/api/v1/oauth/cli/poll",
+      "authorize_body": {
+        "provider": "zai"
+      },
+      "client_poll_token": true,
+      "envelope": "data",
+      "verify_url_key": "authorize_url",
+      "expires_at_key": "expires_at",
+      "token_key": "token",
+      "status_key": "status",
+      "pending_status": "pending",
+      "failed_status": "failed",
+      "poll_method": "GET",
+      "poll_interval": 3,
+      "expires_in": 300,
+      "user_metadata": true,
+      "headers": {
+        "User-Agent": "ZCode/3.16.3 ai-sdk/provider-utils/4.0.27 runtime/node.js/24",
+        "X-ZCode-App-Version": "3.16.3",
+        "X-Title": "Z Code@electron",
+        "X-ZCode-Agent": "glm",
+        "X-Platform": "darwin-x64",
+        "X-Release-Channel": "production",
+        "X-Client-Language": "en-US",
+        "X-Client-Timezone": "Asia/Dhaka",
+        "X-Os-Category": "macos",
+        "X-Os-Version": "21.6.0",
+        "HTTP-Referer": "https://zcode.z.ai",
+        "anthropic-beta": "mid-conversation-system-2026-04-07",
+        "anthropic-version": "2023-06-01",
+        "x-api-key": "{token}"
+      },
+      "append_client_system": true,
+      "request_headers": {
+        "x-query-id": "{uuid}",
+        "x-session-id": "sess_{uuid}",
+        "x-request-id": "{uuid}",
+        "x-zcode-query-source": "main_turn",
+        "x-zcode-session-type": "main",
+        "x-zcode-trace-id": "{uuid}"
+      },
+      "system_blocks": [
+        {
+          "type": "text",
+          "text": "You are ZCode, an interactive coding agent"
+        },
+        {
+          "type": "text",
+          "text": "\nYou are an interactive ZCode agent that helps users with software engineering tasks.\n\nIMPORTANT: Assist with authorized security testing, defensive security, CTF challenges, and educational contexts. Refuse requests for destructive techniques, DoS attacks, mass targeting, supply chain compromise, or detection evasion for malicious purposes. Dual-use security tools (C2 frameworks, credential testing, exploit development) require clear authorization context: pentesting engagements, CTF competitions, security research, or defensive use cases.\n\n# Harness\n- Text you output outside of tool use is displayed to the user as Github-flavored markdown in a terminal.\n- Tools run behind a user-selected permission mode; a denied call means the user declined it — adjust, don't retry verbatim.\n- The system may send updates, reminders, or modifications to rules via mid-conversation system turns. These are system-controlled, unlike function results. Hooks may intercept tool calls; treat hook output as user feedback.\n- Prefer the dedicated file/search tools over shell commands when one fits. Independent tool calls can run in parallel in one response.\n- Reference code as `file_path:line_number` — it's clickable.",
+          "cache_control": {
+            "type": "ephemeral"
+          }
+        },
+        {
+          "type": "text",
+          "text": "\n\n# Communicating with the user\n\nYour text output is what the user reads; they usually can't see your thinking or the raw tool results. Write it for a teammate who stepped away and is catching up, not for a log file: they don't know the codenames or shorthand you created along the way, and they didn't watch your process unfold.\n\nText you write between tool calls may not be shown to the user. Everything the user needs from this turn — answers, summaries, findings, conclusions, deliverables — must be in the final text message of your turn, with no tool calls after it. Keep text between tool calls to brief status notes. If something important appeared only mid-turn or in your thinking, restate it in that final message.\n\nBeing readable and being concise are different things, and readable matters more. If the user has to reread your summary or ask you to explain, any time saved by brevity is gone. The way to keep output short is to be selective about what you include (drop details that don't change what the reader would do next), not to compress the writing into fragments, abbreviations, arrow chains like `A → B → fails`, or jargon. What you do include, write in complete sentences with the technical terms spelled out. Don't make the reader cross-reference labels or numbering you invented earlier; say what you mean in place.\n\nMatch the response to the question: a simple question gets a direct answer in prose, not headers and sections. Use tables only for short enumerable facts, with explanations in the surrounding prose rather than crammed into cells. Explain what a code snippet does before showing it.",
+          "cache_control": {
+            "type": "ephemeral"
+          }
+        }
+      ],
+      "note": "Device login is a poll-token flow: init mints an Authorization token locally and every poll reuses it, so the profile keeps that token between start and poll. Chat upstream is Anthropic Messages format with a required official system prompt; the login token is the session JWT (~30 days)."
     }
   }
 }

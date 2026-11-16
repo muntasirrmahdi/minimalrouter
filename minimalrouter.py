@@ -44,8 +44,11 @@ HTTP API:
 """
 import json
 import os
+import secrets
+import uuid
 import sys
 import time
+import datetime
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -161,6 +164,22 @@ DISCOVERY_REFRESH_PATHS = (
 def _origin(url):
     u = urllib.parse.urlsplit(url)
     return "%s://%s" % (u.scheme, u.netloc)
+
+
+def _dig(d, path):
+    for part in (path or "").split("."):
+        if not part or not isinstance(d, dict):
+            return None
+        d = d.get(part)
+    return d
+
+
+def _envelope(payload, spec):
+    if isinstance(payload, dict) and spec.get("envelope"):
+        inner = _dig(payload, spec["envelope"])
+        if isinstance(inner, dict):
+            return inner
+    return payload
 
 
 def _post_json(url, body, timeout=20):
@@ -414,6 +433,8 @@ def upstream(base, key, path, payload=None, timeout=TIMEOUT, row=None):
     api_mode = row.get("api_mode", "chat_completions")
     if api_mode == "responses" and path == "/v1/chat/completions":
         return oauth_chat(row, payload, timeout)
+    if api_mode == "anthropic" and path == "/v1/chat/completions":
+        return anthropic_chat(row, payload, timeout)
     url = ep(base, path)
     data = json.dumps(payload).encode() if payload is not None else None
     req = urllib.request.Request(url, data=data,
@@ -455,8 +476,99 @@ def oauth_chat(row, payload, timeout=TIMEOUT):
     return urllib.request.urlopen(req, timeout=timeout)
 
 
+ANTHROPIC_DEFAULT_SYSTEM = [{"type": "text", "text": "{client_system}"}]
+
+
+def _content_blocks(content):
+    if isinstance(content, str):
+        return [{"type": "text", "text": content}]
+    if isinstance(content, list):
+        out = []
+        for c in content:
+            if isinstance(c, dict) and c.get("type") == "text":
+                out.append({"type": "text", "text": str(c.get("text", ""))})
+        return out
+    return []
+
+
+def anthropic_chat(row, payload, timeout=TIMEOUT):
+    spec = read_oauth_profiles().get(row.get("oauth_provider", ""), {})
+    token = row.get("key", "")
+    messages = payload.get("messages", [])
+    system = "\n\n".join(str(m.get("content", "")) for m in messages
+                         if m.get("role") == "system")
+    blocks = [dict(b) for b in (spec.get("system_blocks")
+                                or ANTHROPIC_DEFAULT_SYSTEM)]
+    for b in blocks:
+        b["text"] = str(b.get("text", "")).replace("{client_system}",
+                                                   system or "n/a")
+    if spec.get("append_client_system") and system:
+        blocks[-1]["text"] += "\n\n# Client instructions\n" + system
+    msgs = [{"role": m.get("role", "user"),
+             "content": _content_blocks(m.get("content", ""))}
+            for m in messages if m.get("role") in ("user", "assistant")]
+    model = row.get("model") or (spec.get("model_map") or {}).get(
+        payload.get("model", ""), payload.get("model", ""))
+    body = {"model": model, "max_tokens": payload.get("max_tokens") or 8192,
+            "system": blocks, "messages": msgs, "stream": False}
+    if msgs and msgs[-1]["content"]:
+        msgs[-1]["content"][-1]["cache_control"] = {"type": "ephemeral"}
+    if spec.get("user_metadata"):
+        body["metadata"] = {"user_id": json.dumps({
+            "device_id": str(uuid.uuid4()), "account_uuid": "",
+            "session_id": "sess_" + str(uuid.uuid4())})}
+    url = row["base"].rstrip("/")
+    if not url.endswith("/messages"):
+        url += "/v1/messages"
+    req = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST")
+    req.add_header("Content-Type", "application/json")
+    req.add_header("Accept", "application/json")
+    for hk, hv in oauth_headers(row.get("oauth_provider", ""), token,
+                                row.get("org_id", "")).items():
+        req.add_header(hk, hv)
+    for hk, hv in (spec.get("request_headers") or {}).items():
+        req.add_header(hk, str(hv).replace("{uuid}", str(uuid.uuid4())))
+    return urllib.request.urlopen(req, timeout=timeout)
+
+
+def anthropic_text(raw):
+    parts = []
+    for c in (raw or {}).get("content") or []:
+        if isinstance(c, dict) and c.get("type") == "text":
+            parts.append(str(c.get("text", "")))
+    return "".join(parts)
+
+
+class _AnthropicResponse:
+    def __init__(self, raw):
+        self._raw = raw
+
+    def read(self, n=-1):
+        if isinstance(self._raw, (bytes, bytearray)):
+            return bytes(self._raw)
+        return json.dumps(self._raw).encode()
+
+
+def chat_from_anthropic(row, payload):
+    resp = anthropic_chat(row, dict(payload, stream=False))
+    raw = json.loads(resp.read() or b"{}")
+    if raw.get("code") or raw.get("error"):
+        raise RuntimeError(raw.get("msg") or str(raw.get("error")))
+    text = anthropic_text(raw)
+    openai = {"id": raw.get("id", "chatcmpl-anthropic"),
+              "object": "chat.completion",
+              "created": int(time.time()),
+              "model": payload.get("model", ""),
+              "choices": [{"index": 0, "finish_reason": "stop",
+                           "message": {"role": "assistant", "content": text}}],
+              "usage": {"prompt_tokens": (raw.get("usage") or {}).get("input_tokens", 0),
+                        "completion_tokens": (raw.get("usage") or {}).get("output_tokens", 0),
+                        "total_tokens": ((raw.get("usage") or {}).get("input_tokens", 0)
+                                         + (raw.get("usage") or {}).get("output_tokens", 0))}}
+    return _AnthropicResponse(openai)
+
+
 def responses_text(raw):
-    """Extract assistant text from a Responses-style payload."""
     if not isinstance(raw, dict):
         return ""
     if isinstance(raw.get("output_text"), str):
@@ -483,9 +595,13 @@ def probe(base, key, model, row=None):
                "messages": [{"role": "user",
                              "content": "Reply with exactly: OK"}]}
     try:
-        resp = upstream(base, key, "/v1/chat/completions", payload,
-                        timeout=PROBE_TIMEOUT, row=row or {})
-        body = json.loads(resp.read() or b"{}")
+        if (row or {}).get("api_mode") == "anthropic":
+            resp = chat_from_anthropic(row, dict(payload, stream=False))
+            body = json.loads(resp.read() or b"{}")
+        else:
+            resp = upstream(base, key, "/v1/chat/completions", payload,
+                            timeout=PROBE_TIMEOUT, row=row or {})
+            body = json.loads(resp.read() or b"{}")
         ms = (time.time() - t0) * 1000
         if isinstance(body, dict) and "choices" not in body \
                 and (body.get("output") or body.get("output_text")):
@@ -512,7 +628,7 @@ def probe(base, key, model, row=None):
 def fetch_models(base, key):
     resp = upstream(base, key, "/v1/models", timeout=PROBE_TIMEOUT)
     body = json.loads(resp.read() or b"{}")
-    data = body.get("data", body if isinstance(body, list) else [])
+    data = body if isinstance(body, list) else body.get("data", [])
     ids = []
     for m in data:
         i = m.get("id") if isinstance(m, dict) else m
@@ -739,6 +855,35 @@ class Handler(BaseHTTPRequestHandler):
                         log("OK  %s via %s (responses mode) %.1fs"
                             % (model, row["name"], time.time() - t0))
                         return
+                    if row.get("api_mode") == "anthropic":
+                        resp = chat_from_anthropic(row, body)
+                        data = resp.read()
+                        ROW_STATE[row["name"]] = {
+                            "status": "ok", "ms": (time.time() - t0) * 1000,
+                            "at": time.time()}
+                        if stream:
+                            parsed = json.loads(data)
+                            chunk = {"id": parsed.get("id", "chatcmpl-anthropic"),
+                                     "object": "chat.completion.chunk",
+                                     "created": int(time.time()),
+                                     "model": model,
+                                     "choices": [{"index": 0,
+                                                  "delta": {"role": "assistant",
+                                                            "content": (parsed.get("choices") or [{}])[0]
+                                                                       .get("message", {}).get("content", "")},
+                                                  "finish_reason": "stop"}]}
+                            self.send_response(200)
+                            self.send_header("Content-Type", "text/event-stream")
+                            self.send_header("Transfer-Encoding", "chunked")
+                            self.end_headers()
+                            self._chunk(("data: %s\n\n" % json.dumps(chunk)).encode())
+                            self._chunk(b"data: [DONE]\n\n")
+                            self._chunk(b"")
+                        else:
+                            self._send(200, raw=data)
+                        log("OK  %s via %s (anthropic mode) %.1fs"
+                            % (model, row["name"], time.time() - t0))
+                        return
                     resp = upstream(row["base"], row["key"],
                                     "/v1/chat/completions", body, row=row)
                     if stream:
@@ -873,22 +1018,47 @@ def oauth_device_start(provider):
     if not spec:
         raise ValueError("unknown OAuth provider (add it to ~/.minimalrouter/oauth-providers.json first)")
     body = spec.get("authorize_body", {})
-    res = oauth_post(spec["authorize_url"], provider, "", body)
-    return json.loads(res.read() or b"{}")
+    token = ""
+    if spec.get("client_poll_token"):
+        token = secrets.token_hex(32)
+    res = oauth_post(spec["authorize_url"], provider, token, body)
+    return json.loads(res.read() or b"{}"), token
 
 
 def oauth_start(provider):
     try:
-        d = oauth_device_start(provider)
-        url = (d.get("verification_uri_complete") or d.get("verification_uri")
-               or d.get("verificationUrl") or "")
+        raw, poll_token = oauth_device_start(provider)
+        spec = read_oauth_profiles().get(provider, {})
+        d = _envelope(raw, spec)
+        url = str(d.get("verification_uri_complete") or d.get("verification_uri")
+                  or d.get("verificationUrl")
+                  or _dig(d, spec.get("verify_url_key", "")) or "")
         if url.startswith("/"):
-            spec = read_oauth_profiles().get(provider, {})
             url = _origin(spec.get("authorize_url", "")) + url
-        return {"device_code": d.get("device_code") or d.get("code"),
+        interval = d.get("interval", spec.get("poll_interval", 5))
+        expires = d.get("expires_in", spec.get("expires_in", 600))
+        if spec.get("expires_at_key"):
+            ea = _dig(raw, spec["expires_at_key"])
+            ea = _dig(raw, "data." + spec["expires_at_key"]) if ea is None else ea
+            target = None
+            if isinstance(ea, (int, float)):
+                target = ea / 1000.0 if ea > 1e12 else ea
+            elif isinstance(ea, str):
+                try:
+                    target = datetime.datetime.fromisoformat(
+                        ea.replace("Z", "+00:00")).timestamp()
+                except ValueError:
+                    target = None
+            if target:
+                expires = max(1, int(target - time.time()))
+        out = {"device_code": d.get("device_code") or d.get("code")
+               or d.get("flow_id") or "",
                 "user_code": d.get("user_code") or d.get("code", ""),
                 "url": url,
-                "interval": d.get("interval", 5), "expires": d.get("expires_in", 600)}
+                "interval": interval, "expires": expires}
+        if poll_token:
+            out["poll_token"] = poll_token
+        return out
     except Exception as e:
         raise RuntimeError("OAuth start failed for %s: %s" % (provider, e))
 
@@ -910,6 +1080,11 @@ def oauth_poll(provider, flow):
     method = spec.get("poll_method", "POST").upper()
     body = _render_body(spec.get("token_body") or
                         {"device_code": flow["device_code"]}, flow["device_code"])
+    poll_token = flow.get("poll_token", "")
+    token_key = spec.get("token_key", "access_token")
+    status_key = spec.get("status_key", "")
+    pending_status = spec.get("pending_status", "")
+    failed_status = spec.get("failed_status", "")
     interval = float(flow.get("interval", 5) or 5)
     last_msg = ""
     while time.time() < deadline:
@@ -920,19 +1095,28 @@ def oauth_poll(provider, flow):
             if method == "GET":
                 url = poll_url.rstrip("/") + "/" + urllib.parse.quote(
                     flow["device_code"], safe="")
-                req = urllib.request.Request(url, headers={"User-Agent": UA,
-                                                           "Accept": "application/json"})
+                headers = {"User-Agent": UA, "Accept": "application/json"}
+                if poll_token:
+                    headers["Authorization"] = "Bearer " + poll_token
+                req = urllib.request.Request(url, headers=headers)
                 with urllib.request.urlopen(req, timeout=30) as r:
                     status = r.status
                     d = json.loads(r.read() or b"{}")
             else:
                 status, d = _post_json(poll_url, body, timeout=30)
-        except Exception as e:  # transport hiccup: keep waiting until deadline
+        except Exception as e:
             last_msg = str(e)
             continue
 
+        d = _envelope(d, spec)
+        st = str(_dig(d, status_key) or "") if status_key else ""
+        if status_key and pending_status and st == pending_status:
+            last_msg = "authorization pending"
+            continue
+        if status_key and failed_status and st == failed_status:
+            raise RuntimeError("authorization failed or cancelled")
         code = error_code(d)
-        access = d.get("access_token") or d.get("token")
+        access = _dig(d, token_key) or d.get("access_token") or d.get("token")
         if access:
             out = {"access_token": access,
                    "refresh_token": d.get("refresh_token", "")}
@@ -1497,7 +1681,12 @@ def main():
                 spec["api_mode"] = api_mode
             if entry.get("poll_method"):
                 spec["poll_method"] = entry["poll_method"]
-            for k in ("token_body", "authorize_body", "headers"):
+            for k in ("token_body", "authorize_body", "headers", "envelope",
+                      "client_poll_token", "verify_url_key", "expires_at_key",
+                      "token_key", "status_key", "pending_status",
+                      "failed_status", "poll_interval", "expires_in",
+                      "system_blocks", "model_map", "user_metadata",
+                      "request_headers", "append_client_system"):
                 if entry.get(k):
                     spec[k] = entry[k]
             profiles[pid] = spec
