@@ -366,9 +366,17 @@ a successful call followed by 429/503 seconds later is normal.
 
 **Class status at a glance (2026-11-18):** `kilocode` keyless works but flaky;
 `pollinations` keyless works but 402s quickly; `dahl` API works (~4s); `dl` OAuth
-device flow works but the stored token is expired; `opencode` is sidelined
-(`routable:false` — free tier is client-locked); `omnirush` and `freebuff` are
-OAuth-login-only and need a translator before they can route.
+device flow re-approved and working (verified 2026-11-18 ~5:07 AM); `opencode`
+is sidelined (`routable:false` — free tier is client-locked).
+
+**OAuth login does not always mean OAuth class here.** `omnirush` and `freebuff`
+both have real device-code logins, but a bare token cannot route: omnirush needs
+a Responses-only translator with policed client headers; freebuff needs an
+agent-run plus a system-message marker. When either runs through a local bridge,
+register that bridge's loopback endpoint as an **API-class row** (base URL + a
+static key) — the OAuth lives inside the bridge, not in MinimalRouter. Do NOT
+add either as an OAuth preset: the profile would connect but every call would
+fail. `opencode` stays in the sidebar for now.
 
 ## Troubleshooting
 
