@@ -52,7 +52,8 @@
       "authorize_body": {
         "client_id": "opencode-cli"
       },
-      "note": "Device flow verified live. Free Zen models are client-locked to OpenCode itself (429 FreeUsageLimitError from other clients); paid models and OpenCode Go work from any client."
+      "routable": false,
+      "note": "SIDELINED 2026-11-18 per Moon: free Zen models are client-locked (429 FreeUsageLimitError to every non-OpenCode client, UA/header spoof does not bypass); paid/OpenCode Go only. Device flow itself is real. Not a working free OAuth preset - do not advertise as one-word connect."
     }
   }
 }
