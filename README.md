@@ -314,6 +314,43 @@ another app's credential store. Connect an account through
 `minimalrouter oauth <provider>` so the provider's own device flow is visible
 and the resulting token is stored locally.
 
+## Keep in mind — DL and provider classes
+
+These are the traps that actually bite. Read them before you pick a provider.
+
+**Directionally Local (`dl`) is an OAuth-class provider, and its device token expires.**
+It is not an API-key row: you sign in once through `minimalrouter oauth dl` and the
+router stores the token locally. When that token dies, the router attempts a refresh
+on **every** request and logs `OAUTH-REFRESH dl failed: HTTP 401` — all four of its
+models (`gpt-6-luna`, `gpt-6.1-sol`, `gpt-6-astra`,
+`deepseek/deepseek-v4.1-flash-1017`) then fail with 502 even though other rows work.
+The device flow itself is healthy (a real `user_code` is issued); the fix is a
+re-approval, not a reinstall:
+
+```sh
+minimalrouter oauth dl       # prints a URL + user code, waits for browser approval
+```
+
+If you also use the dl/Autopilot CLI, the router rotates the refresh token on
+refresh — mirror the new pair back to that CLI's config or it will sign you out.
+No install of the dl CLI is needed to route through MinimalRouter.
+
+**`dahl` is an API-class row, not OAuth.** It carries an inline `dahl_...` key, so there
+is no device login and no token to expire. Verified live 2026-11-18: real completion,
+correct model echo, ~4s. Its key is stored in `~/.minimalrouter/rows.json` (600); it
+is a paid/credit endpoint, so watch its balance, not a token expiry.
+
+**Three classes, one engine path.** API = paste a key; OAuth = browser approve;
+Keyless = an API row with an empty key (kilocode, pollinations). Keyless is a
+documentation label, not a third auth mechanism. Keyless free tiers are rationed —
+a successful call followed by 429/503 seconds later is normal.
+
+**Class status at a glance (2026-11-18):** `kilocode` keyless works but flaky;
+`pollinations` keyless works but 402s quickly; `dahl` API works (~4s); `dl` OAuth
+device flow works but the stored token is expired; `opencode` is sidelined
+(`routable:false` — free tier is client-locked); `omnirush` and `freebuff` are
+OAuth-login-only and need a translator before they can route.
+
 ## Troubleshooting
 
 | Symptom | Cause | Fix |
