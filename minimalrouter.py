@@ -4,10 +4,13 @@
 Single file, stdlib only. No server authentication, no web UI. Binds 127.0.0.1.
 Terminal dashboard (curses) in the same process.
 
-Two ways to add a provider:
-  1. API key row  — dashboard `a`, paste base URL + key, pick a model.
-  2. OAuth row    — `minimalrouter oauth add` (writes a provider profile),
+Three connection classes (one engine path; class is derived from row shape, never trusted
+from a label):
+  1. API row      — key or key_env in rows.json (`minimalrouter`, press a).
+  2. OAuth row    — `minimalrouter oauth add` (writes a profile),
                     then `minimalrouter oauth <profile-id>` (device sign-in).
+  3. Keyless row  — an API row with no key and no key_env; the upstream serves it
+                    anonymously (e.g. kilocode-free). Docs label only.
 
 Usage:
   minimalrouter              server + terminal dashboard
@@ -70,6 +73,8 @@ UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/120.0 Safari/537.36")
 ROW_LOCK = Lock()
 ROW_STATE = {}
+# Three connection classes. Class is always DERIVED from row shape, never from a label.
+VALID_CLASSES = ("api", "oauth", "keyless")
 
 
 def load_env():
@@ -131,7 +136,15 @@ def read_provider_registry():
         with open(PROVIDER_REGISTRY_PATH) as f:
             data = json.load(f)
         providers = data.get("providers", data) if isinstance(data, dict) else {}
-        return providers if isinstance(providers, dict) else {}
+        if not isinstance(providers, dict):
+            return {}
+        # Optional `class` is a display hint only. Validate to the known set;
+        # an unknown value is dropped, never allowed to influence a request.
+        for entry in providers.values():
+            if isinstance(entry, dict) and "class" in entry \
+                    and entry.get("class") not in VALID_CLASSES:
+                entry.pop("class", None)
+        return providers
     except (OSError, json.JSONDecodeError):
         return {}
 
@@ -529,11 +542,37 @@ def BY_MODEL(rows):
     return bm
 
 
+def row_class(row):
+    """Derive the connection class from a row's actual shape.
+
+    API    = file row whose key comes from a key or key_env (pasted/env key).
+    OAuth  = row produced by an OAuth profile (has oauth_provider).
+    Keyless = file row with no key and no key_env; the upstream serves it anonymously.
+
+    Security: this is DERIVED, never read from a user-supplied `class` field. A row
+    cannot claim to be keyless to skip auth, nor oauth to gain a token: shape decides.
+    """
+    if not isinstance(row, dict):
+        return "api"
+    if row.get("oauth_provider"):
+        return "oauth"
+    if row.get("key") or row.get("key_env"):
+        return "api"
+    return "keyless"
+
+
+def class_label(cls):
+    """Short, stable tag for the dashboard; unknown values collapse to '?'."""
+    return {"api": "API", "oauth": "OAUTH", "keyless": "KEYLESS"}.get(cls, "?")
+
+
 def state_for(rows):
     out = []
     for r in rows:
         st = dict(ROW_STATE.get(r["name"], {"status": "unknown"}))
+        cls = row_class(r)
         out.append({"name": r["name"], "model": r["model"], "base": r["base"],
+                    "class": cls,
                     "key_src": ("env:" + r["key_env"]) if r.get("key_env")
                     else ("pasted" if r.get("key") else "none"),
                     "aliases": r.get("aliases", []), "state": st})
@@ -586,8 +625,13 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, raw=msg.encode(), ctype="text/plain")
         if p == "/health":
             rows = all_rows()
+            by_class = {}
+            for r in rows:
+                c = row_class(r)
+                by_class[c] = by_class.get(c, 0) + 1
             return self._send(200, {"ok": True, "rows": len(rows),
                                     "models": len(BY_MODEL(rows)),
+                                    "classes": by_class,
                                     "port": PORT})
         if p == "/api/state":
             rows = all_rows()
@@ -661,6 +705,9 @@ class Handler(BaseHTTPRequestHandler):
                 slug = "".join(c if c.isalnum() else "-" for c in model
                                )[:40].strip("-")
                 name, i = "%s-%s" % (host, slug), 2
+            # Class is derived from the row shape (key present or not); a caller
+            # cannot pass `class` to claim a different auth path.
+            new_row = {"name": name, "base": base, "model": model, "key": key}
             ok, ms, err, content = probe(base, key, model)
             if not ok:
                 return self._send(400, {"ok": False,
@@ -669,11 +716,12 @@ class Handler(BaseHTTPRequestHandler):
                 rows = read_rows()  # file rows only: never persist OAuth rows
                 while any(r["name"] == name for r in rows):
                     name, i = "%s-%d" % (name, i), i + 1
-                rows.append({"name": name, "base": base, "model": model,
-                             "key": key})
+                new_row["name"] = name
+                rows.append(new_row)
                 write_rows(rows)
             ROW_STATE[name] = {"status": "ok", "ms": ms, "at": time.time()}
-            log("ADD %s (%s / %s) ok %.0fms" % (name, base, model, ms))
+            log("ADD %s (%s / %s) %s ok %.0fms" % (
+                name, base, model, row_class(new_row), ms))
             return self._send(200, {"ok": True, "name": name})
 
         if p == "/api/remove":
@@ -1059,17 +1107,17 @@ def _curses_main(stdscr, port):
 
         # ---- column header ---------------------------------------------
         name_w = 26 if w >= 110 else (20 if w >= 92 else 15)
-        rest = w - (4 + name_w + 8 + 6 + 8)   # space left for model+base
+        rest = w - (12 + name_w + 8 + 6 + 8)  # space left for model+base (CLASS col added)
         model_w = max(16, int(rest * 0.62))
         base_w = max(10, rest - model_w - 1)
-        cols = "   %-*s %-*s %-*s %7s %5s" % (name_w, "NAME", model_w,
-                                             "MODEL", base_w, "HOST",
+        cols = "   %-7s %-*s %-*s %-*s %7s %5s" % ("CLASS", name_w, "NAME",
+                                             model_w, "MODEL", base_w, "HOST",
                                              "LAT", "LAST")
         _putw(stdscr, 1, cols, w, curses.A_BOLD)
         _panel(stdscr, 2, w, G, "")
 
         # ---- layout budget ---------------------------------------------
-        detail_h = 7
+        detail_h = 8
         table_rows = min(len(rows), max(3, h - (3 + detail_h + 3 + 4)))
         top = max(0, sel - table_rows + 1) if sel >= table_rows else 0
         y = 3
@@ -1080,8 +1128,9 @@ def _curses_main(stdscr, port):
             lat = ("%dms" % int(s.get("ms") or 0)) if stt != "unknown" else "-"
             host = urllib.parse.urlparse(row["base"]).netloc[:base_w]
             mark = {"ok": G["ok"], "fail": G["bad"]}.get(stt, G["unk"])
-            line = " %s %s %-*s %-*s %-*s %7s %5s" % (
+            line = " %s %s %-7s %-*s %-*s %-*s %7s %5s" % (
                 G["sel"] if idx == sel else " ", mark,
+                class_label(row.get("class", row_class(row))),
                 name_w, row["name"][:name_w],
                 model_w, row["model"][:model_w],
                 base_w, host, lat, _age(s.get("at")))
@@ -1103,6 +1152,7 @@ def _curses_main(stdscr, port):
             stt = s.get("status", "unknown")
             pairs = [
                 ("name", row["name"]),
+                ("class", class_label(row.get("class", row_class(row)))),
                 ("model", row["model"]),
                 ("base", row["base"]),
                 ("key", row.get("key_src", "-")),
@@ -1304,8 +1354,13 @@ Usage:
   minimalrouter -v           show version
 
 Endpoint: http://127.0.0.1:%d/v1     (env MINIMALROUTER_PORT overrides the port)
-No server authentication. Localhost only. OAuth provider logins are supported
-through profiles; the client-facing format is OpenAI Chat Completions.
+No server authentication. Localhost only. Three connection classes, one engine path:
+  API     - a key or key_env in rows.json (dashboard: press a, paste URL + key).
+  OAUTH   - a device-flow profile: `oauth add` then `oauth <id>`.
+  KEYLESS - an API row with no key; the upstream serves it with no Authorization header.
+Class is derived from the row's real shape, never from a label; a row cannot claim a class.
+The dashboard and GET /api/state show the class of every row. Client format is OpenAI Chat
+Completions.
 
 Dashboard keys:
   up/down  select row     t  re-test row      a  add a row
@@ -1347,8 +1402,9 @@ def main():
                 return 0
             for pid, spec in sorted(profiles.items()):
                 state = "connected" if (auth.get(pid) or {}).get("access_token") else "not connected"
-                print("%-14s %-24s %-12s models: %s"
-                      % (pid, spec.get("label", pid), state,
+                hint = spec.get("class") if spec.get("class") in VALID_CLASSES else "oauth"
+                print("%-14s %-24s %-12s class: %-7s models: %s"
+                      % (pid, spec.get("label", pid), state, hint,
                          ", ".join(m if isinstance(m, str) else m.get("model", "")
                                    for m in spec.get("models", []))))
             return 0

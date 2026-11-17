@@ -314,6 +314,25 @@ another app's credential store. Connect an account through
 `minimalrouter oauth <provider>` so the provider's own device flow is visible
 and the resulting token is stored locally.
 
+## Three connection classes
+
+One engine path, three ways a row gets its credential. The class is **derived from the
+row's actual shape**, never from a label — a row cannot claim to be keyless to skip auth,
+or OAuth to borrow a token.
+
+| Class | How it authenticates | Where it lives | How to add |
+|---|---|---|---|
+| **API** | a key or `key_env` | `rows.json` | dashboard `a`, or `POST /api/add` |
+| **OAuth** | device-flow token | profile + `oauth.json` | `minimalrouter oauth add` → `oauth <id>` |
+| **Keyless** | nothing (no Authorization header) | `rows.json` with empty key | `POST /api/add` without a key, or ship it in `rows.example.json` |
+
+`GET /health` returns a `classes` count, `GET /api/state` returns `class` per row, and the
+dashboard shows a CLASS column plus the class in the SELECTED panel. `oauth list` prints the
+class of each profile.
+
+Keyless is **not** a separate auth mechanism in code — it is the existing file-row path with
+no credential. Do not add an `auth: none` branch to the router.
+
 ## Keep in mind — DL and provider classes
 
 These are the traps that actually bite. Read them before you pick a provider.
