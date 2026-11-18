@@ -115,7 +115,7 @@ minimalrouter serve
 | `t` | re-test the selected row (writes state, latency and last-checked) |
 | `a` | add a row: base URL, key, pick a model, auto-test, save |
 | `d` | delete the selected row |
-| `r` | refresh now |
+| `r` | refresh the selected row's OAuth token (API/keyless rows have none — use `t`) |
 | `q` | quit (also stops the server) |
 | Esc | cancel any prompt |
 
@@ -305,9 +305,9 @@ Because the server binds `127.0.0.1` and has no server auth, it is reachable onl
 your own machine. Do not expose it to a network. OAuth tokens stay in
 `~/.minimalrouter/oauth.json` (600) and never enter the repo.
 
-OAuth-backed rows use the saved access token and rotate it when the profile
-provides a refresh endpoint. A background refresh scheduler is still a
-follow-up; requests refresh on demand.
+OAuth-backed rows use the saved access token and rotate it when the profile provides a
+refresh endpoint. Refresh manually with `minimalrouter refresh [id]` (or `r` in the dashboard);
+a background refresh scheduler is still a follow-up.
 
 Security boundary: MinimalRouter deliberately does not auto-import tokens from
 another app's credential store. Connect an account through
@@ -387,19 +387,18 @@ refresh [id]` forces an OAuth token refresh now; with no id it refreshes every p
 with no refresh token (inference.sh, zcode plan JWT) report that plainly instead of pretending.
 `minimalrouter oauth list` shows every profile's class and connection state.
 
-**inference.sh is registered but NOT yet a working route.** Device flow verified live
-(POST `oauth/device_authorization` → real code; GET `device/auth/poll/{code}` → `pending`),
-and `oauth add inference` resolves it from the registry in one word. But no human completed
-the browser approval, so token→completion is UNVERIFIED. Keep in mind: run
-`minimalrouter oauth inference`, approve in the browser, then test a real completion before
-trusting it. Base is `/models/openai`, models are `namespace/name` refs from the official docs
-(e.g. `openrouter/claude-sonnet-5`).
+**inference.sh connects but serves nothing: the account balance is $0.00.** Moon approved the
+device flow (token stored), and the router now reaches the real upstream — it answers 402
+`insufficient_quota` on every model. No free models exist there; the catalog is billed
+`namespace/name` ids (`openrouter/claude-sonnet-5`). Do not treat a stored token as a working
+route: credits are required before any completion serves.
 
 **Class status at a glance (2026-11-18):** `kilocode` keyless works but flaky;
-`pollinations` keyless works but 402s quickly; `dahl` API works (~4s); `dl` OAuth
-device flow re-approved and working (verified 2026-11-18 ~5:07 AM); `opencode`
-is sidelined (`routable:false` — free tier is client-locked); `inference` OAuth preset
-registered, completion pending human approval.
+`dahl` API works (~4s); `dl` OAuth works (re-approved); `nous` OAuth works — four genuinely
+free `:free` models verified; `zcode` OAuth works — free plan grants route through the native
+translator; `inference` connects but the account is $0.00 (402); `omnirush` authenticates but
+its gateway rejects every non-official client (`official_client_required`, `routable:false`);
+`opencode` is sidelined (free tier client-locked); `freebuff` needs the bridge plus a login.
 
 **OAuth login does not always mean OAuth class here.** `omnirush` and `freebuff`
 both have real device-code logins, but a bare token cannot route: omnirush needs
@@ -449,7 +448,7 @@ rm -rf ~/.minimalrouter
 
 - Anthropic `/v1/messages` shim so Claude Code can use the pool
 - a systemd user unit for always-on use
-- a background token-refresh scheduler
+- a background token-refresh scheduler (manual refresh already exists: `minimalrouter refresh`)
 - weights or latency-based chain ordering
 - a config flag for per-row concurrency limits
 

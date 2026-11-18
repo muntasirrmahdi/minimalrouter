@@ -1942,10 +1942,9 @@ Usage:
   minimalrouter              terminal dashboard + server (one process)
   minimalrouter serve        server only (tmux / systemd / background)
   minimalrouter oauth add    create an OAuth provider profile
-  minimalrouter oauth list   show profiles and connection state
+  minimalrouter oauth list   profiles with class + connection state
   minimalrouter oauth <id>   sign in to that provider (device code)
   minimalrouter oauth rm <id>  delete a profile and its token
-  minimalrouter oauth list   profiles with class + connection state
   minimalrouter refresh [id] refresh OAuth token(s) now (all, or one provider)
   minimalrouter stop         stop the running server/dashboard by verified PID
   minimalrouter -h|--help    show this help

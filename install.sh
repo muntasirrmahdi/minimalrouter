@@ -44,6 +44,10 @@ fetch() {
 fetch minimalrouter.py
 fetch rows.example.json
 fetch oauth-providers.example.json
+# The zcode translator loads this identity asset; without it a fresh install
+# sends an empty identity and the vendor answers 405 code 3012.
+mkdir -p "$DEST/bridges"
+fetch bridges/zcode-identity.json
 # Learned entries must survive an upgrade: seed the registry only once.
 if [ ! -f "$DEST/provider-registry.json" ]; then fetch provider-registry.json; fi
 chmod 600 "$DEST/minimalrouter.py" 2>/dev/null || true
