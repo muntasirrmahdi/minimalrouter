@@ -54,6 +54,18 @@
       },
       "routable": false,
       "note": "SIDELINED 2026-11-18 per Moon: free Zen models are client-locked (429 FreeUsageLimitError to every non-OpenCode client, UA/header spoof does not bypass); paid/OpenCode Go only. Device flow itself is real. Not a working free OAuth preset - do not advertise as one-word connect."
+    },
+    "inference": {
+      "label": "Inference.sh",
+      "base_url": "https://api.inference.sh/models/openai",
+      "models": [
+        "openrouter/claude-sonnet-5",
+        "anthropic/claude-opus-5"
+      ],
+      "authorize_url": "https://api.inference.sh/oauth/device_authorization",
+      "token_url": "https://api.inference.sh/device/auth/poll/{device_code}",
+      "poll_method": "GET",
+      "note": "Added 2026-11-18. Device flow VERIFIED live: POST {} -> real device_code+user_code; GET /device/auth/poll/{code} -> 200 {\"status\":\"pending\"}. Base is /models/openai (chat at /models/openai/chat/completions, Bearer token). Agent could not complete browser approval, so token->completion path is UNVERIFIED. Keep in mind: requires one human approval before it routes; no client-fingerprint gate found in source. Models from official OpenAI-compat docs (namespace/name). Chat at /models/openai/chat/completions, Bearer token, scope apps:execute."
     }
   }
 }
