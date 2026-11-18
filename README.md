@@ -382,7 +382,11 @@ its gateway rejects every non-official client with `official_client_required`, s
 still won't route. API and keyless rows have no token at all — press `t` to re-test them instead.
 
 **Commands you can run any time.** `minimalrouter stop` stops the running server/dashboard by
-verified PID (never a pattern match — a same-named copy elsewhere is untouched). `minimalrouter
+verified PID (never a pattern match — a same-named copy elsewhere is untouched). The server writes
+`~/.minimalrouter/minimalrouter.pid` (mode 600) at start; on Linux `stop` verifies each candidate
+against `/proc/<pid>/cmdline`, and where `/proc` does not exist it falls back to the pid file. A pid
+file left by a killed instance is cleared only after its PID is verified dead. Liveness is checked
+without signaling — `os.kill(pid, 0)` terminates a process on Windows, so it is never used. `minimalrouter
 refresh [id]` forces an OAuth token refresh now; with no id it refreshes every profile. Providers
 with no refresh token (inference.sh, zcode plan JWT) report that plainly instead of pretending.
 `minimalrouter oauth list` shows every profile's class and connection state.

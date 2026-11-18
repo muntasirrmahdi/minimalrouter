@@ -66,6 +66,7 @@ MR_HOME = os.path.join(HOME, ".minimalrouter")
 ROWS_PATH = os.path.join(MR_HOME, "rows.json")
 ENV_PATH = os.path.join(HOME, ".hermes", ".env")
 LOG_PATH = os.path.join(MR_HOME, "minimalrouter.log")
+PID_PATH = os.path.join(MR_HOME, "minimalrouter.pid")
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("MINIMALROUTER_PORT", "8790"))
 TIMEOUT = 90
@@ -1883,6 +1884,90 @@ def oauth_refresh(provider, timeout=30):
     return True, "refreshed (new expiry in %s s)" % int(float(d.get("expires_in", 3600)))
 
 
+def write_pidfile():
+    """Record our PID so `stop` works on platforms without /proc."""
+    try:
+        with open(PID_PATH, "w") as f:
+            f.write("%d %d\n" % (os.getpid(), PORT))
+        try:
+            os.chmod(PID_PATH, 0o600)
+        except OSError:
+            pass
+    except OSError:
+        pass
+
+
+def remove_pidfile(force=False):
+    """Delete the pid file.
+
+    Default is conservative: only unlink if the file is ours or unreadable.
+    force=True is for callers that have ALREADY verified the recorded pid is
+    dead (stop_server); it must never be used on a live instance.
+    """
+    pid, _ = read_pidfile()
+    if not force and not (pid is None or pid == os.getpid()):
+        return
+    try:
+        os.remove(PID_PATH)
+    except OSError:
+        pass
+
+
+def read_pidfile():
+    try:
+        with open(PID_PATH) as f:
+            parts = f.read().split()
+        return (int(parts[0]), int(parts[1])) if len(parts) >= 2 else (None, None)
+    except (OSError, ValueError, IndexError):
+        return None, None
+
+
+def wait_dead(pid, timeout=2.0):
+    """Poll until the PID is gone (or timeout). SIGTERM is asynchronous, so an
+    immediate liveness check races and wrongly reports the process as alive."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not pid_alive(pid):
+            return True
+        time.sleep(0.1)
+    return not pid_alive(pid)
+
+
+def pid_alive(pid):
+    """Liveness WITHOUT signaling. Never os.kill(pid, 0): it terminates on Windows."""
+    if os.path.isdir("/proc"):
+        return os.path.isdir("/proc/%d" % pid)
+    try:
+        import subprocess
+        out = subprocess.run(["tasklist", "/FI", "PID %d" % pid],
+                             capture_output=True, text=True, timeout=8)
+        return str(pid) in out.stdout
+    except Exception:
+        return True  # cannot prove death: stay alive, identity check follows
+
+
+def pid_is_ours(pid):
+    """Strongest available proof the PID runs THIS script. Identity is never assumed.
+
+    Linux: read /proc/<pid>/cmdline and compare realpath against this file.
+    Elsewhere: no /proc, so trust only the pid file this tool wrote at start.
+    """
+    if os.path.isdir("/proc"):
+        ours = os.path.realpath(__file__)
+        try:
+            with open("/proc/%d/cmdline" % pid, "rb") as f:
+                parts = [x.decode("utf-8", "replace")
+                         for x in f.read().split(b"\x00") if x]
+        except (OSError, ValueError):
+            return False
+        if not any("minimalrouter.py" in x for x in parts):
+            return False
+        return any(os.path.realpath(x) == ours
+                   for x in parts if x.endswith(".py"))
+    fpid, _ = read_pidfile()
+    return fpid == pid
+
+
 def stop_server():
     """Stop MinimalRouter instances owned by this user, by verified PID only.
 
@@ -1891,39 +1976,50 @@ def stop_server():
     pkill -f (which self-matches and can kill the caller).
     """
     me = os.getpid()
-    ours = os.path.realpath(__file__)
     targets = []
-    try:
-        entries = os.listdir("/proc")
-    except OSError as e:
-        return 0, "cannot read /proc: %s" % e
-    for name in entries:
-        if not name.isdigit():
-            continue
-        pid = int(name)
-        if pid == me:
-            continue
+    if os.path.isdir("/proc"):
+        # Linux: scan /proc and verify realpath; catches instances with no pid file.
         try:
-            with open("/proc/%d/cmdline" % pid, "rb") as f:
-                parts = [x.decode("utf-8", "replace") for x in f.read().split(b"\0") if x]
-        except (OSError, ValueError):
-            continue
-        if not any("minimalrouter.py" in x for x in parts):
-            continue
-        if not any(os.path.realpath(x) == ours for x in parts if x.endswith(".py")):
-            continue
-        targets.append((pid, parts))
+            entries = os.listdir("/proc")
+        except OSError as e:
+            return 0, "cannot read /proc: %s" % e
+        for name in entries:
+            if not name.isdigit():
+                continue
+            pid = int(name)
+            if pid == me or not pid_is_ours(pid):
+                continue
+            targets.append(pid)
+    else:
+        # Windows/macOS: no /proc. Use the pid file; require alive + ours.
+        pid, _ = read_pidfile()
+        if pid and pid != me and pid_alive(pid) and pid_is_ours(pid):
+            targets.append(pid)
     if not targets:
+        # Nothing to stop: clear a pid file only if its PID is verified dead.
+        fpid, _ = read_pidfile()
+        if fpid and fpid != me and not pid_alive(fpid):
+            remove_pidfile(force=True)
         return 0, "no MinimalRouter process running"
     stopped = []
-    for pid, parts in targets:
+    for pid in targets:
         try:
-            os.kill(pid, 15)  # SIGTERM
+            os.kill(pid, 15)  # SIGTERM; never signal 0 (it kills on Windows)
             stopped.append(str(pid))
         except ProcessLookupError:
             pass
         except OSError as e:
             return len(stopped), "PID %s: %s" % (pid, e)
+    # We just signalled our own instance: its finally-block cannot run under
+    # signal death, so drop the pid file it left behind. Wait for real death
+    # first -- checking immediately races the asynchronous SIGTERM.
+    for s in stopped:
+        spid = int(s)
+        if spid == me or not wait_dead(spid):
+            continue
+        fpid, _ = read_pidfile()
+        if fpid == spid:
+            remove_pidfile(force=True)
     return len(stopped), "stopped PID(s): %s" % ", ".join(stopped)
 
 
@@ -2227,6 +2323,7 @@ def main():
               "MINIMALROUTER_PORT.")
         return 1
     log("MinimalRouter starting on %s:%d mode=%s" % (HOST, PORT, mode))
+    write_pidfile()
     if mode == "serve":
         print("MinimalRouter serving on http://%s:%d/v1  (dashboard: "
               "run `minimalrouter`)" % (HOST, PORT))
@@ -2234,6 +2331,8 @@ def main():
             srv.serve_forever()
         except KeyboardInterrupt:
             pass
+        finally:
+            remove_pidfile()
         return 0
     t = Thread(target=srv.serve_forever, daemon=True)
     t.start()
@@ -2252,6 +2351,7 @@ def main():
         except KeyboardInterrupt:
             pass
     srv.shutdown()
+    remove_pidfile()
     log("MinimalRouter stopped")
     return 0
 
