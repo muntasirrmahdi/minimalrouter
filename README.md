@@ -364,10 +364,19 @@ Keyless = an API row with an empty key (kilocode, pollinations). Keyless is a
 documentation label, not a third auth mechanism. Keyless free tiers are rationed —
 a successful call followed by 429/503 seconds later is normal.
 
+**inference.sh is registered but NOT yet a working route.** Device flow verified live
+(POST `oauth/device_authorization` → real code; GET `device/auth/poll/{code}` → `pending`),
+and `oauth add inference` resolves it from the registry in one word. But no human completed
+the browser approval, so token→completion is UNVERIFIED. Keep in mind: run
+`minimalrouter oauth inference`, approve in the browser, then test a real completion before
+trusting it. Base is `/models/openai`, models are `namespace/name` refs from the official docs
+(e.g. `openrouter/claude-sonnet-5`).
+
 **Class status at a glance (2026-11-18):** `kilocode` keyless works but flaky;
 `pollinations` keyless works but 402s quickly; `dahl` API works (~4s); `dl` OAuth
 device flow re-approved and working (verified 2026-11-18 ~5:07 AM); `opencode`
-is sidelined (`routable:false` — free tier is client-locked).
+is sidelined (`routable:false` — free tier is client-locked); `inference` OAuth preset
+registered, completion pending human approval.
 
 **OAuth login does not always mean OAuth class here.** `omnirush` and `freebuff`
 both have real device-code logins, but a bare token cannot route: omnirush needs
