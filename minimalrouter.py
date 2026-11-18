@@ -921,7 +921,16 @@ def oauth_device_start(provider):
     if not spec:
         raise ValueError("unknown OAuth provider (add it to ~/.minimalrouter/oauth-providers.json first)")
     body = spec.get("authorize_body", {})
-    res = oauth_post(spec["authorize_url"], provider, "", body)
+    # Device-code issuance is unauthenticated. Some gateways (inference.sh) reject an
+    # explicit "Authorization: Bearer " with an empty token; omit it at start.
+    req = urllib.request.Request(spec["authorize_url"],
+                                 data=json.dumps(body).encode(), method="POST")
+    req.add_header("Content-Type", "application/json")
+    req.add_header("Accept", "application/json")
+    req.add_header("User-Agent", UA)
+    for k, v in (spec.get("authorize_headers") or {}).items():
+        req.add_header(k, str(v))
+    res = urllib.request.urlopen(req, timeout=TIMEOUT)
     return json.loads(res.read() or b"{}")
 
 
