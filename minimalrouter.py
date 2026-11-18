@@ -407,7 +407,9 @@ def oauth_rows():
                          "oauth_provider": provider,
                          "api_mode": spec.get("api_mode", "chat_completions"),
                          "org_id": (auth.get(provider) or {}).get("org_id", ""),
-                         "oauth_label": spec.get("label", provider)})
+                         "oauth_label": spec.get("label", provider),
+                         **{k: (auth.get(provider) or {}).get(k, "")
+                            for k in spec.get("row_fields", [])}})
     return rows
 
 
@@ -745,6 +747,46 @@ def _curl_tls_chat(row, payload, spec, timeout=TIMEOUT):
     return io.BytesIO(json.dumps(result).encode())
 
 
+AD_STATE = {}
+AD_LOCK = Lock()
+
+
+def _ad_headers(row, spec):
+    headers = {"Content-Type": "application/json", "Accept": "application/json",
+               "User-Agent": UA, "Authorization": "Bearer " + str(row.get("key", ""))}
+    profile = read_oauth_profiles().get(row.get("oauth_provider", ""), {})
+    field = profile.get("session_field", "session_id")
+    header = profile.get("session_header")
+    if header and row.get(field):
+        headers[header] = str(row[field])
+    return headers
+
+
+def _ensure_ad_impression(row, spec):
+    ads = spec.get("ads") or {}
+    if not ads.get("next_url") or not ads.get("impression_url"):
+        return
+    now = time.time()
+    key = row.get("name") or str(row.get("session_id", "freepi"))
+    with AD_LOCK:
+        if now - AD_STATE.get(key, 0) < ads.get("cache_seconds", 60):
+            return
+    try:
+        url = ads["next_url"] + "?slot=" + ads.get("slot", "banner")
+        req = urllib.request.Request(url, headers=_ad_headers(row, spec))
+        with urllib.request.urlopen(req, timeout=20) as response:
+            ad = json.loads(response.read() or b"{}")
+        if ad.get("ad_id") and ad.get("click_token"):
+            body = json.dumps({"ad_id": ad["ad_id"], "click_token": ad["click_token"]}).encode()
+            req = urllib.request.Request(ads["impression_url"], data=body,
+                                         headers=_ad_headers(row, spec), method="POST")
+            urllib.request.urlopen(req, timeout=20).close()
+        with AD_LOCK:
+            AD_STATE[key] = now
+    except Exception:
+        pass
+
+
 def upstream(base, key, path, payload=None, timeout=TIMEOUT, row=None):
     # Per-profile behavior only; no provider is known by name.
     row = row or {}
@@ -752,6 +794,13 @@ def upstream(base, key, path, payload=None, timeout=TIMEOUT, row=None):
         if spec.get('transport') == 'curl_cffi' and spec.get('base_url', '').rstrip('/') == base.rstrip('/') and path == '/v1/chat/completions':
             return _curl_tls_chat(row, payload, spec, timeout)
     provider = row.get("oauth_provider", "")
+    profile_spec = {}
+    for spec in read_provider_registry().values():
+        if spec.get("base_url", "").rstrip("/") == base.rstrip("/"):
+            profile_spec = spec
+            break
+    if path == "/v1/chat/completions" and profile_spec.get("ads"):
+        _ensure_ad_impression(row, profile_spec)
     api_mode = row.get("api_mode", "chat_completions")
     if api_mode == "responses" and path == "/v1/chat/completions":
         return oauth_chat(row, payload, timeout)
@@ -767,6 +816,10 @@ def upstream(base, key, path, payload=None, timeout=TIMEOUT, row=None):
     if key:
         for hk, hv in oauth_headers(provider, key, row.get("org_id", "")).items():
             req.add_header(hk, hv)
+    profile = read_oauth_profiles().get(provider, {})
+    field, header = profile.get("session_field"), profile.get("session_header")
+    if field and header and row.get(field):
+        req.add_header(header, str(row[field]))
     return urllib.request.urlopen(req, timeout=timeout)
 
 
@@ -1379,24 +1432,34 @@ def oauth_start(provider, options=None):
                     target = None
             if target:
                 expires = max(1, int(target - time.time()))
-        out = {"device_code": d.get("device_code") or d.get("code")
+        out = {"device_code": _dig(d, spec.get("device_code_key", "")) or d.get("device_code") or d.get("code")
                or d.get("flow_id") or "",
-                "user_code": d.get("user_code") or d.get("code", ""),
+                "user_code": _dig(d, spec.get("user_code_key", "")) or d.get("user_code") or d.get("code", ""),
                 "url": url,
                 "interval": interval, "expires": expires}
         if poll_token:
             out["poll_token"] = poll_token
+        for key in spec.get("flow_store_keys", []):
+            value = _dig(d, key) or d.get(key)
+            if value:
+                out[key] = value
         return out
     except Exception as e:
         raise RuntimeError("OAuth start failed for %s: %s" % (provider, e))
 
 
-def _render_body(body, device_code):
-    """Substitute {device_code} in static request bodies from a profile."""
+def _render_body(body, device_code, flow=None):
+    values = dict(flow or {})
+    values['device_code'] = device_code
     out = {}
     for k, v in (body or {}).items():
-        out[k] = (v.replace("{device_code}", str(device_code))
-                  if isinstance(v, str) else v)
+        if not isinstance(v, str):
+            out[k] = v
+            continue
+        for key, value in values.items():
+            if value:
+                v = v.replace('{%s}' % key, str(value))
+        out[k] = v
     return out
 
 
@@ -1407,7 +1470,7 @@ def oauth_poll(provider, flow, cancel_event=None):
     poll_url = spec.get("token_url", "")
     method = spec.get("poll_method", "POST").upper()
     body = _render_body(spec.get("token_body") or
-                        {"device_code": flow["device_code"]}, flow["device_code"])
+                        {"device_code": flow["device_code"]}, flow["device_code"], flow)
     poll_token = flow.get("poll_token", "")
     token_key = spec.get("token_key", "access_token")
     status_key = spec.get("status_key", "")
@@ -1461,8 +1524,11 @@ def oauth_poll(provider, flow, cancel_event=None):
                 out["expires_at"] = time.time() + 3600
             for k in ("org_id", "organization_id"):
                 if d.get(k):
-                    out["org_id"] = d[k]
+                    out[k] = d[k]
                     break
+            for k in spec.get("token_store_keys", spec.get("flow_store_keys", [])):
+                if flow.get(k):
+                    out[k] = flow[k]
             return out
 
         if code in PENDING_CODES:
@@ -1783,7 +1849,13 @@ def _login_flow(stdscr, group):
     pid = group['id'][6:]
     try:
         options = {}
-        field = read_oauth_profiles().get(pid, {}).get('referral_field')
+        profile_spec = read_oauth_profiles().get(pid, {})
+        if profile_spec.get('consent_text'):
+            choice = _pick_list(stdscr, ['Accept', 'Decline'], 'free-pi terms')
+            if choice is None or choice != 'Accept':
+                return 'Login cancelled'
+            stdscr.erase()
+        field = profile_spec.get('referral_field')
         if field:
             referral = _input_line(stdscr, 'Referral code (optional, ENTER skips):')
             if referral is None:
@@ -1924,7 +1996,7 @@ def _discover_models(spec):
         body = response.json()
     finally:
         session.close()
-    entries = body.get('data') if isinstance(body, dict) else body
+    entries = (body.get('data') or body.get('models')) if isinstance(body, dict) else body
     ids = []
     for entry in entries or []:
         if isinstance(entry, str):
@@ -1932,6 +2004,12 @@ def _discover_models(spec):
                 ids.append(entry)
             continue
         if not isinstance(entry, dict):
+            continue
+        if spec.get('skip_key') and entry.get(spec['skip_key']):
+            continue
+        if spec.get('skip_section') and entry.get('section') == spec['skip_section']:
+            continue
+        if spec.get('free_key') and entry.get(spec['free_key']) is False:
             continue
         if spec.get('free_only'):
             cost = ((entry.get('cost') or {}).get('text') or {})
@@ -2035,6 +2113,21 @@ def _quota_refresh(group):
             with urllib.request.urlopen(req, timeout=20) as response:
                 payload = json.loads(response.read())
             details = []
+            if spec.get('format') == 'freepi_credits':
+                cap = payload.get('allowance_credits') or 0
+                left = payload.get('remaining_credits_today') or 0
+                reset = payload.get('refill_at')
+                balances = []
+                if cap:
+                    balances.append({'show_name': 'Daily Free Credits', 'total_units': cap,
+                                     'used_units': max(0, cap - left), 'period_end': reset})
+                bonus = payload.get('bonus_credits') or 0
+                if bonus:
+                    balances.append({'show_name': 'Bonus Credits', 'total_units': bonus,
+                                     'used_units': 0})
+                if not balances:
+                    raise ValueError('No free-pi balance reported')
+                payload = {'code': 0, 'data': {'balances': balances}}
             if spec.get('format') == 'weekly_budgets':
                 allowance = payload.get('allowance') or {}
                 budgets = payload.get('budgets') or allowance.get('budgets') or {}
@@ -2080,10 +2173,17 @@ def _quota_refresh(group):
                 total = float(item.get('total_units') or 0)
                 used = float(item.get('used_units') or 0)
                 remaining = float(item.get('remaining_units', max(0, total - used)))
+                reset_at = item.get('period_end')
+                if isinstance(reset_at, str):
+                    try:
+                        reset_at = datetime.datetime.fromisoformat(
+                            reset_at.replace('Z', '+00:00')).timestamp()
+                    except ValueError:
+                        reset_at = None
                 balances.append({'name': item.get('show_name') or item.get('entitlement_id') or 'Model',
                                  'total': total, 'remaining': remaining,
                                  'percent': min(100, max(0, remaining / total * 100)) if total else 0,
-                                 'reset': item.get('period_end'), 'unit': item.get('unit', 'tokens'),
+                                 'reset': reset_at, 'unit': item.get('unit', 'tokens'),
                                  'used': used, 'unlimited': item.get('unlimited', False),
                                  'usage_tokens': item.get('usage_tokens')})
             with QUOTA_LOCK:
@@ -2238,7 +2338,13 @@ def _draw_dashboard(stdscr, port, groups, group, entries, sel, status, started, 
                 used = '$%.2f' % balance.get('used', 0)
             usage_tokens = balance.get('usage_tokens')
             usage_text = (' | ' + format(usage_tokens, ',.0f') + ' tokens') if usage_tokens is not None else ''
-            reset = time.strftime('%b %d %H:%M %Z', time.localtime(balance['reset'])) if balance.get('reset') else 'Unknown'
+            reset_value = balance.get('reset')
+            if isinstance(reset_value, (int, float)):
+                reset = time.strftime('%b %d %H:%M %Z', time.localtime(reset_value))
+            elif isinstance(reset_value, str) and reset_value:
+                reset = reset_value[:16].replace('T', ' ')
+            else:
+                reset = 'Unknown'
             if detailed:
                 _putw(stdscr, y, '  ' + balance['name'], w, curses.A_BOLD)
                 _putw(stdscr, y + 1, '  %s  %5.1f%% remaining  |  %s %s left%s' % (bar, pct, remaining, unit, usage_text), w, color)

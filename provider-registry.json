@@ -349,6 +349,134 @@
         }
       ],
       "note": "Device login is a poll-token flow: init mints an Authorization token locally and every poll reuses it, so the profile keeps that token between start and poll. Chat upstream is Anthropic Messages format with a required official system prompt; the login token is the session JWT (~30 days)."
+    },
+    "freepi": {
+      "label": "free-pi (GitHub)",
+      "base_url": "https://api.freepi.ai/v1",
+      "models_url": "https://api.freepi.ai/client-version",
+      "skip_key": "unavailable",
+      "skip_section": "defense",
+      "models": [
+        {
+          "model": "particle",
+          "name": "Particle-1 (FREE)"
+        },
+        {
+          "model": "deepseek-v4.1-flash",
+          "name": "DeepSeek V4.1 Flash (FREE)"
+        },
+        {
+          "model": "glm-5.3-flash",
+          "name": "GLM 5.3 Flash (FREE)"
+        },
+        {
+          "model": "deepseek-v4-flash",
+          "name": "DeepSeek V4 Flash (FREE)"
+        },
+        {
+          "model": "abliterated-large-flash",
+          "name": "Abliterated Large Flash (~20x usage, defense)"
+        },
+        {
+          "model": "abliterated-large-v2",
+          "name": "Abliterated Large V2 (~60x usage, defense)"
+        },
+        {
+          "model": "deepseek-v4.1-flash-1017-ultrafast",
+          "name": "DeepSeek V4.1 Flash 600tps (~1.6x usage)"
+        },
+        {
+          "model": "deepseek-v4.1-flash-abliterated",
+          "name": "DeepSeek V4.1 Flash Abliterated (~20x usage, defense)"
+        },
+        {
+          "model": "deepseek-v4-pro",
+          "name": "DeepSeek V4 Pro (~5.9x usage)"
+        },
+        {
+          "model": "gemma-4-uncensored",
+          "name": "Gemma 4 Uncensored (~20x usage, defense)"
+        },
+        {
+          "model": "glm-4.7-flash-heretic",
+          "name": "GLM 4.7 Flash Heretic (~20x usage, defense)"
+        },
+        {
+          "model": "hy4-flash",
+          "name": "Hy4 Flash (~0.2x usage)"
+        },
+        {
+          "model": "kimi-k3.1-pro",
+          "name": "Kimi K3.1 Pro (~22x usage)"
+        },
+        {
+          "model": "mimo-v2.6-flash",
+          "name": "MiMo V2.6 Flash (Xiaomi) (~0.8x usage)"
+        },
+        {
+          "model": "qwen3.5-35b-darkbloom",
+          "name": "Qwen3.5 35B (Darkbloom) (~2.1x usage)"
+        },
+        {
+          "model": "qwen3.6-plus-uncensored",
+          "name": "Qwen 3.6 Plus Uncensored (~37x usage, defense)"
+        },
+        {
+          "model": "solar-pro-4",
+          "name": "Solar Pro 4 (~1.2x usage)"
+        },
+        {
+          "model": "uncensored-1.2",
+          "name": "Uncensored 1.2 (~20x usage, defense)"
+        }
+      ],
+      "authorize_url": "https://api.freepi.ai/auth/connect/start",
+      "authorize_body": {
+        "consent_version": "4",
+        "client": {
+          "os": "linux",
+          "cli_version": "minimalrouter"
+        }
+      },
+      "headers": {
+        "x-freepi-signin-exp": "1"
+      },
+      "token_url": "https://api.freepi.ai/auth/connect/poll",
+      "token_body": {
+        "session_id": "{device_code}",
+        "poll_secret": "{poll_secret}"
+      },
+      "token_key": "token",
+      "status_key": "status",
+      "pending_status": "pending",
+      "failed_status": "failed",
+      "device_code_key": "session_id",
+      "user_code_key": "confirm_code",
+      "verify_url_key": "connect_url",
+      "flow_store_keys": [
+        "session_id",
+        "poll_secret"
+      ],
+      "row_fields": [
+        "session_id"
+      ],
+      "session_field": "session_id",
+      "session_header": "x-session-id",
+      "consent_text": "free-pi is free. In exchange, it shows ads and may train on your data. Terms: https://freepi.ai/terms  Privacy: https://freepi.ai/privacy",
+      "ads": {
+        "next_url": "https://api.freepi.ai/ads/next",
+        "impression_url": "https://api.freepi.ai/ads/impression",
+        "slot": "banner",
+        "cache_seconds": 60
+      },
+      "quota": {
+        "url": "https://api.freepi.ai/me/stats",
+        "format": "freepi_credits",
+        "headers": {}
+      },
+      "token_store_keys": [
+        "session_id"
+      ]
     }
   }
 }
