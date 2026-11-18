@@ -338,6 +338,13 @@ no credential. Do not add an `auth: none` branch to the router.
 These are the traps that actually bite. Read them before you pick a provider.
 
 **Directionally Local (`dl`) is an OAuth-class provider, and its device token expires.**
+
+**GATE UPDATE (2026-11-19, 5:40 AM BD):** dl now answers HTTP 403
+`{"error":{"code":"dl_only","message":"Free tokens work inside dl only. Run dl to keep using
+them, or use your own API key in any tool."}}` on all four models — five consecutive probes.
+The token is valid (refresh succeeds); the CLIENT is refused, so re-approval does not fix it.
+Same class as omnirush's `official_client_required`. Registry: `routable:false`. The vendor's
+stated alternative — your own dl API key as an API-class row — is untested.
 It is not an API-key row: you sign in once through `minimalrouter oauth dl` and the
 router stores the token locally. When that token dies, the router attempts a refresh
 on **every** request and logs `OAUTH-REFRESH dl failed: HTTP 401` — all four of its
@@ -360,7 +367,8 @@ correct model echo, ~4s. Its key is stored in `~/.minimalrouter/rows.json` (600)
 is a paid/credit endpoint, so watch its balance, not a token expiry.
 
 **Three classes, one engine path.** API = paste a key; OAuth = browser approve;
-Keyless = an API row with an empty key (kilocode, pollinations). Keyless is a
+Keyless = an API row with an empty key (the seeded `kilocode-free` row; pollinations
+serves keyless upstream but is not a seeded row). Keyless is a
 documentation label, not a third auth mechanism. Keyless free tiers are rationed —
 a successful call followed by 429/503 seconds later is normal.
 
@@ -397,8 +405,8 @@ device flow (token stored), and the router now reaches the real upstream — it 
 `namespace/name` ids (`openrouter/claude-sonnet-5`). Do not treat a stored token as a working
 route: credits are required before any completion serves.
 
-**Class status at a glance (2026-11-18):** `kilocode` keyless works but flaky;
-`dahl` API works (~4s); `dl` OAuth works (re-approved); `nous` OAuth works — four genuinely
+**Class status at a glance (2026-11-18, updated 2026-11-19 5:45 AM):** `kilocode` keyless works but flaky;
+`dahl` API works (~4s; recovered 19 Nov after a 429 spell); `dl` OAuth GATED since 19 Nov 5:40 AM (403 `dl_only` — free tokens now work inside the dl client only; served fine 3:47-5:39 AM that day); `nous` OAuth works — four genuinely
 free `:free` models verified; `zcode` OAuth works — free plan grants route through the native
 translator; `inference` connects but the account is $0.00 (402); `omnirush` authenticates but
 its gateway rejects every non-official client (`official_client_required`, `routable:false`);

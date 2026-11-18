@@ -8,7 +8,10 @@
         "gpt-6.1-sol",
         "gpt-6-astra",
         "deepseek/deepseek-v4.1-flash-1017"
-      ]
+      ],
+      "class": "oauth",
+      "routable": false,
+      "note": "2026-11-19 5:40 AM BD: free device tokens now CLIENT-GATED — HTTP 403 {\"error\":{\"code\":\"dl_only\",\"message\":\"Free tokens work inside dl only. Run dl to keep using them, or use your own API key in any tool.\"}} on all 4 models (5 consecutive probes; same tokens served real completions 3:47-5:39 AM the same day). Refresh still succeeds — the token is valid, the client is refused; re-approval does NOT fix it. Same class as omnirush official_client_required. Paid dl API-key row = untested alternative."
     },
     "kilocode": {
       "label": "Kilo Code",
@@ -36,7 +39,7 @@
       "token_url": "https://omnirush.ai/omnirush/device/token",
       "api_mode": "omnirush",
       "routable": false,
-      "note": "2026-11-18 VERDICT with a REAL approved token: omni's gateway returns SSE event:error detail=official_client_required \u2014 'OmniRush works only through the official OmniRush CLI or desktop app, updated to the latest version'. Tried User-Agent omnirush + X-OmniRush-Client cli/3.0.1, browser UA + cli/3.0.1, and cli/2.8.2 \u2014 all gated. Token validation passes (401 only when the token is bad), so login works; routing does not. Translator code (api_mode omnirush) is implemented and correct but cannot pass this client gate. Verdict: OAuth login works, NOT routable through a third-party router. Do not advertise as working.",
+      "note": "2026-11-18 VERDICT with a REAL approved token: omni's gateway returns SSE event:error detail=official_client_required — 'OmniRush works only through the official OmniRush CLI or desktop app, updated to the latest version'. Tried User-Agent omnirush + X-OmniRush-Client cli/3.0.1, browser UA + cli/3.0.1, and cli/2.8.2 — all gated. Token validation passes (401 only when the token is bad), so login works; routing does not. Translator code (api_mode omnirush) is implemented and correct but cannot pass this client gate. Verdict: OAuth login works, NOT routable through a third-party router. Do not advertise as working.",
       "authorize_body": {
         "device_name": "minimalrouter",
         "platform": "linux"

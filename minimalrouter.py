@@ -83,7 +83,6 @@ OMNIRUSH_GATEWAY_DEFAULT = "https://omnirush.ai/omnirush/v1"
 OMNIRUSH_CLIENT_FALLBACK = "2.8.2"
 OMNIRUSH_REFRESH_LOCK = Lock()
 _OMNIRUSH_VERSION = None
-ZCODE_GATEWAY_DEFAULT = "https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages"
 ZCODE_IDENTITY_PATH = os.path.join(MR_HOME, "bridges", "zcode-identity.json")
 # Per-flow client secrets for device flows that authenticate the client with a
 # self-minted bearer that must match between init and poll (zcode).
@@ -926,7 +925,7 @@ def state_for(rows):
         st = dict(ROW_STATE.get(r["name"], {"status": "unknown"}))
         cls = row_class(r)
         out.append({"name": r["name"], "model": r["model"], "base": r["base"],
-                    "class": cls,
+                    "class": cls, "oauth_provider": r.get("oauth_provider", ""),
                     "key_src": ("env:" + r["key_env"]) if r.get("key_env")
                     else ("pasted" if r.get("key") else "none"),
                     "aliases": r.get("aliases", []), "state": st})
@@ -1249,13 +1248,21 @@ class Handler(BaseHTTPRequestHandler):
                             % (model, row["name"], time.time() - t0))
                     return
                 except Exception as e:
-                    last_err = "%s: %s" % (row["name"], e)
+                    detail = str(e)
+                    if isinstance(e, urllib.error.HTTPError):
+                        try:
+                            snippet = e.read(300).decode("utf-8", "replace").strip()
+                            if snippet:
+                                detail += " | " + snippet[:200]
+                        except Exception:
+                            pass
+                    last_err = "%s: %s" % (row["name"], detail)
                     ROW_STATE[row["name"]] = {
                         "status": "fail",
                         "ms": (time.time() - t0) * 1000,
-                        "at": time.time(), "error": str(e)[:200]}
+                        "at": time.time(), "error": detail[:200]}
                     log("FAIL %s via %s: %s (%.1fs) -> next"
-                        % (model, row["name"], e, time.time() - t0))
+                        % (model, row["name"], detail, time.time() - t0))
             return self._send(502, {"error": "all rows failed for '%s'"
                                            % model, "last": last_err})
 
@@ -1934,9 +1941,16 @@ def wait_dead(pid, timeout=2.0):
 
 
 def pid_alive(pid):
-    """Liveness WITHOUT signaling. Never os.kill(pid, 0): it terminates on Windows."""
+    """Liveness WITHOUT signaling. Never os.kill(pid, 0): it terminates on Windows.
+    A zombie (state Z) is DEAD: its /proc entry lingers until the parent reaps it,
+    so directory existence alone would strand wait_dead and leave a stale pidfile."""
     if os.path.isdir("/proc"):
-        return os.path.isdir("/proc/%d" % pid)
+        try:
+            with open("/proc/%d/stat" % pid) as f:
+                state = f.read().rsplit(") ", 1)[1].split()[0]
+            return state != "Z"
+        except (FileNotFoundError, IndexError, ProcessLookupError):
+            return False
     try:
         import subprocess
         out = subprocess.run(["tasklist", "/FI", "PID %d" % pid],
@@ -2164,6 +2178,9 @@ def main():
                 return 2
             if not base_url:
                 print("cancelled: base URL is required")
+                return 2
+            if not base_url.startswith(("http://", "https://")):
+                print("cancelled: base URL must start with http:// or https://")
                 return 2
             base_url = base_url.rstrip("/")
             label = entry.get("label") or ask("display label: ", pid)
