@@ -66,6 +66,38 @@
       "token_url": "https://api.inference.sh/device/auth/poll/{device_code}",
       "poll_method": "GET",
       "note": "Added 2026-11-18. Device flow VERIFIED live: POST {} -> real device_code+user_code; GET /device/auth/poll/{code} -> 200 {\"status\":\"pending\"}. Base is /models/openai (chat at /models/openai/chat/completions, Bearer token). Agent could not complete browser approval, so token->completion path is UNVERIFIED. Keep in mind: requires one human approval before it routes; no client-fingerprint gate found in source. Models from official OpenAI-compat docs (namespace/name). Chat at /models/openai/chat/completions, Bearer token, scope apps:execute."
+    },
+    "nous": {
+      "label": "Nous Portal",
+      "base_url": "https://inference-api.nousresearch.com/v1",
+      "models": [
+        "tencent/hy4-flash:free",
+        "upstage/solar-mini4:free",
+        "stepfun/step-3.7-flash:free",
+        "meituan/longcat-2.5:free"
+      ],
+      "authorize_url": "https://portal.nousresearch.com/api/oauth/device/code",
+      "token_url": "https://portal.nousresearch.com/api/oauth/token",
+      "refresh_url": "https://portal.nousresearch.com/api/oauth/token",
+      "authorize_form": true,
+      "token_form": true,
+      "authorize_body": {
+        "client_id": "hermes-cli",
+        "scope": "inference:invoke"
+      },
+      "token_body": {
+        "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+        "client_id": "hermes-cli",
+        "device_code": "{device_code}"
+      },
+      "refresh_body": {
+        "grant_type": "refresh_token",
+        "client_id": "hermes-cli"
+      },
+      "refresh_headers": {
+        "x-nous-refresh-token": "{refresh_token}"
+      },
+      "note": "Added 2026-11-18 from primary-source research. Device flow form-encoded; refresh secret travels in x-nous-refresh-token header and is SINGLE-USE (persist rotated token). Token is a plain Bearer JWT on the OpenAI-compatible inference API. Free plan = 4 zero-priced :free models (listed); purchased credits needed for paid models. x402 challenge without a token."
     }
   }
 }

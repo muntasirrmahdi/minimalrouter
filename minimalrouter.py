@@ -923,9 +923,12 @@ def oauth_device_start(provider):
     body = spec.get("authorize_body", {})
     # Device-code issuance is unauthenticated. Some gateways (inference.sh) reject an
     # explicit "Authorization: Bearer " with an empty token; omit it at start.
-    req = urllib.request.Request(spec["authorize_url"],
-                                 data=json.dumps(body).encode(), method="POST")
-    req.add_header("Content-Type", "application/json")
+    form = bool(spec.get("authorize_form"))
+    payload = (urllib.parse.urlencode(body).encode() if form
+               else json.dumps(body).encode())
+    req = urllib.request.Request(spec["authorize_url"], data=payload, method="POST")
+    req.add_header("Content-Type",
+                   "application/x-www-form-urlencoded" if form else "application/json")
     req.add_header("Accept", "application/json")
     req.add_header("User-Agent", UA)
     for k, v in (spec.get("authorize_headers") or {}).items():
@@ -975,13 +978,35 @@ def oauth_poll(provider, flow):
         d = {}
         try:
             if method == "GET":
-                url = poll_url.rstrip("/") + "/" + urllib.parse.quote(
-                    flow["device_code"], safe="")
+                # Some providers put {device_code} in token_url (inference.sh);
+                # others expose a bare poll path and expect the code appended (kilocode).
+                if "{device_code}" in poll_url:
+                    url = poll_url.replace("{device_code}",
+                                           urllib.parse.quote(flow["device_code"], safe=""))
+                else:
+                    url = poll_url.rstrip("/") + "/" + urllib.parse.quote(
+                        flow["device_code"], safe="")
                 req = urllib.request.Request(url, headers={"User-Agent": UA,
                                                            "Accept": "application/json"})
                 with urllib.request.urlopen(req, timeout=30) as r:
                     status = r.status
                     d = json.loads(r.read() or b"{}")
+                if isinstance(d.get("data"), dict):  # nested token/pending payload
+                    d = dict(d["data"], **{k: v for k, v in d.items() if k != "data"})
+            elif spec.get("token_form"):
+                data = urllib.parse.urlencode(body).encode()
+                req = urllib.request.Request(poll_url, data=data, method="POST")
+                req.add_header("Content-Type", "application/x-www-form-urlencoded")
+                req.add_header("Accept", "application/json")
+                req.add_header("User-Agent", UA)
+                for k, v in (spec.get("token_headers") or {}).items():
+                    req.add_header(k, str(v).replace("{token}", "").replace(
+                        "{device_code}", flow["device_code"]))
+                try:
+                    with urllib.request.urlopen(req, timeout=30) as r:
+                        status, d = r.status, json.loads(r.read() or b"{}")
+                except urllib.error.HTTPError as e:
+                    status, d = e.code, json.loads(e.read() or b"{}")
             else:
                 status, d = _post_json(poll_url, body, timeout=30)
         except Exception as e:  # transport hiccup: keep waiting until deadline
@@ -1562,7 +1587,9 @@ def main():
                 spec["api_mode"] = api_mode
             if entry.get("poll_method"):
                 spec["poll_method"] = entry["poll_method"]
-            for k in ("token_body", "authorize_body", "headers"):
+            for k in ("token_body", "authorize_body", "headers",
+                      "authorize_form", "token_form", "token_headers",
+                      "refresh_headers", "refresh_body"):
                 if entry.get(k):
                     spec[k] = entry[k]
             profiles[pid] = spec
