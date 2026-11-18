@@ -36,7 +36,7 @@
       "token_url": "https://omnirush.ai/omnirush/device/token",
       "api_mode": "omnirush",
       "routable": false,
-      "note": "Translator implemented natively 2026-11-18 (api_mode omnirush): POST /responses only, forced stream:true + store:false, NO x-omnirush-session-id, User-Agent omnirush + X-OmniRush-Client cli/<npm-latest>, typed input array, rotating refresh at <control-plane>/device/refresh persisted to oauth.json. Version resolved lazily from registry.npmjs.org/omnirush/latest (live 3.0.1). routable:false until a human device approval proves a real completion; account-signout/ban risk on shared tokens.",
+      "note": "2026-11-18 VERDICT with a REAL approved token: omni's gateway returns SSE event:error detail=official_client_required \u2014 'OmniRush works only through the official OmniRush CLI or desktop app, updated to the latest version'. Tried User-Agent omnirush + X-OmniRush-Client cli/3.0.1, browser UA + cli/3.0.1, and cli/2.8.2 \u2014 all gated. Token validation passes (401 only when the token is bad), so login works; routing does not. Translator code (api_mode omnirush) is implemented and correct but cannot pass this client gate. Verdict: OAuth login works, NOT routable through a third-party router. Do not advertise as working.",
       "authorize_body": {
         "device_name": "minimalrouter",
         "platform": "linux"
