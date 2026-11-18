@@ -27,12 +27,16 @@
     "omnirush": {
       "label": "OmniRush",
       "base_url": "https://omnirush.ai/omnirush/v1",
-      "models": [],
-      "api_mode": "responses",
+      "models": [
+        "gpt-6-astra",
+        "gpt-6.1-sol",
+        "gpt-6-sol"
+      ],
       "authorize_url": "https://omnirush.ai/omnirush/device/authorize",
       "token_url": "https://omnirush.ai/omnirush/device/token",
+      "api_mode": "omnirush",
       "routable": false,
-      "note": "Login flow works, but the server runs a mandatory-update gate on every model call (X-OmniRush-Client) and signs out devices whose tokens look shared. Treat as not routable through a generic router."
+      "note": "Translator implemented natively 2026-11-18 (api_mode omnirush): POST /responses only, forced stream:true + store:false, NO x-omnirush-session-id, User-Agent omnirush + X-OmniRush-Client cli/<npm-latest>, typed input array, rotating refresh at <control-plane>/device/refresh persisted to oauth.json. Version resolved lazily from registry.npmjs.org/omnirush/latest (live 3.0.1). routable:false until a human device approval proves a real completion; account-signout/ban risk on shared tokens."
     },
     "opencode": {
       "label": "OpenCode",
@@ -98,6 +102,20 @@
         "x-nous-refresh-token": "{refresh_token}"
       },
       "note": "Added 2026-11-18 from primary-source research. Device flow form-encoded; refresh secret travels in x-nous-refresh-token header and is SINGLE-USE (persist rotated token). Token is a plain Bearer JWT on the OpenAI-compatible inference API. Free plan = 4 zero-priced :free models (listed); purchased credits needed for paid models. x402 challenge without a token."
+    },
+    "zcode": {
+      "label": "ZCode (z.ai plan lane)",
+      "base_url": "https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages",
+      "models": [
+        "glm-5.3-flash",
+        "glm-5.3"
+      ],
+      "authorize_url": "https://zcode.z.ai/api/v1/oauth/cli/init",
+      "token_url": "https://zcode.z.ai/api/v1/oauth/cli/poll/{device_code}",
+      "poll_method": "GET",
+      "api_mode": "zcode",
+      "routable": false,
+      "note": "Added 2026-11-18 from primary-source research. Free Start Plan grants live-probe: 3M tok/day GLM-5.3 + 5M/day GLM-5.3-Flash (GET /api/v1/client/configs is unauthenticated). Device flow: POST /api/v1/oauth/cli/init with a client-minted 64-hex Bearer + body {provider:zai} -> flow_id + authorize_url; poll GET /api/v1/oauth/cli/poll/<flow_id> with the same Bearer. Plan lane is Anthropic-Messages only (all OpenAI routes 404) and requires the 3-block identity system + X-ZCode-*/X-OS-* headers + metadata.user_id JSON string; missing identity -> 405 code 3012 (captcha/WAF, account-state dependent). Translator implemented natively (api_mode zcode). routable:false until one real login + completion."
     }
   }
 }

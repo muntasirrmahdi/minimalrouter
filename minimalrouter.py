@@ -47,6 +47,7 @@ HTTP API:
 """
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -75,6 +76,14 @@ ROW_LOCK = Lock()
 ROW_STATE = {}
 # Three connection classes. Class is always DERIVED from row shape, never from a label.
 VALID_CLASSES = ("api", "oauth", "keyless")
+
+# Translator constants (data-driven: endpoints live in oauth-providers.json / registry).
+OMNIRUSH_GATEWAY_DEFAULT = "https://omnirush.ai/omnirush/v1"
+OMNIRUSH_CLIENT_FALLBACK = "2.8.2"
+OMNIRUSH_REFRESH_LOCK = Lock()
+_OMNIRUSH_VERSION = None
+ZCODE_GATEWAY_DEFAULT = "https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages"
+ZCODE_IDENTITY_PATH = os.path.join(MR_HOME, "bridges", "zcode-identity.json")
 
 
 def load_env():
@@ -390,6 +399,7 @@ def oauth_rows():
                          "aliases": aliases, "key": token,
                          "oauth_provider": provider,
                          "api_mode": spec.get("api_mode", "chat_completions"),
+                         "gateway_url": (auth.get(provider) or {}).get("gateway_url", ""),
                          "org_id": (auth.get(provider) or {}).get("org_id", ""),
                          "oauth_label": spec.get("label", provider)})
     return rows
@@ -487,6 +497,334 @@ def chat_from_responses(row, payload):
     resp = oauth_chat(row, dict(payload, stream=False))
     raw = json.loads(resp.read() or b"{}")
     return responses_text(raw)
+
+
+
+# ---------------------------------------------------------------------------
+# Translators. These are api_mode values keyed by profile data; no provider name
+# is hardcoded in the request path. Each is importable/testable without network.
+# ---------------------------------------------------------------------------
+
+def omnirush_client_version(force=False):
+    """Resolve the policed CLI version lazily (npm latest), stdlib-only."""
+    global _OMNIRUSH_VERSION
+    pinned = os.environ.get("OMNIRUSH_CLIENT_VERSION") or ENV.get("OMNIRUSH_CLIENT_VERSION")
+    if pinned:
+        return pinned
+    if _OMNIRUSH_VERSION and not force:
+        return _OMNIRUSH_VERSION
+    v = OMNIRUSH_CLIENT_FALLBACK
+    try:
+        req = urllib.request.Request("https://registry.npmjs.org/omnirush/latest",
+                                     headers={"User-Agent": UA, "Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=8) as r:
+            j = json.loads(r.read() or b"{}")
+        got = str(j.get("version", ""))
+        if re.match(r"^\d+\.\d+\.\d+", got):
+            v = got
+    except Exception as e:
+        log("OMNIRUSH version lookup failed: %s" % e)
+    _OMNIRUSH_VERSION = v
+    return v
+
+
+def omnirush_control_plane(gateway_url):
+    g = (gateway_url or OMNIRUSH_GATEWAY_DEFAULT).rstrip("/")
+    return g[:-3] if g.endswith("/v1") else g
+
+
+def omnirush_headers(token, version, stream=True):
+    return {"Content-Type": "application/json",
+            "Accept": "text/event-stream" if stream else "application/json",
+            "Authorization": "Bearer " + token, "User-Agent": "omnirush",
+            "X-OmniRush-Client": "cli/" + version}   # no session-id header
+
+
+def omnirush_access_token(provider):
+    """Refresh with rotating token; persist atomically via shared oauth.json."""
+    with OMNIRUSH_REFRESH_LOCK:
+        auth = read_oauth()
+        rec = auth.get(provider) or {}
+        tok = rec.get("access_token", "")
+        if tok and float(rec.get("expires_at", 0) or 0) > time.time() + 300:
+            return tok
+        rt = rec.get("refresh_token", "")
+        if not rt:
+            return tok
+        ver = omnirush_client_version()
+        profile = read_oauth_profiles().get(provider, {}) or {}
+        gw = rec.get("gateway_url") or profile.get("base_url") or OMNIRUSH_GATEWAY_DEFAULT
+        url = omnirush_control_plane(gw) + "/device/refresh"
+        try:
+            req = urllib.request.Request(url, data=json.dumps({"refresh_token": rt}).encode(),
+                                         method="POST")
+            req.add_header("Content-Type", "application/json")
+            req.add_header("Accept", "application/json")
+            req.add_header("User-Agent", "omnirush/%s (linux; x64)" % ver)
+            req.add_header("X-OmniRush-Client", "cli/" + ver)
+            with urllib.request.urlopen(req, timeout=30) as r:
+                d = json.loads(r.read() or b"{}")
+            new = d.get("access_token") or d.get("token")
+            if not new:
+                return tok
+            rec = dict(rec)
+            rec["access_token"] = new
+            if d.get("refresh_token"):
+                rec["refresh_token"] = d["refresh_token"]
+            if d.get("gateway_url"):
+                rec["gateway_url"] = d["gateway_url"]
+            rec["expires_at"] = time.time() + float(d.get("expires_in", 3600))
+            auth[provider] = rec
+            write_oauth(auth)
+            return new
+        except Exception as e:
+            log("OMNIRUSH refresh %s failed: %s" % (provider, e))
+            return tok
+
+
+def chat_to_omnirush(row, payload):
+    """OpenAI Chat body -> Responses body with forced stream/store (pure)."""
+    messages = payload.get("messages", [])
+    system = "\n\n".join(str(m.get("content", "")) for m in messages
+                         if m.get("role") in ("system", "developer"))
+    inp = []
+    for m in messages:
+        role = m.get("role")
+        if role in ("system", "developer"):
+            continue
+        content = m.get("content", "")
+        if isinstance(content, str):
+            parts = [{"type": "input_text" if role == "user" else "output_text",
+                      "text": content}]
+        else:
+            parts = []
+            for c in content if isinstance(content, list) else []:
+                if not isinstance(c, dict):
+                    continue
+                if c.get("type") == "text":
+                    parts.append({"type": "input_text" if role == "user" else "output_text",
+                                  "text": str(c.get("text", ""))})
+                elif c.get("type") == "image_url":
+                    parts.append({"type": "input_image",
+                                  "image_url": (c.get("image_url") or {}).get("url", "")})
+        if role == "tool":
+            inp.append({"type": "function_call_output", "call_id": m.get("tool_call_id", ""),
+                        "output": str(content)})
+        else:
+            inp.append({"type": "message", "role": "user" if role == "user" else "assistant",
+                        "content": parts})
+    body = {"model": payload.get("model", ""), "input": inp,
+            "stream": True, "store": False}
+    if system:
+        body["instructions"] = system
+    mt = payload.get("max_completion_tokens", payload.get("max_tokens"))
+    if mt is not None:
+        body["max_output_tokens"] = mt
+    for k in ("temperature", "top_p", "reasoning_effort", "parallel_tool_calls", "metadata"):
+        if k in payload:
+            body[k] = payload[k]
+    tools = payload.get("tools")
+    if tools:
+        body["tools"] = [{"type": "function", "name": t.get("function", {}).get("name", ""),
+                          "description": t.get("function", {}).get("description", ""),
+                          "parameters": t.get("function", {}).get("parameters", {})}
+                         for t in tools if isinstance(t, dict)]
+    return body
+
+
+def omnirush_sse_events(resp):
+    """Yield parsed data: payloads from an SSE stream (pure over a line iterable)."""
+    for raw in resp:
+        try:
+            line = raw.decode() if isinstance(raw, bytes) else str(raw)
+        except Exception:
+            continue
+        line = line.strip()
+        if not line.startswith("data:"):
+            continue
+        chunk = line[5:].strip()
+        if not chunk or chunk == "[DONE]":
+            continue
+        try:
+            obj = json.loads(chunk)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict):
+            yield obj
+
+
+def omnirush_usage(u):
+    """Responses usage -> chat usage (pure)."""
+    if not isinstance(u, dict):
+        return {}
+    out = {"prompt_tokens": u.get("input_tokens", 0),
+           "completion_tokens": u.get("output_tokens", 0),
+           "total_tokens": u.get("total_tokens", 0)}
+    rd = (u.get("output_tokens_details") or {}).get("reasoning_tokens")
+    if rd is not None:
+        out["completion_tokens_details"] = {"reasoning_tokens": rd}
+    return out
+
+
+def chat_from_omnirush(row, payload):
+    """Non-stream bridge: forced upstream SSE, assembled into a chat.completion dict."""
+    base = (row.get("gateway_url") or row["base"]).rstrip("/")
+    if not base.endswith("/responses"):
+        url = base + "/responses"
+    else:
+        url = base
+    token = omnirush_access_token(row.get("oauth_provider", "")) or row.get("key", "")
+    ver = omnirush_client_version()
+    body = chat_to_omnirush(row, payload)
+    st = {"id": "chatcmpl-" + os.urandom(12).hex(), "text": "", "reasoning": "",
+          "model": body.get("model", ""), "tool_calls": [], "usage": {}, "finish": "stop"}
+    req = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST")
+    for k, v in omnirush_headers(token, ver, stream=True).items():
+        req.add_header(k, v)
+    with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+        for ev in omnirush_sse_events(resp):
+            t = ev.get("type")
+            if t == "response.created":
+                st["model"] = (ev.get("response") or {}).get("model", st["model"])
+            elif t == "response.output_text.delta" and isinstance(ev.get("delta"), str):
+                st["text"] += ev["delta"]
+            elif t in ("response.reasoning_summary_text.delta", "response.reasoning_text.delta",
+                       "response.reasoning.delta") and isinstance(ev.get("delta"), str):
+                st["reasoning"] += ev["delta"]
+            elif t == "response.completed":
+                rp = ev.get("response") or {}
+                if rp.get("usage"):
+                    st["usage"] = omnirush_usage(rp["usage"])
+                if rp.get("model"):
+                    st["model"] = rp["model"]
+            elif t in ("response.failed", "error"):
+                raise RuntimeError("omnirush upstream: %s" % str(ev.get("error", t))[:200])
+    return st
+
+
+def zcode_identity():
+    """Load the sanitized public identity asset (data, never code)."""
+    try:
+        with open(ZCODE_IDENTITY_PATH) as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def zcode_headers(token, account_uuid, device_id, session_id, request_id, trace_id, query_id):
+    ident = zcode_identity()
+    return {"Content-Type": "application/json", "Accept": "text/event-stream",
+            "Authorization": "Bearer " + token,
+            "anthropic-version": ident.get("anthropicVersion", "2023-06-01"),
+            "anthropic-beta": ident.get("anthropicBeta", "mid-conversation-system-2026-04-07"),
+            "http-referer": "https://zcode.z.ai",
+            "User-Agent": ident.get("sdkUserAgent", "ZCode/3.16.3"),
+            "x-title": "Z Code@electron", "x-release-channel": "production",
+            "x-client-language": "en", "x-client-timezone": "UTC",
+            "x-zcode-agent": "glm", "x-platform": "linux-amd64",
+            "x-os-category": "linux", "x-os-version": "unknown",
+            "x-zcode-app-version": "3.16.3", "x-zcode-session-type": "main",
+            "x-zcode-query-source": "main_turn", "x-session-id": session_id,
+            "x-request-id": request_id, "x-zcode-trace-id": trace_id,
+            "x-query-id": query_id, "x-device-mid": device_id}
+
+
+def chat_to_zcode(row, payload):
+    """OpenAI Chat body -> Anthropic Messages body with 3-block identity (pure)."""
+    ident = zcode_identity()
+    messages = payload.get("messages", [])
+    client_system = "\n".join(str(m.get("content", "")) for m in messages
+                              if m.get("role") in ("system", "developer"))
+    blocks = [{"type": "text", "text": ident.get("cliPrefix",
+               "You are ZCode, an interactive coding agent")}]
+    stable = ident.get("stablePrefix", "")
+    if stable:
+        blocks.append({"type": "text", "text": stable,
+                       "cache_control": {"type": "ephemeral"}})
+    blocks.append({"type": "text", "text": "\n\n" + client_system,
+                   "cache_control": {"type": "ephemeral"}})
+    msgs = []
+    for m in messages:
+        role = m.get("role")
+        if role in ("system", "developer"):
+            continue
+        content = m.get("content", "")
+        if role == "tool":
+            msgs.append({"role": "user", "content": [{"type": "tool_result",
+                         "tool_use_id": m.get("tool_call_id", ""),
+                         "content": str(content)}]})
+            continue
+        parts = []
+        for c in (content if isinstance(content, list) else [{"type": "text", "text": str(content)}]):
+            if not isinstance(c, dict):
+                continue
+            if c.get("type") == "text":
+                parts.append({"type": "text", "text": str(c.get("text", ""))})
+            elif c.get("type") == "image_url":
+                parts.append({"type": "image", "source": {"type": "url",
+                              "url": (c.get("image_url") or {}).get("url", "")}})
+        msgs.append({"role": "user" if role == "user" else "assistant", "content": parts})
+    rec = read_oauth().get(row.get("oauth_provider", "")) or {}
+    device_id = rec.get("zcode_device_id") or str(__import__("uuid").uuid4())
+    account_uuid = rec.get("zcode_account_uuid") or rec.get("org_id") or ""
+    session_id = rec.get("zcode_session_id") or ("session_" + os.urandom(16).hex())
+    request_id = str(__import__("uuid").uuid4())
+    trace_id = str(__import__("uuid").uuid4())
+    body = {"model": str(payload.get("model", "")).lower(),
+            "system": blocks, "messages": msgs,
+            "max_tokens": int(payload.get("max_tokens", 8192) or 8192),
+            "stream": bool(payload.get("stream", False)),
+            "metadata": {"user_id": json.dumps({"device_id": device_id,
+                         "account_uuid": account_uuid, "session_id": session_id},
+                         separators=(",", ":"))}}
+    return body, {"device_id": device_id, "account_uuid": account_uuid,
+                  "session_id": session_id, "request_id": request_id,
+                  "trace_id": trace_id,
+                  "query_id": "01a1" + request_id[4:]}
+
+
+ZCODE_ERR = {"1005": 429, "1113": 429, "3008": 429, "3009": 429, "3012": 403}
+
+
+def zcode_status(body):
+    """Business error inside HTTP 200 -> HTTP status (pure)."""
+    if not isinstance(body, dict):
+        return 200
+    code = str(body.get("code", ""))
+    return ZCODE_ERR.get(code, 200)
+
+
+def chat_from_zcode(row, payload):
+    """Non-stream bridge: Anthropic Messages upstream -> chat.completion dict."""
+    base = row.get("base", "").rstrip("/")
+    token = row.get("key", "")
+    spec = row.get("oauth_provider", "")
+    body, ids = chat_to_zcode(row, payload)
+    req = urllib.request.Request(base, data=json.dumps(body).encode(), method="POST")
+    for k, v in zcode_headers(token, ids["account_uuid"], ids["device_id"],
+                              ids["session_id"], ids["request_id"], ids["trace_id"],
+                              ids["query_id"]).items():
+        req.add_header(k, v)
+    with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+        raw = resp.read()
+    try:
+        d = json.loads(raw or b"{}")
+    except json.JSONDecodeError:
+        d = {}
+    st = zcode_status(d)
+    if st != 200:
+        raise RuntimeError("zcode business error %s: %s" % (d.get("code"), str(d.get("msg"))[:120]))
+    if d.get("stream"):
+        text = "".join(str(e.get("delta", {}).get("text", "")) for e in
+                       [json.loads(l[6:]) for l in raw.decode().splitlines()
+                        if l.startswith("data:") and l[6:].strip() not in ("[DONE]", "")]
+                       if isinstance(e, dict) and e.get("type") == "content_block_delta")
+    else:
+        text = "".join(str(b.get("text", "")) for b in d.get("content", [])
+                       if isinstance(b, dict) and b.get("type") == "text")
+    return {"id": "chatcmpl-" + os.urandom(12).hex(), "text": text,
+            "model": body.get("model", ""), "usage": {}, "finish": "stop"}
+
 
 
 def probe(base, key, model, row=None):
@@ -754,6 +1092,73 @@ class Handler(BaseHTTPRequestHandler):
             for row in chain:
                 t0 = time.time()
                 try:
+                    if row.get("api_mode") == "omnirush":
+                        chat = chat_from_omnirush(row, dict(body, stream=False))["text"]
+                        ROW_STATE[row["name"]] = {
+                            "status": "ok", "ms": (time.time() - t0) * 1000,
+                            "at": time.time()}
+                        if stream:
+                            chunk = {"id": "chatcmpl-omnirush",
+                                     "object": "chat.completion.chunk",
+                                     "created": int(time.time()),
+                                     "model": model,
+                                     "choices": [{"index": 0,
+                                                  "delta": {"role": "assistant",
+                                                            "content": chat},
+                                                  "finish_reason": "stop"}]}
+                            self.send_response(200)
+                            self.send_header("Content-Type", "text/event-stream")
+                            self.send_header("Transfer-Encoding", "chunked")
+                            self.end_headers()
+                            self._chunk(("data: %s\n\n" % json.dumps(chunk)).encode())
+                            self._chunk(b"data: [DONE]\n\n")
+                            self._chunk(b"")
+                        else:
+                            self._send(200, {
+                                "id": "chatcmpl-omnirush",
+                                "object": "chat.completion",
+                                "created": int(time.time()),
+                                "model": model,
+                                "choices": [{"index": 0, "finish_reason": "stop",
+                                             "message": {"role": "assistant",
+                                                         "content": chat}}]})
+                        log("OK  %s via %s (omnirush mode) %.1fs"
+                            % (model, row["name"], time.time() - t0))
+                        return
+                    if row.get("api_mode") == "zcode":
+                        zc = chat_from_zcode(row, dict(body, stream=False))
+                        chat = zc["text"]
+                        ROW_STATE[row["name"]] = {
+                            "status": "ok", "ms": (time.time() - t0) * 1000,
+                            "at": time.time()}
+                        if stream:
+                            chunk = {"id": "chatcmpl-zcode",
+                                     "object": "chat.completion.chunk",
+                                     "created": int(time.time()),
+                                     "model": model,
+                                     "choices": [{"index": 0,
+                                                  "delta": {"role": "assistant",
+                                                            "content": chat},
+                                                  "finish_reason": "stop"}]}
+                            self.send_response(200)
+                            self.send_header("Content-Type", "text/event-stream")
+                            self.send_header("Transfer-Encoding", "chunked")
+                            self.end_headers()
+                            self._chunk(("data: %s\n\n" % json.dumps(chunk)).encode())
+                            self._chunk(b"data: [DONE]\n\n")
+                            self._chunk(b"")
+                        else:
+                            self._send(200, {
+                                "id": "chatcmpl-zcode",
+                                "object": "chat.completion",
+                                "created": int(time.time()),
+                                "model": model,
+                                "choices": [{"index": 0, "finish_reason": "stop",
+                                             "message": {"role": "assistant",
+                                                         "content": chat}}]})
+                        log("OK  %s via %s (zcode mode) %.1fs"
+                            % (model, row["name"], time.time() - t0))
+                        return
                     if row.get("api_mode") == "responses":
                         chat = chat_from_responses(row, body)
                         ROW_STATE[row["name"]] = {
@@ -1014,7 +1419,11 @@ def oauth_poll(provider, flow):
             continue
 
         code = error_code(d)
-        access = d.get("access_token") or d.get("token")
+        # Providers disagree on the credential field. inference.sh returns
+        # "session_token" (token_kind=session) or "api_key" (legacy/default);
+        # others use "access_token" or "token".
+        access = (d.get("access_token") or d.get("token") or
+                  d.get("session_token") or d.get("api_key"))
         if access:
             out = {"access_token": access,
                    "refresh_token": d.get("refresh_token", "")}
