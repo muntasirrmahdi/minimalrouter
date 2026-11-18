@@ -400,6 +400,7 @@ def oauth_rows():
                          "oauth_provider": provider,
                          "api_mode": spec.get("api_mode", "chat_completions"),
                          "gateway_url": (auth.get(provider) or {}).get("gateway_url", ""),
+                         "chat_path": spec.get("chat_path", ""),
                          "org_id": (auth.get(provider) or {}).get("org_id", ""),
                          "oauth_label": spec.get("label", provider)})
     return rows
@@ -437,6 +438,8 @@ def upstream(base, key, path, payload=None, timeout=TIMEOUT, row=None):
     api_mode = row.get("api_mode", "chat_completions")
     if api_mode == "responses" and path == "/v1/chat/completions":
         return oauth_chat(row, payload, timeout)
+    if path == "/v1/chat/completions" and row.get("chat_path"):
+        path = row["chat_path"]
     url = ep(base, path)
     data = json.dumps(payload).encode() if payload is not None else None
     req = urllib.request.Request(url, data=data,

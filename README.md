@@ -364,6 +364,16 @@ Keyless = an API row with an empty key (kilocode, pollinations). Keyless is a
 documentation label, not a third auth mechanism. Keyless free tiers are rationed —
 a successful call followed by 429/503 seconds later is normal.
 
+**freebuff is API class via a local bridge, and it carries a real ToS warning.** The bridge
+(`~/.minimalrouter/bridges/freebuff_bridge.py`) must be logged in once (`--login`) and running
+(`--serve`) before the row works; then MinimalRouter sees a plain loopback OpenAI endpoint with a
+dummy key. The free path needs admission + agent-run + a byte-exact "You are Buffy..." marker +
+`cost_mode:free` inside the bridge — a bare token never routes. **Warning from freebuff's own ToS
+(effective 2026-11-12): direct endpoint access through wrappers/relays/automation and use of more
+than one account are prohibited, enforced with identity verification and device fingerprinting.**
+Personal, single-account, loopback use only; the registry entry is `routable:false` and was left
+out of the public repo seed on purpose.
+
 **inference.sh is registered but NOT yet a working route.** Device flow verified live
 (POST `oauth/device_authorization` → real code; GET `device/auth/poll/{code}` → `pending`),
 and `oauth add inference` resolves it from the registry in one word. But no human completed
