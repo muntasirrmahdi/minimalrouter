@@ -374,6 +374,13 @@ than one account are prohibited, enforced with identity verification and device 
 Personal, single-account, loopback use only; the registry entry is `routable:false` and was left
 out of the public repo seed on purpose.
 
+**Why refreshing a row can honestly fail.** In the dashboard, `r` refreshes the selected row's
+OAuth token — it no longer just prints a timestamp. But two providers have nothing to refresh:
+**zcode** mints a plan JWT with **no `exp` claim** (it doesn't expire) and no refresh token, so the
+answer is "re-login with `minimalrouter oauth zcode`" — not a bug. **omnirush** refreshes fine, but
+its gateway rejects every non-official client with `official_client_required`, so a fresh token
+still won't route. API and keyless rows have no token at all — press `t` to re-test them instead.
+
 **Commands you can run any time.** `minimalrouter stop` stops the running server/dashboard by
 verified PID (never a pattern match — a same-named copy elsewhere is untouched). `minimalrouter
 refresh [id]` forces an OAuth token refresh now; with no id it refreshes every profile. Providers

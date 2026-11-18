@@ -350,7 +350,7 @@ def oauth_access_token(provider):
     rec = auth.get(provider) or {}
     token = rec.get("access_token", "")
     expires = float(rec.get("expires_at", 0) or 0)
-    if not token or expires > time.time() + 60:
+    if not token or (expires and expires > time.time() + 60) or (not expires and token):
         return token
     spec = read_oauth_profiles().get(provider, {})
     refresh_url = spec.get("refresh_url")
@@ -383,6 +383,15 @@ def oauth_access_token(provider):
     except Exception as e:
         log("OAUTH-REFRESH %s failed: %s" % (provider, e))
         return token
+
+
+def token_live(rec):
+    """True when a stored credential has not expired. Tokens with no expiry
+    (e.g. zcode's plan JWT, which has no exp claim) never expire."""
+    if not rec.get("access_token"):
+        return False
+    exp = float(rec.get("expires_at", 0) or 0)
+    return exp <= 0 or exp > time.time()
 
 
 def oauth_rows():
@@ -996,6 +1005,14 @@ class Handler(BaseHTTPRequestHandler):
         except json.JSONDecodeError as e:
             return self._send(400, {"error": "bad json: %s" % e})
 
+        if p == "/api/refresh":
+            pid = body.get("provider", "")
+            ids = [pid] if pid else sorted(read_oauth_profiles())
+            out = []
+            for p_id in ids:
+                ok, msg = oauth_refresh(p_id)
+                out.append({"provider": p_id, "ok": ok, "message": msg})
+            return self._send(200, {"results": out})
         if p == "/api/test":
             base, key, model = (body.get("base", ""), body.get("key", ""),
                                 body.get("model", ""))
@@ -1657,7 +1674,7 @@ def _curses_main(stdscr, port):
         # ---- status + legend -------------------------------------------
         _putw(stdscr, h - 2, " " + status, w, curses.A_BOLD)
         _putw(stdscr, h - 1,
-              " up/down select  t test  a add  d delete  r refresh  "
+              " up/down select  t test  a add  d delete  r refresh token  "
               "q quit (stops server)  Esc cancel", w, curses.A_DIM)
         stdscr.refresh()
 
@@ -1672,7 +1689,24 @@ def _curses_main(stdscr, port):
         elif ch == curses.KEY_UP:
             sel = max(0, sel - 1)
         elif ch in (ord("r"), ord("R")):
-            status = "refreshed %s" % time.strftime("%H:%M:%S")
+            if not rows:
+                status = "no rows to refresh"
+            else:
+                row = rows[sel]
+                provider = row.get("oauth_provider", "")
+                if not provider:
+                    status = ("%s: API/keyless row - no token to refresh "
+                              "(press t to re-test)" % row["name"])
+                else:
+                    status = "refreshing %s ..." % provider
+                    _draw_status(stdscr, status, w, h)
+                    res = api_post("/api/refresh", {"provider": provider})
+                    items = res.get("results") or []
+                    if items:
+                        it = items[0]
+                        status = "%s: %s" % (provider, it.get("message", "unknown"))
+                    else:
+                        status = "%s: refresh error" % provider
         elif ch in (ord("t"), ord("T")):
             if rows:
                 row = rows[sel]
