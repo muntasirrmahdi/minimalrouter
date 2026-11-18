@@ -374,6 +374,12 @@ than one account are prohibited, enforced with identity verification and device 
 Personal, single-account, loopback use only; the registry entry is `routable:false` and was left
 out of the public repo seed on purpose.
 
+**Commands you can run any time.** `minimalrouter stop` stops the running server/dashboard by
+verified PID (never a pattern match — a same-named copy elsewhere is untouched). `minimalrouter
+refresh [id]` forces an OAuth token refresh now; with no id it refreshes every profile. Providers
+with no refresh token (inference.sh, zcode plan JWT) report that plainly instead of pretending.
+`minimalrouter oauth list` shows every profile's class and connection state.
+
 **inference.sh is registered but NOT yet a working route.** Device flow verified live
 (POST `oauth/device_authorization` → real code; GET `device/auth/poll/{code}` → `pending`),
 and `oauth add inference` resolves it from the registry in one word. But no human completed

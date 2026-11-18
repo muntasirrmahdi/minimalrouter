@@ -1798,6 +1798,101 @@ def _add_flow(stdscr):
     return "add failed: %s" % a.get("error", "?")
 
 
+def oauth_refresh(provider, timeout=30):
+    """Force a token refresh for one provider. Returns (ok, message).
+
+    Handles three shapes: generic header/body refresh, Nous' header-carried secret,
+    and omnirush's dedicated control-plane refresh with rotating token + gateway_url.
+    Never prints the token.
+    """
+    profiles = read_oauth_profiles()
+    if provider not in profiles:
+        return False, "unknown provider %r (see: minimalrouter oauth list)" % provider
+    spec = profiles[provider] or {}
+    auth = read_oauth()
+    rec = auth.get(provider) or {}
+    rt = rec.get("refresh_token", "")
+    if not rt:
+        return False, "%s: no refresh token — re-login with: minimalrouter oauth %s" % (
+            provider, provider)
+    if spec.get("api_mode") == "omnirush":
+        # single-flight and atomic persist live inside omnirush_access_token
+        tok = omnirush_access_token(provider)
+        return (True, "refreshed") if tok else (False, "refresh failed (see log)")
+    url = spec.get("refresh_url")
+    if not url:
+        return False, "%s: no refresh_url — re-login with: minimalrouter oauth %s" % (
+            provider, provider)
+    body = {k: str(v).replace("{refresh_token}", rt)
+            for k, v in (spec.get("refresh_body") or
+                         {"refresh_token": "{refresh_token}"}).items()}
+    try:
+        req = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST")
+        req.add_header("Content-Type", "application/json")
+        req.add_header("Accept", "application/json")
+        req.add_header("User-Agent", UA)
+        for k, v in (spec.get("refresh_headers") or {}).items():
+            req.add_header(k, str(v).replace("{refresh_token}", rt))
+        d = json.loads(urllib.request.urlopen(req, timeout=timeout).read() or b"{}")
+    except Exception as e:
+        return False, "refresh request failed: %s" % e
+    new = d.get("access_token") or d.get("token")
+    if not new:
+        return False, "no token in refresh response: %s" % str(d)[:120]
+    rec = dict(rec)
+    rec["access_token"] = new
+    if d.get("refresh_token"):
+        rec["refresh_token"] = d["refresh_token"]
+    rec["expires_at"] = time.time() + float(d.get("expires_in", 3600))
+    auth[provider] = rec
+    write_oauth(auth)
+    return True, "refreshed (new expiry in %s s)" % int(float(d.get("expires_in", 3600)))
+
+
+def stop_server():
+    """Stop MinimalRouter instances owned by this user, by verified PID only.
+
+    Scans /proc for processes whose cmdline contains minimalrouter.py, skips self,
+    verifies the path is our script, and signals each PID by number. Never uses
+    pkill -f (which self-matches and can kill the caller).
+    """
+    me = os.getpid()
+    ours = os.path.realpath(__file__)
+    targets = []
+    try:
+        entries = os.listdir("/proc")
+    except OSError as e:
+        return 0, "cannot read /proc: %s" % e
+    for name in entries:
+        if not name.isdigit():
+            continue
+        pid = int(name)
+        if pid == me:
+            continue
+        try:
+            with open("/proc/%d/cmdline" % pid, "rb") as f:
+                parts = [x.decode("utf-8", "replace") for x in f.read().split(b"\0") if x]
+        except (OSError, ValueError):
+            continue
+        if not any("minimalrouter.py" in x for x in parts):
+            continue
+        if not any(os.path.realpath(x) == ours for x in parts if x.endswith(".py")):
+            continue
+        targets.append((pid, parts))
+    if not targets:
+        return 0, "no MinimalRouter process running"
+    stopped = []
+    for pid, parts in targets:
+        try:
+            os.kill(pid, 15)  # SIGTERM
+            stopped.append(str(pid))
+        except ProcessLookupError:
+            pass
+        except OSError as e:
+            return len(stopped), "PID %s: %s" % (pid, e)
+    return len(stopped), "stopped PID(s): %s" % ", ".join(stopped)
+
+
 def run_server():
     ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()
 
@@ -1816,6 +1911,9 @@ Usage:
   minimalrouter oauth list   show profiles and connection state
   minimalrouter oauth <id>   sign in to that provider (device code)
   minimalrouter oauth rm <id>  delete a profile and its token
+  minimalrouter oauth list   profiles with class + connection state
+  minimalrouter refresh [id] refresh OAuth token(s) now (all, or one provider)
+  minimalrouter stop         stop the running server/dashboard by verified PID
   minimalrouter -h|--help    show this help
   minimalrouter -v           show version
 
@@ -2067,6 +2165,22 @@ def main():
         except Exception as e:
             print("OAuth failed: %s" % e)
             return 1
+    if args and args[0].lower() == "stop":
+        n, msg = stop_server()
+        print("MinimalRouter: " + msg)
+        return 0 if n or "no MinimalRouter" in msg else 1
+    if args and args[0].lower() == "refresh":
+        profiles = read_oauth_profiles()
+        ids = [args[1].lower()] if len(args) > 1 else sorted(profiles)
+        if not ids:
+            print("No OAuth profiles. Add one: minimalrouter oauth add")
+            return 0
+        bad = 0
+        for pid in ids:
+            ok, msg = oauth_refresh(pid)
+            print("%-12s %s" % (pid, ("OK " if ok else "FAIL ") + msg))
+            bad += 0 if ok else 1
+        return 1 if bad else 0
     mode = args[0] if args else "tui"
     if mode not in ("tui", "serve"):
         print("minimalrouter: unknown command %r\n" % mode)
