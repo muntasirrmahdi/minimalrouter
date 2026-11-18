@@ -84,6 +84,9 @@ OMNIRUSH_REFRESH_LOCK = Lock()
 _OMNIRUSH_VERSION = None
 ZCODE_GATEWAY_DEFAULT = "https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages"
 ZCODE_IDENTITY_PATH = os.path.join(MR_HOME, "bridges", "zcode-identity.json")
+# Per-flow client secrets for device flows that authenticate the client with a
+# self-minted bearer that must match between init and poll (zcode).
+FLOW_SECRETS = {}
 
 
 def load_env():
@@ -1339,17 +1342,29 @@ def oauth_device_start(provider):
                    "application/x-www-form-urlencoded" if form else "application/json")
     req.add_header("Accept", "application/json")
     req.add_header("User-Agent", UA)
+    if spec.get("client_secret_mode") == "random_hex":
+        secret = os.urandom(32).hex()
+        FLOW_SECRETS[provider] = secret
+        req.add_header("Authorization", "Bearer " + secret)
     for k, v in (spec.get("authorize_headers") or {}).items():
         req.add_header(k, str(v))
     res = urllib.request.urlopen(req, timeout=TIMEOUT)
-    return json.loads(res.read() or b"{}")
+    out = json.loads(res.read() or b"{}")
+    # Some providers wrap the device payload in {code,msg,data:{flow_id,...}}.
+    if isinstance(out.get("data"), dict):
+        inner = dict(out["data"])
+        if not inner.get("device_code") and inner.get("flow_id"):
+            inner["device_code"] = inner["flow_id"]
+        return inner
+    return out
 
 
 def oauth_start(provider):
     try:
         d = oauth_device_start(provider)
         url = (d.get("verification_uri_complete") or d.get("verification_uri")
-               or d.get("verificationUrl") or "")
+               or d.get("verificationUrl") or d.get("authorize_url")
+               or d.get("authorizeUrl") or "")
         if url.startswith("/"):
             spec = read_oauth_profiles().get(provider, {})
             url = _origin(spec.get("authorize_url", "")) + url
@@ -1394,13 +1409,18 @@ def oauth_poll(provider, flow):
                 else:
                     url = poll_url.rstrip("/") + "/" + urllib.parse.quote(
                         flow["device_code"], safe="")
-                req = urllib.request.Request(url, headers={"User-Agent": UA,
-                                                           "Accept": "application/json"})
+                hdrs = {"User-Agent": UA, "Accept": "application/json"}
+                secret = FLOW_SECRETS.get(provider)
+                if secret:
+                    hdrs["Authorization"] = "Bearer " + secret
+                req = urllib.request.Request(url, headers=hdrs)
                 with urllib.request.urlopen(req, timeout=30) as r:
                     status = r.status
                     d = json.loads(r.read() or b"{}")
                 if isinstance(d.get("data"), dict):  # nested token/pending payload
                     d = dict(d["data"], **{k: v for k, v in d.items() if k != "data"})
+                    if not d.get("access_token") and d.get("token"):
+                        d["access_token"] = d["token"]
             elif spec.get("token_form"):
                 data = urllib.parse.urlencode(body).encode()
                 req = urllib.request.Request(poll_url, data=data, method="POST")
