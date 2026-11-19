@@ -266,6 +266,7 @@ flow you changed before submitting.
 
 - [Issues](https://github.com/muntasirrmahdi/minimalrouter/issues) — bugs and feature requests (use the templates)
 - [Security advisories](https://github.com/muntasirrmahdi/minimalrouter/security/advisories/new) — private vulnerability reports, see [SECURITY.md](SECURITY.md)
+- [Releases & changelog](https://github.com/muntasirrmahdi/minimalrouter/releases) — versioned releases; the full history is in [CHANGELOG.md](CHANGELOG.md)
 
 ## License
 

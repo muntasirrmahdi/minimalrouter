@@ -61,6 +61,12 @@ try:  # single guarded import: every UI helper resolves curses from here
 except ImportError:  # platform without curses -> main() degrades to serve
     curses = None
 
+# Semantic version — the single source of truth. -v, the HTTP server_version, the
+# CHANGELOG and the git tag all derive from this one line. MAJOR.MINOR.PATCH per
+# semver.org: MAJOR on a breaking client contract, MINOR on backward-compatible
+# features, PATCH on fixes.
+__version__ = "1.1.0"
+
 HOME = os.path.expanduser("~")
 MR_HOME = os.path.join(HOME, ".minimalrouter")
 ROWS_PATH = os.path.join(MR_HOME, "rows.json")
@@ -987,7 +993,7 @@ def pool_stats(rows):
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "minimalrouter/1.0"
+    server_version = "minimalrouter/" + __version__
 
     def log_message(self, fmt, *args):
         pass
@@ -2185,7 +2191,7 @@ def main():
         print(usage())
         return 0
     if args and args[0].lower() in ("-v", "--version", "version"):
-        print("minimalrouter 1.0")
+        print("minimalrouter " + __version__)
         return 0
     if args and args[0].lower() == "oauth":
         profiles = read_oauth_profiles()

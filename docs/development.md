@@ -134,7 +134,16 @@ then leaves the file untouched instead of half-applied.
 5. Provider-specific blockers live in docs/providers.md where users pick a
    provider; a status line expires the moment reality changes — rewrite it in the
    same pass, dated.
-6. Commit (Conventional Commits), push, verify `origin/main` moved and matches.
-7. Clean-HOME stranger test against the pushed artifact.
-8. CI green on the pushed commit (`gh run list` / `gh run view`) — never claim green
-   without the live read.
+6. **Version bump** (semver): decide MAJOR (breaking client contract) / MINOR
+   (backward-compatible features) / PATCH (fixes); set `__version__` in
+   `minimalrouter.py` (the single source — `-v`, `server_version` and the tag all
+   derive from it; a CI test asserts they match); add the `[x.y.z]` entry to
+   `CHANGELOG.md` (Keep a Changelog).
+7. Commit (Conventional Commits), push, verify `origin/main` moved and matches.
+8. **Tag + release**: `git tag -a vX.Y.Z -m "vX.Y.Z"` (the tag name is `v` + the
+   exact `__version__`), push the tag, then `gh release create vX.Y.Z --title
+   "vX.Y.Z" --notes-file <(section from CHANGELOG)>`. The GitHub release body mirrors
+   the CHANGELOG entry — never a second hand-written source of truth.
+9. Clean-HOME stranger test against the pushed artifact.
+10. CI green on the pushed commit **and** the tag (`gh run list` / `gh run view`) —
+    never claim green without the live read.

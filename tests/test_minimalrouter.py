@@ -471,5 +471,20 @@ class TestTextualDashboardLoader(unittest.TestCase):
             self.assertIsNone(got)
 
 
+class TestVersion(unittest.TestCase):
+    """__version__ is the single source; every surface must derive from it (semver)."""
+
+    def test_version_is_semver(self):
+        self.assertRegex(mr.__version__, r"^\d+\.\d+\.\d+$")
+
+    def test_server_version_derives_from_version(self):
+        self.assertEqual(mr.Handler.server_version, "minimalrouter/" + mr.__version__)
+
+    def test_dash_v_prints_version(self):
+        out = subprocess.run(
+            [sys.executable, str(ENGINE), "-v"], capture_output=True, text=True, timeout=30)
+        self.assertEqual(out.stdout.strip(), "minimalrouter " + mr.__version__)
+
+
 if __name__ == "__main__":
     unittest.main()
