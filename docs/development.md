@@ -25,8 +25,30 @@ audit: class derivation and spoof resistance, `token_live` no-expiry semantics,
 `ep()` path joining, OAuth error-shape normalisation, `state_for` field contract
 (D1), zombie-aware liveness (D3), `oauth add` URL validation (D2, subprocess),
 and the failure-envelope upstream body (D4, loopback fixture server). CI runs the
-suite on Python 3.11-3.14 plus an install-smoke job that runs `install.sh` from the
-checkout into a throwaway HOME.
+suite on Python 3.11-3.14 (the dashboard tests skip when textual is absent, so the
+core job stays zero-dep), an install-smoke job that runs `install.sh` from the
+checkout into a throwaway HOME and asserts the curses fallback without textual, and
+a `dashboard` job that installs textual and runs the full suite plus a headless
+Textual-board smoke.
+
+## The optional Textual dashboard
+
+`minimalrouter_dashboard.py` is the enhanced Mission Control board. It is a sibling
+module the core imports lazily via `_load_textual_dashboard()`; if it or `textual` is
+missing, or it crashes at runtime, the core falls back to its stdlib curses board.
+The router core and the request path never depend on it. To develop against it:
+
+```sh
+pip install textual            # the one dependency, dashboard-only
+python -m unittest discover -s tests -v          # dashboard tests now run
+MINIMALROUTER_TUI=curses minimalrouter           # force the curses fallback
+MINIMALROUTER_TUI=textual minimalrouter          # request the board (loud if absent)
+```
+
+Verify it in a real PTY with a true terminal emulator (pyte), not a hand-rolled
+escape parser — the naive parser mangles UTF-8 block glyphs and fakes layout bugs.
+Theme and density persist to `~/.minimalrouter/dashboard.json`; the live-vs-repo sha
+check above covers `minimalrouter.py` AND `minimalrouter_dashboard.py`.
 
 A regression test must bite: to prove one does, run it against the pre-fix engine
 (`MR_TEST_ENGINE=/path/to/old/minimalrouter.py python -m unittest ...`) and confirm

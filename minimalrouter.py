@@ -2124,7 +2124,11 @@ Class is derived from the row's real shape, never from a label; a row cannot cla
 The dashboard and GET /api/state show the class of every row. Client format is OpenAI Chat
 Completions.
 
-Dashboard keys:
+Dashboard: with `pip install textual` you get the enhanced Mission Control board
+(p cycle theme, v density); without it, the built-in curses board. Force a mode with
+MINIMALROUTER_TUI=textual|curses (default auto). The router core needs no dependencies.
+
+Dashboard keys (curses):
   up/down  select row     t  re-test row      a  add a row
   d        delete row     r  refresh          q  quit (stops the server)
   Esc      cancel a prompt
@@ -2140,6 +2144,30 @@ Files:
   ~/.minimalrouter/oauth.json           local OAuth tokens (chmod 600)
   ~/.minimalrouter/minimalrouter.log   per-request OK/FAIL log
 """ % PORT
+
+
+def _load_textual_dashboard():
+    """Optional enhanced dashboard (Textual). Returns its runner, or None.
+
+    The core stays stdlib: this is a guarded lazy import of the sibling
+    minimalrouter_dashboard module, which itself imports textual. When textual
+    (or the module) is absent, ImportError -> None -> the curses fallback.
+    MINIMALROUTER_TUI=curses forces the fallback; =textual requests it loudly.
+    """
+    pref = os.environ.get("MINIMALROUTER_TUI", "auto").strip().lower()
+    if pref == "curses":
+        return None
+    try:
+        import minimalrouter_dashboard as _d
+        return _d.run_dashboard
+    except ImportError:
+        if pref == "textual":
+            print("minimalrouter: Textual dashboard requested but not installed.")
+            print("Install it with:  pip install textual   (using curses for now)")
+        return None
+    except Exception as e:
+        log("textual dashboard failed to load: %s" % e)
+        return None
 
 
 def main():
@@ -2408,20 +2436,30 @@ def main():
         return 0
     t = Thread(target=srv.serve_forever, daemon=True)
     t.start()
-    if curses is None:
-        log("curses unavailable; server-only")
-        print("curses not available on this Python — server running on "
-              "http://%s:%d/v1 (Ctrl-C to stop)" % (HOST, PORT))
+    dash = _load_textual_dashboard()
+    if dash is not None:
         try:
-            while True:
-                time.sleep(60)
+            dash(PORT)
         except KeyboardInterrupt:
             pass
-    else:
-        try:
-            curses.wrapper(_curses_main, PORT)
-        except KeyboardInterrupt:
-            pass
+        except Exception as e:
+            log("textual dashboard crashed (%s); falling back to curses" % e)
+            dash = None
+    if dash is None:
+        if curses is None:
+            log("curses unavailable; server-only")
+            print("curses not available on this Python — server running on "
+                  "http://%s:%d/v1 (Ctrl-C to stop)" % (HOST, PORT))
+            try:
+                while True:
+                    time.sleep(60)
+            except KeyboardInterrupt:
+                pass
+        else:
+            try:
+                curses.wrapper(_curses_main, PORT)
+            except KeyboardInterrupt:
+                pass
     srv.shutdown()
     remove_pidfile()
     log("MinimalRouter stopped")

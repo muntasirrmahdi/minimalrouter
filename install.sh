@@ -1,7 +1,9 @@
 #!/bin/sh
-# MinimalRouter installer: one file, no dependencies.
+# MinimalRouter installer: stdlib core, no required dependencies.
+# The enhanced Mission Control dashboard is optional (pip install textual);
+# without it the built-in curses dashboard is used. Pass --textual to install it.
 # Usage:  curl -fsSL https://raw.githubusercontent.com/muntasirrmahdi/minimalrouter/main/install.sh | sh
-# Or from a checkout:  sh install.sh
+# Or from a checkout:  sh install.sh [--textual]
 
 set -eu
 
@@ -12,6 +14,14 @@ DEST="$HOME/.minimalrouter"
 BIN="$HOME/.local/bin"
 
 say() { printf '%s\n' "$*"; }
+
+WITH_TEXTUAL=0
+for arg in "$@"; do
+    case "$arg" in
+        --textual) WITH_TEXTUAL=1 ;;
+        *) say "note: ignoring unknown option '$arg'" ;;
+    esac
+done
 
 # ---- requirements ----------------------------------------------------------
 if ! command -v python3 >/dev/null 2>&1; then
@@ -42,6 +52,9 @@ fetch() {
 }
 
 fetch minimalrouter.py
+# Optional enhanced dashboard (Textual). The core falls back to curses if the
+# module or its dependency is absent, so this file is safe to ship always.
+fetch minimalrouter_dashboard.py
 fetch rows.example.json
 fetch oauth-providers.example.json
 # The zcode translator loads this identity asset; without it a fresh install
@@ -65,6 +78,17 @@ if [ -f "$DEST/oauth.json" ]; then chmod 600 "$DEST/oauth.json"; fi
 printf '#!/bin/sh\nexec python3 "%s/minimalrouter.py" "$@"\n' "$DEST" > "$BIN/minimalrouter"
 chmod +x "$BIN/minimalrouter"
 
+# ---- optional enhanced dashboard ------------------------------------------
+if [ "$WITH_TEXTUAL" = "1" ]; then
+    say "installing Textual for the enhanced Mission Control dashboard..."
+    if python3 -m pip install --user textual >/dev/null 2>&1; then
+        say "  Textual installed — run 'minimalrouter' for the enhanced board."
+    else
+        say "  note: could not install textual; the curses dashboard will be used."
+        say "  try manually later:  pip install textual"
+    fi
+fi
+
 # ---- report ----------------------------------------------------------------
 say ""
 say "MinimalRouter installed"
@@ -86,3 +110,6 @@ say "  2. run: minimalrouter"
 say "  3. press a to add a provider, t to test one, q to quit"
 say ""
 say "server only: minimalrouter serve"
+say ""
+say "enhanced dashboard (optional): pip install textual   (or: sh install.sh --textual)"
+say "  without it the built-in curses dashboard is used — the core needs no deps"

@@ -15,11 +15,13 @@ import sys
 import tempfile
 import threading
 import time
+import types
 import unittest
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 ENGINE = Path(os.environ.get("MR_TEST_ENGINE") or ROOT / "minimalrouter.py")
@@ -417,6 +419,56 @@ class TestPoolStats(unittest.TestCase):
         self.assertEqual(s["rows"], 5)
         self.assertEqual(s["serving"], 1)
         self.assertEqual(s["blocked"], 2)  # gated + empty
+
+
+class TestTextualDashboardLoader(unittest.TestCase):
+    """The optional-Textual integration must never break the stdlib core:
+    absent -> curses fallback, curses pref -> forced fallback, present -> runner."""
+
+    def setUp(self):
+        self._env = os.environ.get("MINIMALROUTER_TUI")
+        if str(ROOT) not in sys.path:
+            sys.path.insert(0, str(ROOT))
+
+    def tearDown(self):
+        if self._env is None:
+            os.environ.pop("MINIMALROUTER_TUI", None)
+        else:
+            os.environ["MINIMALROUTER_TUI"] = self._env
+
+    def test_curses_pref_forces_fallback(self):
+        os.environ["MINIMALROUTER_TUI"] = "curses"
+        self.assertIsNone(mr._load_textual_dashboard())
+
+    def test_absent_module_returns_none(self):
+        os.environ["MINIMALROUTER_TUI"] = "auto"
+        # sys.modules[name] = None makes `import name` raise ImportError,
+        # simulating "textual / dashboard not installed" in any environment.
+        with mock.patch.dict(sys.modules, {"minimalrouter_dashboard": None}):
+            self.assertIsNone(mr._load_textual_dashboard())
+
+    def test_textual_pref_absent_prints_hint_and_falls_back(self):
+        os.environ["MINIMALROUTER_TUI"] = "textual"
+        with mock.patch.dict(sys.modules, {"minimalrouter_dashboard": None}):
+            self.assertIsNone(mr._load_textual_dashboard())
+
+    def test_present_module_returns_runner(self):
+        os.environ["MINIMALROUTER_TUI"] = "auto"
+        fake = types.ModuleType("minimalrouter_dashboard")
+        setattr(fake, "run_dashboard", lambda port=8790: None)
+        with mock.patch.dict(sys.modules, {"minimalrouter_dashboard": fake}):
+            self.assertIs(mr._load_textual_dashboard(), getattr(fake, "run_dashboard"))
+
+    def test_broken_module_returns_none_not_crash(self):
+        os.environ["MINIMALROUTER_TUI"] = "auto"
+        broken = types.ModuleType("minimalrouter_dashboard")
+        # no run_dashboard attribute -> loader must not raise
+        with mock.patch.dict(sys.modules, {"minimalrouter_dashboard": broken}):
+            try:
+                got = mr._load_textual_dashboard()
+            except Exception as e:
+                self.fail("loader raised on a broken module: %r" % e)
+            self.assertIsNone(got)
 
 
 if __name__ == "__main__":

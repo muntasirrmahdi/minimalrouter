@@ -1,8 +1,10 @@
 # MinimalRouter
 
-One OpenAI-compatible endpoint over all your free API rows — a single Python file,
-standard library only, zero dependencies, localhost only, with a terminal dashboard
-built in. Provider logins (OAuth device flow) are first-class.
+One OpenAI-compatible endpoint over all your free API rows — the router core is a
+single Python file, standard library only, zero dependencies, localhost only, with a
+terminal dashboard built in. An optional Textual board upgrades the dashboard to the
+full Mission Control look; without it, the built-in curses board runs. Provider logins
+(OAuth device flow) are first-class.
 
 Free tiers are scattered across a dozen providers: each has its own base URL, its own
 key, its own rate limit, and its own way of dying quietly. MinimalRouter puts them
@@ -14,7 +16,7 @@ of every row in your terminal.
 | **One endpoint** | Every client that speaks the OpenAI format uses one base URL: `http://127.0.0.1:8790/v1`. No server auth, no lock-in, no pip install. |
 | **Three connection classes** | API key, OAuth device flow, or keyless — one engine path. The class is derived from the row's actual shape, never from a label. |
 | **Ordered fallback** | Rows sharing a model id form a chain. 401/402/403/429/5xx/timeout moves to the next row automatically, and the failure envelope carries the upstream's own error message. |
-| **A real terminal dashboard** | Mission Control board: stat strip (rows/models/serving/blocked), dense row table with class, latency sparklines and status pills, compact selected-row detail, live event tail; add/test/delete/refresh without leaving the TUI. |
+| **A real terminal dashboard** | Mission Control board: block-pixel wordmark, stat strip (rows/models/serving/blocked), dense table with class, latency sparklines and status pills, selected-row detail, live event tail, 3 themes + a density toggle. The enhanced Textual board ships with the install; if Textual isn't present the core falls back to a stdlib curses board — no dependency required. |
 | **One-word provider connects** | A name-to-endpoint registry makes a known tool a single word: `oauth add`, type the name, approve in the browser. Unknown tools stay addable by pasting a base URL once. |
 | **Native translators** | Providers that need a transformed request (Responses-only gateways, Anthropic-Messages plan lanes) route through sibling transports in the same file — endpoints and identity assets are data, not code. |
 | **Runs anywhere Python runs** | Linux, macOS, WSL2. One file, Python 3.8+, no database, no web UI, nothing to configure beyond a JSON file of rows. |

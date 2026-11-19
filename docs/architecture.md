@@ -1,17 +1,23 @@
 # Architecture
 
-MinimalRouter is deliberately one Python file (`minimalrouter.py`, standard library
-only). This document maps the file and the request lifecycle so a contributor can
-navigate it without reading all of it. Function names are the anchors; line numbers
-are not quoted because they drift.
+MinimalRouter's router core is deliberately one Python file (`minimalrouter.py`,
+standard library only). The interactive dashboard has two implementations: the core's
+built-in stdlib curses board (always available) and an optional Textual "Mission
+Control" sibling module (`minimalrouter_dashboard.py`) that the core imports lazily
+and falls back from when Textual is absent. This document maps the core file and the
+request lifecycle. Function names are the anchors; line numbers are not quoted because
+they drift.
 
 ## Design laws
 
 These are the invariants every change is reviewed against:
 
-1. **One file, stdlib only.** No pip dependencies in the core, ever. A PR that adds a
-   dependency to `minimalrouter.py` is closed. Dev-only tooling (tests, CI lint) may
-   use external tools; the shipped engine may not.
+1. **Core is one file, stdlib only.** No pip dependencies in `minimalrouter.py`, ever.
+   A PR that adds a dependency to the core is closed. The optional dashboard
+   (`minimalrouter_dashboard.py`) may use Textual, but only as a guarded lazy import:
+   the core must run and fall back to its curses board when that module or its
+   dependency is absent, and the request path never touches it. Dev-only tooling
+   (tests, CI lint) may use external tools; the shipped engine may not.
 2. **No provider names or endpoints in code.** Names live in
    `provider-registry.json`; endpoints are discovered live or curated in
    `oauth-providers.json` / the registry. The generic engine never knows a provider
@@ -46,7 +52,7 @@ These are the invariants every change is reviewed against:
 | Translators | `chat_to_omnirush()` / `chat_from_omnirush()` (Responses-only, forced `stream:true`+`store:false`, policed client header, rotating control-plane refresh), `chat_to_zcode()` / `chat_from_zcode()` (Anthropic-Messages plan lane, 3-block system identity from `bridges/zcode-identity.json`, header bundle, business errors inside HTTP 200 mapped by `zcode_status()`), `oauth_chat()` (generic `api_mode: responses`) |
 | OAuth device-flow layer | `discover_device_endpoints()` (OIDC + conventional paths, accepted only on a real device code), `oauth_add` CLI flow, poll loop (pending codes 202/400/401/409/428 keep waiting; `token`/`session_token`/`api_key`/`access_token` all accepted; `data` unwrapped), `oauth_refresh()` (generic body/header refresh, header-carried secrets, rotating vendor control-plane), `oauth_access_token()` (refresh-on-demand gated by `token_live()`) |
 | HTTP handler | `do_GET`: `/health`, `/v1/models`, `/api/state`, OAuth status endpoints. `do_POST`: `/v1/chat/completions` (the chain loop), `/api/test`, `/api/fetch_models`, `/api/add`, `/api/remove`, `/api/refresh`. `/v1/messages` is intentionally absent (404) — the Anthropic shim is roadmap |
-| Dashboard | curses TUI ("Mission Control") in the same process; reads `/api/state`; stat strip (rows/models/serving/blocked via `pool_stats`), dense table CLASS/ROW/MODEL/TREND(sparkline)/LAT/STATUS, compact 3-line SELECTED (last error always shown), EVENTS tail; keys up/down/t/a/d/r/q/Esc; status via `classify_status` (ok/gated/empty/error/unknown), latency history via `record_state` (bounded JSON-safe list) |
+| Dashboard | Two boards, same data. Primary: optional Textual module (`minimalrouter_dashboard.py`) — block-pixel wordmark, stat strip, dense table CLASS/ROW/MODEL/TREND(sparkline)/LAT/STATUS, SELECTED + EVENTS, 3 themes + density toggle, offline-tolerant, theme/density persisted to `dashboard.json`. Fallback: the core's stdlib curses board (`_curses_main`), same layout minus the true-color polish. Both read `/api/state`; the core picks Textual via `_load_textual_dashboard()` (guarded lazy import, `MINIMALROUTER_TUI=auto\|textual\|curses`) and falls back to curses on ImportError or crash. Status via `classify_status` (ok/gated/empty/error/unknown), latency history via `record_state` (bounded JSON-safe list) |
 | Lifecycle | `write_pidfile()`/`read_pidfile()`/`remove_pidfile()`, `pid_alive()` (no signaling; `/proc/<pid>/stat` state, zombie = dead; `tasklist` fallback off Linux), `pid_is_ours()` (realpath identity check), `wait_dead()` (bounded poll — SIGTERM is asynchronous), `stop_server()` (verified-PID targeting, never `pkill -f`), `usage()` |
 
 ## Request lifecycle
