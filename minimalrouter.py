@@ -2124,9 +2124,10 @@ Class is derived from the row's real shape, never from a label; a row cannot cla
 The dashboard and GET /api/state show the class of every row. Client format is OpenAI Chat
 Completions.
 
-Dashboard: with `pip install textual` you get the enhanced Mission Control board
-(p cycle theme, v density); without it, the built-in curses board. Force a mode with
-MINIMALROUTER_TUI=textual|curses (default auto). The router core needs no dependencies.
+Dashboard: the installer bundles the Mission Control board (Textual, in a dedicated
+venv) so it works out of the box -- p cycle theme, v density. If that setup is not
+possible it falls back to the built-in curses board. Force a mode with
+MINIMALROUTER_TUI=textual|curses (default auto). The router engine needs no deps.
 
 Dashboard keys (curses):
   up/down  select row     t  re-test row      a  add a row

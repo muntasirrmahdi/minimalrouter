@@ -36,7 +36,7 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
-      - name: Clean-HOME install from this checkout (offline)
+      - name: Default install bundles the Mission Control board
         run: |
           FAKE_HOME="$(mktemp -d)"
           HOME="$FAKE_HOME" sh install.sh
@@ -45,14 +45,12 @@ jobs:
           test -f "$FAKE_HOME/.minimalrouter/bridges/zcode-identity.json"
           cmp minimalrouter.py "$FAKE_HOME/.minimalrouter/minimalrouter.py"
           cmp minimalrouter_dashboard.py "$FAKE_HOME/.minimalrouter/minimalrouter_dashboard.py"
-          HOME="$FAKE_HOME" python3 "$FAKE_HOME/.minimalrouter/minimalrouter.py" -h
-          # zero-dep fallback: with no textual installed, the loader must return None
-          HOME="$FAKE_HOME" python3 -c "
-          import sys; sys.path.insert(0, '$FAKE_HOME/.minimalrouter')
-          import minimalrouter as mr
-          assert mr._load_textual_dashboard() is None, 'must fall back to curses without textual'
-          print('zero-dep curses fallback OK')
-          "
+          # the installer must have created the dashboard venv WITH textual
+          test -x "$FAKE_HOME/.minimalrouter/.venv/bin/python3"
+          "$FAKE_HOME/.minimalrouter/.venv/bin/python3" -c "import textual; from textual.app import App; print('venv textual OK')"
+          # the launcher must be pinned to the venv python (beautiful board out of the box)
+          grep -q "$FAKE_HOME/.minimalrouter/.venv/bin/python3" "$FAKE_HOME/.local/bin/minimalrouter"
+          echo "default install bundles Textual + pins the launcher: OK"
           HOME="$FAKE_HOME" python3 -c "
           import json, os
           p = os.path.expanduser('~/.minimalrouter/rows.json')
@@ -63,6 +61,20 @@ jobs:
           assert len(asset) == 3487, 'identity asset size drift'
           print('install smoke OK: keyless-first seed + identity asset shipped')
           "
+      - name: Zero-dep install (--curses) falls back to the curses board
+        run: |
+          FH2="$(mktemp -d)"
+          HOME="$FH2" sh install.sh --curses
+          test ! -d "$FH2/.minimalrouter/.venv"
+          # no venv: with a python3 lacking textual, the loader must return None
+          HOME="$FH2" python3 -c "
+          import sys; sys.path.insert(0, '$FH2/.minimalrouter')
+          import minimalrouter as mr
+          assert mr._load_textual_dashboard() is None, 'must fall back to curses without textual'
+          print('zero-dep curses fallback OK')
+          "
+          HOME="$FH2" python3 "$FH2/.minimalrouter/minimalrouter.py" -h >/dev/null
+          echo "zero-dep install OK"
 
   dashboard:
     runs-on: ubuntu-latest

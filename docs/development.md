@@ -31,16 +31,21 @@ checkout into a throwaway HOME and asserts the curses fallback without textual, 
 a `dashboard` job that installs textual and runs the full suite plus a headless
 Textual-board smoke.
 
-## The optional Textual dashboard
+## The Mission Control dashboard (bundled by the installer)
 
-`minimalrouter_dashboard.py` is the enhanced Mission Control board. It is a sibling
-module the core imports lazily via `_load_textual_dashboard()`; if it or `textual` is
-missing, or it crashes at runtime, the core falls back to its stdlib curses board.
-The router core and the request path never depend on it. To develop against it:
+`minimalrouter_dashboard.py` is the Mission Control board. It is a sibling module the
+core imports lazily via `_load_textual_dashboard()`; if it or `textual` is missing, or
+it crashes at runtime, the core falls back to its stdlib curses board. The router core
+and the request path never depend on it. **The installer bundles Textual into a
+dedicated `~/.minimalrouter/.venv` and pins the launcher to it**, so one install gives
+the beautiful board out of the box regardless of which `python3` is on the user's PATH
+(verified: the launcher renders Textual even in a shell whose `python3` lacks it).
+`--curses` skips the venv for a strict zero-dep install.
 
 ```sh
-pip install textual            # the one dependency, dashboard-only
-python -m unittest discover -s tests -v          # dashboard tests now run
+sh install.sh                 # one install -> Textual board (venv bundled)
+sh install.sh --curses        # zero-dep: curses board only, no venv
+python -m unittest discover -s tests -v          # dashboard tests run with textual
 MINIMALROUTER_TUI=curses minimalrouter           # force the curses fallback
 MINIMALROUTER_TUI=textual minimalrouter          # request the board (loud if absent)
 ```
