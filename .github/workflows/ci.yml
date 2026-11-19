@@ -13,13 +13,8 @@ jobs:
       matrix:
         python-version: ["3.11", "3.12", "3.13", "3.14"]
     steps:
-<<<<<<< HEAD
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v5
-=======
-      - uses: actions/checkout@v4
       - uses: actions/setup-python@v7
->>>>>>> main
         with:
           python-version: ${{ matrix.python-version }}
       - name: Syntax and JSON integrity
@@ -37,13 +32,8 @@ jobs:
   install-smoke:
     runs-on: ubuntu-latest
     steps:
-<<<<<<< HEAD
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v5
-=======
-      - uses: actions/checkout@v4
       - uses: actions/setup-python@v7
->>>>>>> main
         with:
           python-version: "3.12"
       - name: Clean-HOME install from this checkout (offline)
