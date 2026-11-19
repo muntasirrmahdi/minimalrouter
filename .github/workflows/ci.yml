@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Syntax and JSON integrity
+        run: |
+          python -m py_compile minimalrouter.py
+          python -c "import json, glob; [json.load(open(f)) for f in glob.glob('*.json')]"
+          sh -n install.sh
+      - name: Offline unit tests (stdlib, zero network)
+        run: python -m unittest discover -s tests -v
+      - name: Lint (pyflakes class)
+        run: |
+          python -m pip install ruff==0.15.10
+          ruff check --select F minimalrouter.py tests
+
+  install-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Clean-HOME install from this checkout (offline)
+        run: |
+          FAKE_HOME="$(mktemp -d)"
+          HOME="$FAKE_HOME" sh install.sh
+          test -f "$FAKE_HOME/.minimalrouter/minimalrouter.py"
+          test -f "$FAKE_HOME/.minimalrouter/bridges/zcode-identity.json"
+          cmp minimalrouter.py "$FAKE_HOME/.minimalrouter/minimalrouter.py"
+          HOME="$FAKE_HOME" python3 "$FAKE_HOME/.minimalrouter/minimalrouter.py" -h
+          HOME="$FAKE_HOME" python3 -c "
+          import json, os
+          p = os.path.expanduser('~/.minimalrouter/rows.json')
+          rows = json.load(open(p))
+          assert rows[0]['name'] == 'kilocode-free', 'keyless row must be first'
+          assert not rows[0].get('key') and not rows[0].get('key_env'), 'first row must be keyless'
+          asset = open(os.path.expanduser('~/.minimalrouter/bridges/zcode-identity.json'), 'rb').read()
+          assert len(asset) == 3487, 'identity asset size drift'
+          print('install smoke OK: keyless-first seed + identity asset shipped')
+          "

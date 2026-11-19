@@ -1,0 +1,42 @@
+name: Setup Help
+description: Installation or first-run trouble (installer, PATH, Python, first row).
+title: "[Setup]: "
+labels: ["question"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Check the [README Quick Install](https://github.com/muntasirrmahdi/minimalrouter#quick-install)
+        and [Troubleshooting](https://github.com/muntasirrmahdi/minimalrouter#troubleshooting) first.
+        Windows native is not supported yet — use WSL2.
+
+  - type: textarea
+    id: tried
+    attributes:
+      label: What You Tried
+      description: The exact commands you ran, in order.
+      placeholder: |
+        curl -fsSL .../install.sh | sh
+        minimalrouter
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      placeholder: |
+        - OS: Ubuntu 24.04 / macOS 15 / WSL2
+        - python3 -V: ...
+        - Shell: bash / zsh
+    validations:
+      required: true
+
+  - type: textarea
+    id: error
+    attributes:
+      label: Error Output
+      description: What the terminal printed (keys redacted).
+      render: text
+    validations:
+      required: true

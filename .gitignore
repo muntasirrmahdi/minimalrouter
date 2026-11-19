@@ -6,6 +6,9 @@ oauth-providers.json
 __pycache__/
 *.pyc
 
+# tooling caches
+.ruff_cache/
+
 # editors
 .vscode/
 .idea/

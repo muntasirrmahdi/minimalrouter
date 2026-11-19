@@ -813,7 +813,6 @@ def chat_from_zcode(row, payload):
     """Non-stream bridge: Anthropic Messages upstream -> chat.completion dict."""
     base = row.get("base", "").rstrip("/")
     token = row.get("key", "")
-    spec = row.get("oauth_provider", "")
     body, ids = chat_to_zcode(row, payload)
     req = urllib.request.Request(base, data=json.dumps(body).encode(), method="POST")
     for k, v in zcode_headers(token, ids["account_uuid"], ids["device_id"],

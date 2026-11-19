@@ -1,0 +1,49 @@
+name: Feature Request
+description: Suggest a new capability or improvement.
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the suggestion! MinimalRouter is deliberately small — read the
+        [ground rules](https://github.com/muntasirrmahdi/minimalrouter/blob/main/CONTRIBUTING.md#ground-rules)
+        first, and search [existing issues](https://github.com/muntasirrmahdi/minimalrouter/issues)
+        for duplicates.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / Motivation
+      description: What can't you do today? Why does it matter?
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed Solution
+      description: How could it work? Prefer data (registry/profile fields) over new engine surface.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives Considered
+      description: Other approaches, including doing nothing or using an existing row/profile field.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: ground-rules
+    attributes:
+      label: Ground Rules
+      description: This project keeps its shape. Confirm the proposal fits.
+      options:
+        - label: The core stays one Python file on the standard library (no new dependencies)
+          required: true
+        - label: No provider names or endpoints in the generic engine (data, not code)
+          required: true
+        - label: The server stays localhost-only with no server auth
+          required: true

@@ -64,7 +64,7 @@
         "client_id": "opencode-cli"
       },
       "routable": false,
-      "note": "SIDELINED 2026-11-18 per Moon: free Zen models are client-locked (429 FreeUsageLimitError to every non-OpenCode client, UA/header spoof does not bypass); paid/OpenCode Go only. Device flow itself is real. Not a working free OAuth preset - do not advertise as one-word connect."
+      "note": "SIDELINED 2026-11-18: free Zen models are client-locked (429 FreeUsageLimitError to every non-OpenCode client, UA/header spoof does not bypass); paid/OpenCode Go only. Device flow itself is real. Not a working free OAuth preset - do not advertise as one-word connect."
     },
     "inference": {
       "label": "Inference.sh",
