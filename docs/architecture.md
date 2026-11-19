@@ -1,10 +1,10 @@
 # Architecture
 
 MinimalRouter's router core is deliberately one Python file (`minimalrouter.py`,
-standard library only). The interactive dashboard has two implementations: the core's
-built-in stdlib curses board (always available) and an optional Textual "Mission
-Control" sibling module (`minimalrouter_dashboard.py`) that the core imports lazily
-and falls back from when Textual is absent. This document maps the core file and the
+standard library only). The interactive dashboard's primary is the Textual "Mission
+Control" board (`minimalrouter_dashboard.py`), which the installer bundles into a
+dedicated venv so it works out of the box; the core's built-in stdlib curses board is
+the automatic fallback when Textual is absent or the board crashes. This document maps the core file and the
 request lifecycle. Function names are the anchors; line numbers are not quoted because
 they drift.
 
