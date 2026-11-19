@@ -2159,7 +2159,12 @@ def _load_textual_dashboard():
         return None
     try:
         import minimalrouter_dashboard as _d
-        return _d.run_dashboard
+        runner = getattr(_d, "run_dashboard", None)
+        if callable(runner):
+            return runner
+        # Module present but incomplete (e.g. stale bytecode): treat as
+        # unavailable and fall back quietly, not with a scary log line.
+        return None
     except ImportError:
         if pref == "textual":
             print("minimalrouter: Textual dashboard requested but not installed.")

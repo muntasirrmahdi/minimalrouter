@@ -81,11 +81,15 @@ chmod +x "$BIN/minimalrouter"
 # ---- optional enhanced dashboard ------------------------------------------
 if [ "$WITH_TEXTUAL" = "1" ]; then
     say "installing Textual for the enhanced Mission Control dashboard..."
-    if python3 -m pip install --user textual >/dev/null 2>&1; then
+    # NOTE: no --user. --user installs into the user site, which virtualenvs
+    # exclude; we must install into the SAME python3 that will run the launcher.
+    if python3 -m pip install textual >/dev/null 2>&1; then
         say "  Textual installed — run 'minimalrouter' for the enhanced board."
+    elif command -v uv >/dev/null 2>&1 && uv pip install --python python3 textual >/dev/null 2>&1; then
+        say "  Textual installed (via uv) — run 'minimalrouter' for the enhanced board."
     else
         say "  note: could not install textual; the curses dashboard will be used."
-        say "  try manually later:  pip install textual"
+        say "  try manually:  python3 -m pip install textual"
     fi
 fi
 
