@@ -334,5 +334,90 @@ class TestEnvelopeCarriesUpstreamBody(unittest.TestCase):
             fixture.shutdown()
 
 
+class TestClassifyStatus(unittest.TestCase):
+    def test_ok(self):
+        self.assertEqual(mr.classify_status({"status": "ok"}), "ok")
+
+    def test_unknown(self):
+        self.assertEqual(mr.classify_status({}), "unknown")
+        self.assertEqual(mr.classify_status({"status": "unknown"}), "unknown")
+
+    def test_gated_403(self):
+        self.assertEqual(mr.classify_status(
+            {"status": "fail", "error": "HTTP Error 403: Forbidden | {\"code\":\"dl_only\"}"}), "gated")
+
+    def test_empty_402(self):
+        self.assertEqual(mr.classify_status(
+            {"status": "fail", "error": "HTTP Error 402: Payment Required"}), "empty")
+
+    def test_other_fail_is_error(self):
+        self.assertEqual(mr.classify_status(
+            {"status": "fail", "error": "HTTP Error 530: <none>"}), "error")
+        self.assertEqual(mr.classify_status(
+            {"status": "fail", "error": "URLError: connection refused"}), "error")
+
+
+class TestSparkChars(unittest.TestCase):
+    def test_empty(self):
+        self.assertEqual(mr.spark_chars([]), "")
+
+    def test_default_width_is_five(self):
+        self.assertEqual(len(mr.spark_chars(list(range(10)))), 5)
+
+    def test_length_capped(self):
+        self.assertEqual(len(mr.spark_chars(list(range(10)), width=5)), 5)
+
+    def test_flat_history(self):
+        self.assertEqual(len(mr.spark_chars([5, 5, 5])), 3)  # no div-by-zero
+
+    def test_monotonic_uses_full_range(self):
+        s = mr.spark_chars([1, 10])
+        self.assertEqual(s[0], "▁")
+        self.assertEqual(s[-1], "█")
+
+
+class TestRecordState(unittest.TestCase):
+    def setUp(self):
+        self._saved = dict(mr.ROW_STATE)
+        mr.ROW_STATE.clear()
+
+    def tearDown(self):
+        mr.ROW_STATE.clear()
+        mr.ROW_STATE.update(self._saved)
+
+    def test_hist_bounded_and_json_safe(self):
+        for i in range(12):
+            mr.record_state("r", "ok", ms=100 + i)
+        st = mr.ROW_STATE["r"]
+        self.assertEqual(len(st["hist"]), mr.HIST_MAX)
+        self.assertIsInstance(st["hist"], list)
+        json.dumps(st)  # must not raise (a deque would)
+
+    def test_hist_is_last_n(self):
+        for i in range(8):
+            mr.record_state("r", "ok", ms=i)
+        self.assertEqual(mr.ROW_STATE["r"]["hist"], [3, 4, 5, 6, 7])
+
+    def test_state_fields_preserved(self):
+        mr.record_state("r", "fail", ms=50, error="HTTP Error 403: x")
+        st = mr.ROW_STATE["r"]
+        self.assertEqual(st["status"], "fail")
+        self.assertEqual(st["error"], "HTTP Error 403: x")
+        self.assertIn("at", st)
+
+
+class TestPoolStats(unittest.TestCase):
+    def test_counts(self):
+        rows = [{"state": {"status": "ok"}},
+                {"state": {"status": "fail", "error": "HTTP Error 403: x"}},
+                {"state": {"status": "fail", "error": "HTTP Error 402: x"}},
+                {"state": {"status": "fail", "error": "HTTP Error 530: x"}},
+                {}]
+        s = mr.pool_stats(rows)
+        self.assertEqual(s["rows"], 5)
+        self.assertEqual(s["serving"], 1)
+        self.assertEqual(s["blocked"], 2)  # gated + empty
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -931,6 +931,61 @@ def state_for(rows):
     return out
 
 
+# --- Mission Control dashboard helpers ------------------------------------
+HIST_MAX = 5
+SPARK_BLOCKS = "▁▂▃▄▅▆▇█"
+SPARK_ASCII = "._-~=+*#"
+
+
+def classify_status(state):
+    """Live state -> display status: ok/gated/empty/error/unknown (pure)."""
+    st = (state or {}).get("status", "unknown")
+    if st == "ok":
+        return "ok"
+    if st != "fail":
+        return "unknown"
+    m = re.search(r"HTTP Error (\d{3})", str((state or {}).get("error", "")))
+    code = m.group(1) if m else ""
+    if code == "403":
+        return "gated"
+    if code == "402":
+        return "empty"
+    return "error"
+
+
+def spark_chars(hist, width=5):
+    """Latency history -> block sparkline, <= width chars (pure)."""
+    if not hist:
+        return ""
+    vals = hist[-width:]
+    lo, hi = min(vals), max(vals)
+    span = (hi - lo) or 1
+    return "".join(SPARK_BLOCKS[int((v - lo) / span * (len(SPARK_BLOCKS) - 1))]
+                   for v in vals)
+
+
+def record_state(name, status, ms, at=None, error=""):
+    """Single write path for per-row live state + bounded latency history.
+
+    hist is a JSON-safe list (NOT a deque) so /api/state can serialize it.
+    """
+    hist = list(ROW_STATE.get(name, {}).get("hist", []))
+    if ms is not None:
+        hist.append(int(ms))
+        hist = hist[-HIST_MAX:]
+    ROW_STATE[name] = {"status": status, "ms": ms,
+                       "at": at if at is not None else time.time(),
+                       "error": error, "hist": hist}
+
+
+def pool_stats(rows):
+    """Stat-strip counts from live row state (pure). models comes from /api/state."""
+    cls = [classify_status(r.get("state", {})) for r in rows]
+    return {"rows": len(rows),
+            "serving": cls.count("ok"),
+            "blocked": cls.count("gated") + cls.count("empty")}
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "minimalrouter/1.0"
 
@@ -1032,10 +1087,8 @@ class Handler(BaseHTTPRequestHandler):
                 key = match["key"]
             ok, ms, err, content = probe(base, key, model, row=match)
             if match:  # keep the table's STATE / LATENCY / LAST live
-                ROW_STATE[match["name"]] = {
-                    "status": "ok" if ok else "fail", "ms": ms,
-                    "at": time.time(),
-                    "error": "" if ok else str(err)[:200]}
+                record_state(match["name"], "ok" if ok else "fail", ms,
+                             error="" if ok else str(err)[:200])
             log("TEST %s %s -> %s" % (base, model, "ok" if ok else err))
             return self._send(200 if ok else 400,
                               {"ok": ok, "ms": ms, "error": err,
@@ -1079,7 +1132,7 @@ class Handler(BaseHTTPRequestHandler):
                 new_row["name"] = name
                 rows.append(new_row)
                 write_rows(rows)
-            ROW_STATE[name] = {"status": "ok", "ms": ms, "at": time.time()}
+            record_state(name, "ok", ms)
             log("ADD %s (%s / %s) %s ok %.0fms" % (
                 name, base, model, row_class(new_row), ms))
             return self._send(200, {"ok": True, "name": name})
@@ -1116,9 +1169,7 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     if row.get("api_mode") == "omnirush":
                         chat = chat_from_omnirush(row, dict(body, stream=False))["text"]
-                        ROW_STATE[row["name"]] = {
-                            "status": "ok", "ms": (time.time() - t0) * 1000,
-                            "at": time.time()}
+                        record_state(row["name"], "ok", (time.time() - t0) * 1000)
                         if stream:
                             chunk = {"id": "chatcmpl-omnirush",
                                      "object": "chat.completion.chunk",
@@ -1150,9 +1201,7 @@ class Handler(BaseHTTPRequestHandler):
                     if row.get("api_mode") == "zcode":
                         zc = chat_from_zcode(row, dict(body, stream=False))
                         chat = zc["text"]
-                        ROW_STATE[row["name"]] = {
-                            "status": "ok", "ms": (time.time() - t0) * 1000,
-                            "at": time.time()}
+                        record_state(row["name"], "ok", (time.time() - t0) * 1000)
                         if stream:
                             chunk = {"id": "chatcmpl-zcode",
                                      "object": "chat.completion.chunk",
@@ -1183,9 +1232,7 @@ class Handler(BaseHTTPRequestHandler):
                         return
                     if row.get("api_mode") == "responses":
                         chat = chat_from_responses(row, body)
-                        ROW_STATE[row["name"]] = {
-                            "status": "ok", "ms": (time.time() - t0) * 1000,
-                            "at": time.time()}
+                        record_state(row["name"], "ok", (time.time() - t0) * 1000)
                         if stream:
                             chunk = {"id": "chatcmpl-responses",
                                      "object": "chat.completion.chunk",
@@ -1232,16 +1279,12 @@ class Handler(BaseHTTPRequestHandler):
                         except (BrokenPipeError, ConnectionResetError):
                             log("stream client disconnected mid-row %s"
                                 % row["name"])
-                        ROW_STATE[row["name"]] = {
-                            "status": "ok", "ms": (time.time() - t0) * 1000,
-                            "at": time.time()}
+                        record_state(row["name"], "ok", (time.time() - t0) * 1000)
                         log("OK  %s via %s stream %.1fs"
                             % (model, row["name"], time.time() - t0))
                     else:
                         data = resp.read()
-                        ROW_STATE[row["name"]] = {
-                            "status": "ok", "ms": (time.time() - t0) * 1000,
-                            "at": time.time()}
+                        record_state(row["name"], "ok", (time.time() - t0) * 1000)
                         self._send(200, raw=data)
                         log("OK  %s via %s %.1fs"
                             % (model, row["name"], time.time() - t0))
@@ -1256,10 +1299,8 @@ class Handler(BaseHTTPRequestHandler):
                         except Exception:
                             pass
                     last_err = "%s: %s" % (row["name"], detail)
-                    ROW_STATE[row["name"]] = {
-                        "status": "fail",
-                        "ms": (time.time() - t0) * 1000,
-                        "at": time.time(), "error": detail[:200]}
+                    record_state(row["name"], "fail", (time.time() - t0) * 1000,
+                                 error=detail[:200])
                     log("FAIL %s via %s: %s (%.1fs) -> next"
                         % (model, row["name"], detail, time.time() - t0))
             return self._send(502, {"error": "all rows failed for '%s'"
@@ -1537,11 +1578,23 @@ def _curses_main(stdscr, port):
         G = {"tl": "+", "tr": "+", "bl": "+", "br": "+", "h": "-", "v": "|",
              "lt": "+", "rt": "+", "sel": ">", "ok": "*", "bad": "x",
              "unk": "."}
+    try:
+        stdscr.addstr(0, 0, SPARK_BLOCKS[0])
+        SPARK = SPARK_BLOCKS
+    except Exception:
+        SPARK = SPARK_ASCII
+    SPARK_TRANS = str.maketrans(SPARK_BLOCKS, SPARK_ASCII)
     sel = 0
     started = time.time()
     status = "ready - press a to add a row, t to test the selected one"
     COLOR = {"ok": curses.color_pair(1) if HAS_COLOR else 0,
              "fail": curses.color_pair(2) if HAS_COLOR else 0}
+    STATUS_COLOR = {"ok": curses.color_pair(1) if HAS_COLOR else 0,
+                    "gated": curses.color_pair(2) if HAS_COLOR else 0,
+                    "empty": curses.color_pair(3) if HAS_COLOR else 0,
+                    "error": curses.color_pair(2) if HAS_COLOR else 0,
+                    "unknown": curses.A_DIM}
+    BAD_MARK = {"gated": G["bad"], "empty": G["bad"], "error": G["bad"]}
     LABEL = curses.A_DIM
     while True:
         online = True
@@ -1555,32 +1608,45 @@ def _curses_main(stdscr, port):
         stdscr.erase()
         if sel >= len(rows):
             sel = max(0, len(rows) - 1)
+        stats = pool_stats(rows)
 
-        # ---- header -----------------------------------------------------
+        # ---- header (row 0): endpoint / uptime / auth ------------------
         up = int(time.time() - started)
-        head = (" MINIMALROUTER  |  http://%s:%d/v1  |  %d rows  %d models  |  "
-                "up %dm%02ds  |  %s" % (
-                    HOST, port, len(rows), nmodels,
-                    up // 60, up % 60,
+        head = (" MINIMALROUTER  |  http://%s:%d/v1  |  up %dm%02ds  |  %s" % (
+                    HOST, port, up // 60, up % 60,
                     "no server auth / localhost only" if online
                     else "SERVER OFFLINE"))
         _putw(stdscr, 0, head, w, curses.A_REVERSE | curses.A_BOLD)
-        if h < 16 or w < 60:  # tiny terminal: rows + legend only
-            maxr = max(1, h - 3)
+
+        # ---- stat strip (row 1): rows / models / serving / blocked -----
+        stat_line = " %d ROWS    %d MODELS    %d SERVING    %d BLOCKED" % (
+            len(rows), nmodels, stats["serving"], stats["blocked"])
+        _putw(stdscr, 1, stat_line, w, curses.A_BOLD)
+        if HAS_COLOR:
+            try:
+                so = stat_line.index("%d SERVING" % stats["serving"])
+                stdscr.addnstr(1, so, str(stats["serving"]),
+                               len(str(stats["serving"])), COLOR["ok"])
+                bo = stat_line.index("%d BLOCKED" % stats["blocked"])
+                stdscr.addnstr(1, bo, str(stats["blocked"]),
+                               len(str(stats["blocked"])), COLOR["fail"])
+            except Exception:
+                pass
+
+        if h < 16 or w < 60:  # tiny terminal: stat strip + rows + legend
+            maxr = max(1, h - 4)
             top = max(0, sel - maxr + 1) if sel >= maxr else 0
             for i, row in enumerate(rows[top:top + maxr]):
                 s = row.get("state", {}) or {}
-                stt = s.get("status", "unknown")
-                line = " %s %-18s %-22s %7s %5s" % (
-                    {"ok": G["ok"], "fail": G["bad"]}.get(stt, G["unk"]),
-                    row["name"][:18], row["model"][:22],
-                    ("%dms" % int(s.get("ms") or 0))
-                    if stt != "unknown" else "-", _age(s.get("at")))
-                _putw(stdscr, 1 + i, line, w,
+                cs = classify_status(s)
+                mark = G["ok"] if cs == "ok" else BAD_MARK.get(cs, G["unk"])
+                line = " %s %-18s %-20s %8s" % (
+                    mark, row["name"][:18], row["model"][:20], cs.upper())
+                _putw(stdscr, 2 + i, line, w,
                       curses.A_REVERSE if i + top == sel else 0)
             _putw(stdscr, h - 2, " " + status, w, curses.A_BOLD)
             _putw(stdscr, h - 1,
-                  " up/down · t test · a add · d delete · r refresh · q quit",
+                  " up/down \u00b7 t test \u00b7 a add \u00b7 d delete \u00b7 r refresh \u00b7 q quit",
                   w, curses.A_DIM)
             stdscr.refresh()
             ch = stdscr.getch()
@@ -1595,72 +1661,62 @@ def _curses_main(stdscr, port):
                 sel = max(0, sel - 1)
             continue
 
-        # ---- column header ---------------------------------------------
-        name_w = 26 if w >= 110 else (20 if w >= 92 else 15)
-        rest = w - (12 + name_w + 8 + 6 + 8)  # space left for model+base (CLASS col added)
-        model_w = max(16, int(rest * 0.62))
-        base_w = max(10, rest - model_w - 1)
-        cols = "   %-7s %-*s %-*s %-*s %7s %5s" % ("CLASS", name_w, "NAME",
-                                             model_w, "MODEL", base_w, "HOST",
-                                             "LAT", "LAST")
-        _putw(stdscr, 1, cols, w, curses.A_BOLD)
-        _panel(stdscr, 2, w, G, "")
+        # ---- column header (row 2): CLASS ROW MODEL TREND LAT STATUS ---
+        name_w = 24 if w >= 110 else (18 if w >= 92 else 14)
+        model_w = max(12, w - 41 - name_w)
+        cols = "     %-8s %-*s %-*s %6s %8s %8s" % (
+            "CLASS", name_w, "ROW", model_w, "MODEL", "TREND", "LAT", "STATUS")
+        _putw(stdscr, 2, cols, w, curses.A_BOLD)
+        _panel(stdscr, 3, w, G, "")
 
-        # ---- layout budget ---------------------------------------------
-        detail_h = 8
-        table_rows = min(len(rows), max(3, h - (3 + detail_h + 3 + 4)))
+        # ---- layout budget (stat strip + compact 3-line SELECTED) ------
+        detail_h = 4
+        table_rows = min(len(rows), max(3, h - (4 + detail_h + 3 + 4)))
         top = max(0, sel - table_rows + 1) if sel >= table_rows else 0
-        y = 3
+        y = 4
         for i, row in enumerate(rows[top:top + table_rows]):
             idx = i + top
             s = row.get("state", {}) or {}
-            stt = s.get("status", "unknown")
-            lat = ("%dms" % int(s.get("ms") or 0)) if stt != "unknown" else "-"
-            host = urllib.parse.urlparse(row["base"]).netloc[:base_w]
-            mark = {"ok": G["ok"], "fail": G["bad"]}.get(stt, G["unk"])
-            line = " %s %s %-7s %-*s %-*s %-*s %7s %5s" % (
+            cs = classify_status(s)
+            lat = ("%dms" % int(s.get("ms") or 0)) if cs != "unknown" else "-"
+            spark = spark_chars(s.get("hist", []))
+            if SPARK is SPARK_ASCII:
+                spark = spark.translate(SPARK_TRANS)
+            mark = G["ok"] if cs == "ok" else BAD_MARK.get(cs, G["unk"])
+            line = " %s %s %-8s %-*s %-*s %6s %8s %8s" % (
                 G["sel"] if idx == sel else " ", mark,
                 class_label(row.get("class", row_class(row))),
                 name_w, row["name"][:name_w],
                 model_w, row["model"][:model_w],
-                base_w, host, lat, _age(s.get("at")))
+                spark, lat, cs.upper())
             _putw(stdscr, y + i, line, w,
                   curses.A_REVERSE if idx == sel else 0)
-            if idx != sel and HAS_COLOR and stt in COLOR:
+            if idx != sel and HAS_COLOR:
                 try:
-                    stdscr.addnstr(y + i, 3, mark, 1, COLOR[stt])
+                    stdscr.addnstr(y + i, 3, mark, 1, STATUS_COLOR.get(cs, 0))
                 except Exception:
                     pass
-        y = 3 + table_rows
+        y = 4 + table_rows
 
-        # ---- selected row details --------------------------------------
+        # ---- compact SELECTED block (3 lines, last error always shown) --
         _panel(stdscr, y, w, G, "SELECTED")
         y += 1
         if rows:
             row = rows[sel]
             s = row.get("state", {}) or {}
-            stt = s.get("status", "unknown")
-            pairs = [
-                ("name", row["name"]),
-                ("class", class_label(row.get("class", row_class(row)))),
-                ("model", row["model"]),
-                ("base", row["base"]),
-                ("key", row.get("key_src", "-")),
-                ("state", "%s  %s  last %s" % (
-                    stt.upper(),
-                    ("%dms" % int(s.get("ms") or 0))
-                    if stt != "unknown" else "-", _age(s.get("at")))),
-                ("error", (s.get("error") or "-")),
-            ]
-            for lbl, val in pairs:
-                try:
-                    stdscr.addnstr(y, 2, lbl, 6, LABEL)
-                    stdscr.addnstr(y, 9, str(val), max(1, w - 11),
-                                   COLOR[stt] if (lbl == "state" and
-                                                  stt in COLOR) else 0)
-                except Exception:
-                    pass
-                y += 1
+            cs = classify_status(s)
+            l1 = "%s  \u00b7  %s  \u00b7  %s" % (
+                row["name"], class_label(row.get("class", row_class(row))),
+                row["model"])
+            l2 = "%s  \u00b7  key %s" % (row["base"], row.get("key_src", "-"))
+            l3 = "%s  %s  last %s  \u00b7  %s" % (
+                cs.upper(),
+                ("%dms" % int(s.get("ms") or 0)) if cs != "unknown" else "-",
+                _age(s.get("at")), (s.get("error") or "no error"))
+            _putw(stdscr, y, "  " + l1, w, curses.A_BOLD)
+            _putw(stdscr, y + 1, "  " + l2, w, LABEL)
+            _putw(stdscr, y + 2, "  " + l3, w, STATUS_COLOR.get(cs, 0))
+            y += 3
         else:
             _putw(stdscr, y, "  no rows - press a to add one", w, LABEL)
             y += detail_h - 1
