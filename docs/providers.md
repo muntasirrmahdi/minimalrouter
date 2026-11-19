@@ -97,21 +97,16 @@ atomically; mirror a rotated pair back to any other consumer of the same account
 
 ## Keep in mind — the traps
 
-**A client gate is not a token problem.** `dl`, `omnirush` and `opencode` all
+**A client gate is not a token problem.** `omnirush` and `opencode` both
 complete a real device login and then refuse non-official clients at the API step.
 Re-approval and refresh do not fix a client gate. The router reports the vendor's
 literal error; the registry carries `routable:false` with the evidence.
 
-**`dl` (Directionally Local).** OAuth class. Since 2026-11-19 ~5:40 AM BD the free
-device tokens answer HTTP 403 `{"error":{"code":"dl_only","message":"Free tokens work
-inside dl only. Run dl to keep using them, or use your own API key in any tool."}}`
-on all four models (five consecutive probes; the same tokens served real completions
-earlier that morning). Refresh still succeeds — the token is valid, the client is
-refused. The vendor's stated alternative (your own dl API key as an API-class row) is
-untested. Before the gate, the failure mode was token expiry: the device token lives
-~1h, refresh rotates it, and an expired token with a dead refresh logs
-`OAUTH-REFRESH dl failed` on every request until re-approval (`minimalrouter oauth dl`).
-If you also use the dl/Autopilot CLI, mirror rotated refresh pairs back to it.
+**`dl` (Directionally Local) — REMOVED 2026-11-19.** Dropped from the pool and the
+registry after its free device tokens became client-gated (403 `dl_only`: "Free tokens
+work inside dl only"). Refresh succeeded but the client was refused, so re-approval
+could not fix it. The free models still work inside the dl CLI itself; a paid dl API
+key as an API-class row is the only router-side path back (untested).
 
 **`dahl` is an API-class row, not OAuth.** Inline key, no token to expire; it is a
 paid/credit endpoint — watch the balance, not an expiry. It intermittently 429s with
@@ -174,7 +169,7 @@ press `t` to re-test. A successful refresh never implies the route now works.
 | nous | OAuth | works — four `:free` models; single-use rotating refresh |
 | zcode | OAuth | works — native translator, no-expiry plan JWT |
 | kilocode profile | OAuth | not connected (no token); 3 models serve keyless-open anyway |
-| dl | OAuth | GATED since 19 Nov 5:40 AM (403 `dl_only`); refresh works, routing refused |
+| dl | — | REMOVED 19 Nov (pool + registry); free tokens client-gated; use the dl CLI |
 | omnirush | OAuth | auth only; `official_client_required`; routable:false |
 | opencode | OAuth | sidelined; free tier client-locked |
 | inference | OAuth | connected, token expired, $0.00 balance — credits + re-login needed |

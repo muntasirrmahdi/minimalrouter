@@ -189,10 +189,13 @@ Free upstreams rot independently of the router; the full, dated status table liv
 - **Working:** seeded keyless `kilocode-free`; Groq free tier; Nous Portal `:free`
   models; the zcode plan lane through its native translator; several kilocode models
   that serve keyless-open upstream.
-- **Client-gated (auth works, routing refused):** `dl` free device tokens (403
-  `dl_only` since 2026-11-19), `omnirush` (`official_client_required`), `opencode`
-  free tier (sidelined). A valid token does not imply a routable client — the router
-  reports these honestly instead of pretending.
+- **Client-gated (auth works, routing refused):** `omnirush`
+  (`official_client_required`), `opencode` free tier (sidelined). A valid token does
+  not imply a routable client — the router reports these honestly instead of pretending.
+- **Removed:** `dl` (Directionally Local) — dropped from the pool and the registry
+  2026-11-19 after its free device tokens became client-gated (403 `dl_only`). The free
+  models still work inside the dl CLI itself; a paid dl API key is the only router-side
+  path back.
 - **Needs action:** `inference.sh` (connected, $0.00 balance — credits required);
   `freebuff` (personal loopback bridge, login required, ToS-risky — not shipped in
   this repo).
