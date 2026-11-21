@@ -262,7 +262,9 @@ rm -rf ~/.minimalrouter
 
 - Anthropic `/v1/messages` shim so Claude Code can use the pool
 - a systemd user unit for always-on use
-- a background token-refresh scheduler (manual refresh already exists)
+- OAuth token PRE-ROTATION in the background (tokens today refresh on demand
+  at request time; `r`/`R`/`minimalrouter refresh` force it now — row HEALTH
+  re-probing on a scheduler shipped in 1.2.0)
 - weights or latency-based chain ordering
 - a config flag for per-row concurrency limits
 
