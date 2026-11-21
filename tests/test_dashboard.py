@@ -233,6 +233,11 @@ class TestDashboardV12Helpers(unittest.TestCase):
         self.assertEqual(d.prov_short("api.groq.com"), "GROQ")
         self.assertEqual(d.prov_short("Kilocode"), "KILOCODE")
         self.assertEqual(d.prov_short(""), "?")
+        # v1.2.0 polish cases (captured-board defects)
+        self.assertEqual(d.prov_short("Nous Portal"), "NOUSPORTAL")
+        self.assertEqual(d.prov_short("ZCode (Z.ai)"), "ZCODE")
+        self.assertEqual(d.prov_short("127.0.0.1", "freebuff-bridge"), "FREEBUFF")
+        self.assertEqual(d.prov_short("inference.dahl.global"), "INFERENCE")
 
     def test_plan_cols_full_and_drop_order(self):
         d = self.d

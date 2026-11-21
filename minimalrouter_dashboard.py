@@ -262,13 +262,28 @@ def classify(state):
     return "error"
 
 
-def prov_short(name):
-    n = str(name or "?")
-    for p in ("api.", "www.", "free.", "openrouter.", "models."):
-        if n.startswith(p):
-            n = n[len(p):]
-    host = n.split(".")[0][:10]
-    return host.upper() or "?"
+def prov_short(name, row_name=""):
+    """Provider tag: OAuth labels collapse to alphanumerics ('Nous Portal' ->
+    NOUSPORTAL, 'ZCode (Z.ai)' -> ZCODE); domains shorten to the first
+    significant label ('api.groq.com' -> GROQ); a numeric/localhost host (a
+    loopback bridge row) falls back to the row name's first token
+    ('freebuff-bridge' -> FREEBUFF) — '127' on the board reads as garbage."""
+    s = str(name or "").strip()
+    if "://" in s:
+        s = s.split("//")[-1].split("/")[0]
+    elif "." in s and " " not in s:
+        pass  # bare domain
+    else:
+        s = s.split("(")[0].strip()  # oauth label with a parenthetical
+    if "." in s:
+        for p in ("api.", "www.", "free.", "openrouter.", "models."):
+            if s.startswith(p):
+                s = s[len(p):]
+        s = s.split(".")[0]
+    if s.isdigit() or s.lower() == "localhost":
+        s = str(row_name or "").split("-")[0] or s
+    out = re.sub(r"[^A-Za-z0-9]", "", s).upper()[:10]
+    return out or "?"
 
 
 def load_prefs():
@@ -681,7 +696,7 @@ class MissionControl(App):
             line.append(f"{clip(name, w['ROW']):<{w['ROW']}} ",
                         style=base_style or p["strong"])
             if "PROV" in cols:
-                line.append(f"{clip(prov_short(r.get('provider') or r.get('oauth_provider') or ''), w['PROV']):<{w['PROV']}} ", style=base_style or p["muted"])
+                line.append(f"{clip(prov_short(r.get('provider') or r.get('oauth_provider') or '', name), w['PROV']):<{w['PROV']}} ", style=base_style or p["muted"])
             if "CLASS" in cols:
                 line.append(f"{str(r.get('class', '?')).upper():<{w['CLASS']}} ", style=base_style or p["muted"])
             if "MODEL" in cols:
@@ -691,18 +706,24 @@ class MissionControl(App):
             return line
         cs = "off" if dis else classify(s)
         col = p[STATUS_KEY[cs]]
-        lat = ("%dms" % int(s.get("ms") or 0)).rjust(w.get("LAT", 8) - 2) \
-            if cs not in ("unknown", "off") else " " * (w.get("LAT", 8) - 2) + "—"
+        lat = ("%dms" % int(s.get("ms") or 0)) \
+            if cs not in ("unknown", "off") else "—"
         line.append(f"{clip(name, w['ROW']):<{w['ROW']}} ",
                     style=base_style or p["strong"])
         if "PROV" in cols:
-            line.append(f"{clip(prov_short(r.get('provider') or r.get('oauth_provider') or ''), w['PROV']):<{w['PROV']}} ", style=base_style or p["muted"])
+            line.append(f"{clip(prov_short(r.get('provider') or r.get('oauth_provider') or '', name), w['PROV']):<{w['PROV']}} ", style=base_style or p["muted"])
         if "CLASS" in cols:
             line.append(f"{str(r.get('class', '?')).upper():<{w['CLASS']}} ", style=base_style or p["muted"])
         if "MODEL" in cols:
             line.append(f"{clip(r.get('model', '?'), w['MODEL']):<{w['MODEL']}} ", style=base_style or p["muted"])
         if "CW" in cols:
             line.append(f"{cw_str(r.get('cw')):>{w['CW'] - 1}} ", style=base_style or p["dim"])
+        if "LAT" in cols:
+            sp = spark(s.get("hist", []))
+            line.append(sp, style=base_style or
+                        (f"bold {p['accent']}" if cs == "ok" else p[STATUS_KEY[cs]]))
+            line.append(" ")
+            line.append(lat.rjust(w["LAT"]) + " ", style=base_style or p["dim"])
         if "TPS" in cols:
             tps = s.get("tps") or 0
             line.append((f"{tps:>{w['TPS'] - 1}.0f} " if tps else
@@ -714,9 +735,6 @@ class MissionControl(App):
                         style=base_style or (p["ok"] if (pct or 0) >= 80
                                              else p["warn"] if pct is not None
                                              else p["dim"]))
-        line.append(spark(s.get("hist", [])) if "LAT" in cols else "", style="")
-        if "LAT" in cols:
-            line.append(lat + " ", style=base_style or p["dim"])
         line.append(f"{cs.upper():<{w['STATUS']}}", style=f"bold {col}")
         return line
 
@@ -830,7 +848,8 @@ class MissionControl(App):
         st = r.get("state", {}) or {}
         cs = "off" if r.get("disabled") else classify(st)
         col = p[STATUS_KEY[cs]]
-        prov = prov_short(r.get("provider") or r.get("oauth_provider") or "")
+        prov = prov_short(r.get("provider") or r.get("oauth_provider") or "",
+                          r.get("name", ""))
         # Line 1: row name — the anchor. Line 2: MODEL highlighted hardest
         # (bold accent), provider lighter-but-highlighted (bold dim accent).
         s.append("  " + clip(r.get("name", "?"), 40), style=f"bold {p['strong']}")

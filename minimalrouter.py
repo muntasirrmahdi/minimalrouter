@@ -74,7 +74,7 @@ except ImportError:  # platform without curses -> main() degrades to serve
 # CHANGELOG and the git tag all derive from this one line. MAJOR.MINOR.PATCH per
 # semver.org: MAJOR on a breaking client contract, MINOR on backward-compatible
 # features, PATCH on fixes.
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 
 HOME = os.path.expanduser("~")
 MR_HOME = os.path.join(HOME, ".minimalrouter")
@@ -922,7 +922,10 @@ def chat_from_zcode(row, payload):
 
 
 def probe(base, key, model, row=None):
-    """Marker probe. Returns (ok, ms, error, content)."""
+    """Marker probe. Returns (ok, ms, error, content, completion_tokens).
+
+    tokens is 0 when the upstream reports no usage (streamed or silent lanes) —
+    the honest floor, never an estimate."""
     t0 = time.time()
     payload = {"model": model, "max_tokens": 200,
                "messages": [{"role": "user",
@@ -938,20 +941,21 @@ def probe(base, key, model, row=None):
                 "role": "assistant", "content": responses_text(body)}}],
                 "usage": body.get("usage", {})}
         if not isinstance(body, dict) or "choices" not in body:
-            return False, ms, "unexpected body", ""
+            return False, ms, "unexpected body", "", 0
         try:
             msg = body["choices"][0].get("message", {}) or {}
             content = msg.get("content") or ""
         except (KeyError, IndexError, TypeError):
             content = ""
+        tokens = int((body.get("usage", {}) or {}).get("completion_tokens") or 0)
         if not content.strip():
-            if (body.get("usage", {}) or {}).get("completion_tokens"):
-                return True, ms, "", "(reasoning only, no visible text)"
-            return False, ms, "empty content", ""
-        return True, ms, "", content.strip()[:80]
+            if tokens:
+                return True, ms, "", "(reasoning only, no visible text)", tokens
+            return False, ms, "empty content", "", 0
+        return True, ms, "", content.strip()[:80], tokens
     except Exception as e:
         return False, (time.time() - t0) * 1000, "%s: %s" % (
-            type(e).__name__, e), ""
+            type(e).__name__, e), "", 0
 
 
 def fetch_models(base, key):
@@ -1168,10 +1172,13 @@ def pool_stats(rows, now=None):
 
 
 def probe_row(r):
-    """Probe one configured row with its own credential; records state + log."""
-    ok, ms, err, content = probe(r["base"], r.get("key", ""), r["model"], row=r)
+    """Probe one configured row with its own credential; records state + log.
+    Reported usage seeds the per-row TPS EMA — the board's TPS column is live
+    from the boot probe, not only after real client traffic."""
+    ok, ms, err, content, tokens = probe(r["base"], r.get("key", ""), r["model"],
+                                         row=r)
     record_state(r["name"], "ok" if ok else "fail", ms,
-                 error="" if ok else str(err)[:200])
+                 error="" if ok else str(err)[:200], tokens=tokens)
     log("%s %s via %s %.1fs%s" % ("OK " if ok else "FAIL", r["model"], r["name"],
                                   ms / 1000.0,
                                   "" if ok else ": %s" % str(err)[:120]))
@@ -1211,9 +1218,33 @@ def probe_all(reason="boot"):
     log("PROBE all (%s) done: %d/%d ok" % (reason, ok_n, len(rows)))
 
 
+def learn_catalogs():
+    """Read every enabled base's /v1/models once; LEARNS context windows into
+    RUNTIME_CW. Shared by POST /api/refetch (the f key) and the boot sequence —
+    without the boot call the CW column reads '-' until someone presses f."""
+    bases = {}
+    for r in enabled_rows():
+        b = r["base"].rstrip("/")
+        if b not in bases:
+            bases[b] = r.get("key", "")
+    n_ids = 0
+    for b, k in bases.items():
+        try:
+            n_ids += len(fetch_models(b, k))
+        except Exception as e:
+            log("CATALOG %s failed: %s" % (b, e))
+    log("CATALOG learn %d bases, %d ids, %d context windows known"
+        % (len(bases), n_ids, len(RUNTIME_CW)))
+    return len(bases), n_ids
+
+
 def _probe_loop():
     time.sleep(2)  # let the socket bind and the dashboard mount first
     probe_all("boot")
+    try:
+        learn_catalogs()
+    except Exception as e:
+        log("CATALOG boot failed: %s" % e)
     while PROBE_INTERVAL > 0:
         time.sleep(PROBE_INTERVAL)
         probe_all("cycle")
@@ -1331,14 +1362,14 @@ class Handler(BaseHTTPRequestHandler):
                     break
             if not key and match:  # dashboard row test -> configured key
                 key = match["key"]
-            ok, ms, err, content = probe(base, key, model, row=match)
+            ok, ms, err, content, tokens = probe(base, key, model, row=match)
             if match:  # keep the table's STATE / LATENCY / LAST live
                 record_state(match["name"], "ok" if ok else "fail", ms,
-                             error="" if ok else str(err)[:200])
+                             error="" if ok else str(err)[:200], tokens=tokens)
             log("TEST %s %s -> %s" % (base, model, "ok" if ok else err))
             return self._send(200 if ok else 400,
                               {"ok": ok, "ms": ms, "error": err,
-                               "content": content})
+                               "content": content, "tokens": tokens})
 
         if p == "/api/fetch_models":
             base, key = body.get("base", ""), body.get("key", "")
@@ -1367,7 +1398,7 @@ class Handler(BaseHTTPRequestHandler):
             # Class is derived from the row shape (key present or not); a caller
             # cannot pass `class` to claim a different auth path.
             new_row = {"name": name, "base": base, "model": model, "key": key}
-            ok, ms, err, content = probe(base, key, model)
+            ok, ms, err, content, tokens = probe(base, key, model)
             if not ok:
                 return self._send(400, {"ok": False,
                                         "error": "test failed: %s" % err})
@@ -1378,7 +1409,7 @@ class Handler(BaseHTTPRequestHandler):
                 new_row["name"] = name
                 rows.append(new_row)
                 write_rows(rows)
-            record_state(name, "ok", ms)
+            record_state(name, "ok", ms, tokens=tokens)
             log("ADD %s (%s / %s) %s ok %.0fms" % (
                 name, base, model, row_class(new_row), ms))
             return self._send(200, {"ok": True, "name": name})
@@ -1435,20 +1466,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(404, {"error": "no such row"})
 
         if p == "/api/refetch":
-            bases = {}
-            for r in enabled_rows():
-                b = r["base"].rstrip("/")
-                if b not in bases:
-                    bases[b] = r.get("key", "")
-            n_ids = 0
-            for b, k in bases.items():
-                try:
-                    n_ids += len(fetch_models(b, k))
-                except Exception as e:
-                    log("CATALOG %s failed: %s" % (b, e))
-            log("CATALOG refetch %d bases, %d ids, %d context windows known"
-                % (len(bases), n_ids, len(RUNTIME_CW)))
-            return self._send(200, {"ok": True, "bases": len(bases),
+            n_bases, n_ids = learn_catalogs()
+            return self._send(200, {"ok": True, "bases": n_bases,
                                     "ids": n_ids, "cw": len(RUNTIME_CW)})
 
         if p in ("/v1/chat/completions", "/chat/completions"):

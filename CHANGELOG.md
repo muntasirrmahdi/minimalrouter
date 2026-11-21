@@ -12,6 +12,34 @@ OpenAI-compatible request/response shape, the endpoint, or the install command);
 for backward-compatible features (new providers, classes, dashboard capability, CLI verbs);
 **PATCH** for fixes only.
 
+## [1.2.1] — 2026-11-21
+
+Fixes to the 1.2.0 Mission Control overhaul, all found by capturing the rendered
+board and reading it with fresh eyes before handing it over. PATCH bump — fixes
+only, no contract change.
+
+### Fixed
+
+- **Table column order.** The header promised `CW · TREND+LAT · TPS · OK% ·
+  STATUS`; the data rendered `CW · TPS · OK% · spark+LAT · STATUS`, so every
+  column right of MODEL was misaligned. Data now follows the header order, and
+  the spark+LAT block width matches the header cell exactly (5+1+LAT+1).
+- **TPS column dead at boot.** `probe()` parsed `usage.completion_tokens` and
+  threw it away, so the per-row EMA stayed zero until real client traffic.
+  `probe()` now returns tokens (5-tuple), `probe_row`/`/api/test`/`/api/add`
+  feed them to `record_state` — the column is live from the boot probe.
+  `/api/test` gains a `tokens` field (additive).
+- **CW column empty at boot.** Context windows were only learned by the manual
+  `f` key / `POST /api/refetch`. The catalog read is now a shared
+  `learn_catalogs()` that the boot sequence runs right after the row probes —
+  the column fills itself on start. (`/api/refetch` uses the same function.)
+- **PROV column garbage.** Numeric loopback hosts rendered `127` (the freebuff
+  bridge row), OAuth labels clipped mid-word (`NOUS PORTA`), parenthetical
+  labels leaked (`ZCODE (Z`). `prov_short()` now collapses labels to
+  alphanumerics (`Nous Portal` -> NOUSPORTAL, `ZCode (Z.ai)` -> ZCODE),
+  shortens domains to the first significant label, and falls back to the row
+  name's first token for loopback hosts (`freebuff-bridge` -> FREEBUFF).
+
 ## [1.2.0] — 2026-11-21
 
 The Mission Control overhaul. The client contract (one OpenAI-compatible endpoint, the

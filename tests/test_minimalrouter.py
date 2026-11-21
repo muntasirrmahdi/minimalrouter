@@ -621,6 +621,61 @@ class TestResolveCw(unittest.TestCase):
         self.assertIsNone(mr.resolve_cw({"model": "totally-unknown-model-xyz"}))
 
 
+class TestProbeTokens(unittest.TestCase):
+    """probe() carries usage.completion_tokens so the boot probe seeds the
+    per-row TPS EMA (the board's TPS column is live from boot, not only after
+    real client traffic). v1.2.0 polish, found by the captured board grid."""
+
+    def test_probe_returns_tokens(self):
+        class FakeResp:
+            def read(self, *a):
+                return json.dumps({
+                    "choices": [{"message": {"role": "assistant",
+                                             "content": "OK"}}],
+                    "usage": {"completion_tokens": 42}}).encode()
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+
+        old = mr.upstream
+        mr.upstream = lambda *a, **k: FakeResp()
+        _saved = dict(mr.ROW_STATE)
+        mr.ROW_STATE.clear()
+        try:
+            ok, ms, err, content, tokens = mr.probe("https://x/v1", "k", "m")
+            self.assertTrue(ok)
+            self.assertEqual(tokens, 42)
+            mr.probe_row({"name": "tr", "base": "https://x/v1",
+                          "model": "m", "key": "k"})
+            # the fake call's ms is ~0 so the EMA value is not meaningful —
+            # the contract is that tokens SEED the tps field (non-zero)
+            self.assertGreater(mr.ROW_STATE["tr"]["tps"], 0)
+        finally:
+            mr.upstream = old
+            mr.ROW_STATE.clear()
+            mr.ROW_STATE.update(_saved)
+
+    def test_probe_no_usage_is_zero_floor(self):
+        class FakeResp:
+            def read(self, *a):
+                return json.dumps({"choices": [{"message": {
+                    "role": "assistant", "content": "OK"}}]}).encode()
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+
+        old = mr.upstream
+        mr.upstream = lambda *a, **k: FakeResp()
+        try:
+            ok, ms, err, content, tokens = mr.probe("https://x/v1", "k", "m")
+            self.assertTrue(ok)
+            self.assertEqual(tokens, 0)  # honest floor, never an estimate
+        finally:
+            mr.upstream = old
+
+    def test_learn_catalogs_shared_with_boot(self):
+        # learn_catalogs exists and is the same code path /api/refetch uses
+        self.assertTrue(callable(getattr(mr, "learn_catalogs", None)))
+
+
 class TestFetchModelsCw(unittest.TestCase):
     def setUp(self):
         self._saved_rt = dict(mr.RUNTIME_CW)
