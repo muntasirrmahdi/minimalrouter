@@ -9,7 +9,8 @@ Design (v1.2.0, Moon's rulings 2026-11-21): the btop-class console.
 - One centered max-width frame; hero zone (wordmark, URL bar, stat tiles) is
   dead-center, data table left-flush inside the centered frame.
 - 8 pixel-digit stat tiles (5x5 block face, >= half the wordmark's visual mass):
-  ROWS / MODELS / SERVING / BLOCKED / REQ-MIN / TOK/S / ERR% / UPTIME.
+  ROWS / MODELS / SERVING / DOWN / REQ-MIN / TOK/S / ERR% / UPTIME.
+  (SERVING + DOWN + unprobed == ROWS — the tiles partition the pool.)
   Numbers colored per meaning; labels are one text row (1/4 wordmark).
 - Route table: ROW · PROV · CLASS · MODEL · CW · LAT · TPS · OK% · STATUS,
   with richer statuses (COOLDOWN/STALE/DEAD/OFF) and multi-row marks.
@@ -799,13 +800,13 @@ class MissionControl(App):
     def tile_values(self):
         s = self.stats
         p = self.pal()
-        blocked = s.get("blocked", 0)
+        down = s.get("down", 0)
         err = s.get("err_pct", 0)
         return [
             (compact(s.get("rows", 0)), "ROWS", p["strong"], s.get("rows", 0)),
             (compact(self.nmodels), "MODELS", p["strong"], self.nmodels),
             (compact(s.get("serving", 0)), "SERVING", p["ok"], s.get("serving", 0)),
-            (compact(blocked), "BLOCKED", p["bad"] if blocked else p["dim"], blocked),
+            (compact(down), "DOWN", p["bad"] if down else p["dim"], down),
             (compact(s.get("req_min", 0)), "REQ/MIN", p["accent"], s.get("req_min", 0)),
             (compact(s.get("tok_s", 0)), "TOK/S ≥", p["accent"], s.get("tok_s", 0)),
             (compact(err), "ERR%", p["bad"] if err else p["dim"], err),

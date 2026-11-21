@@ -409,6 +409,39 @@ class TestRecordState(unittest.TestCase):
         self.assertIn("at", st)
 
 
+class TestPoolStatsReconcile(unittest.TestCase):
+    """v1.2.2: the health tiles are a partition — SERVING + DOWN + UNKNOWN == ROWS.
+    A row that is not serving is visible in DOWN (errored, rate-limited, gated,
+    or parked); only never-probed rows sit outside both (boot window)."""
+
+    def test_partition_covers_every_row(self):
+        rows = [{"state": {"status": "ok"}},
+                {"state": {"status": "fail", "error": "HTTP Error 403: x"}},
+                {"state": {"status": "fail", "error": "HTTP Error 402: x"}},
+                {"state": {"status": "fail", "error": "HTTP Error 429: x"}},
+                {"state": {"status": "fail", "error": "HTTP Error 530: x",
+                           "fail_streak": 3}},
+                {"state": {"status": "fail", "error": "URLError: refused"}},
+                {},
+                {"state": {"status": "ok"}, "disabled": True}]
+        s = mr.pool_stats(rows)
+        self.assertEqual(s["rows"], 8)
+        self.assertEqual(s["serving"], 1)
+        self.assertEqual(s["down"], 6)     # 403+402+429+dead+error+parked-ok
+        self.assertEqual(s["unknown"], 1)  # never probed
+        self.assertEqual(s["serving"] + s["down"] + s["unknown"], s["rows"])
+        self.assertEqual(s["blocked"], 2)  # granular fields still reported
+        self.assertEqual(s["cooldown"], 1)
+        self.assertEqual(s["dead"], 1)
+        self.assertEqual(s["disabled"], 1)
+
+    def test_parked_row_counts_down_not_serving(self):
+        rows = [{"state": {"status": "ok"}, "disabled": True}]
+        s = mr.pool_stats(rows)
+        self.assertEqual(s["serving"], 0)
+        self.assertEqual(s["down"], 1)
+
+
 class TestPoolStats(unittest.TestCase):
     def test_counts(self):
         rows = [{"state": {"status": "ok"}},

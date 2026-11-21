@@ -74,7 +74,7 @@ except ImportError:  # platform without curses -> main() degrades to serve
 # CHANGELOG and the git tag all derive from this one line. MAJOR.MINOR.PATCH per
 # semver.org: MAJOR on a breaking client contract, MINOR on backward-compatible
 # features, PATCH on fixes.
-__version__ = "1.2.1"
+__version__ = "1.2.2"
 
 HOME = os.path.expanduser("~")
 MR_HOME = os.path.join(HOME, ".minimalrouter")
@@ -1149,9 +1149,27 @@ def note_req(ok, tokens=0, ms=0):
 
 
 def pool_stats(rows, now=None):
-    """Stat-strip counts from live row state + the client traffic ledger."""
+    """Stat-strip counts from live row state + the client traffic ledger.
+
+    The health tiles are a PARTITION: every row lands in exactly one of
+    serving / down / unknown, so SERVING + DOWN + UNKNOWN == ROWS. (v1.2.1
+    counted only gated+empty as BLOCKED: a 21-row pool showed 11 serving + 1
+    blocked and nine errored/cooldown rows were invisible in the tiles —
+    Moon's "Where are the rest?" audit, 2026-11-22.)"""
     now = now if now is not None else time.time()
     cls = [classify_status(r.get("state", {}), now) for r in rows]
+    serving = 0
+    down = 0
+    unknown = 0
+    for r, c in zip(rows, cls):
+        if r.get("disabled"):
+            down += 1          # a parked row cannot serve
+        elif c == "ok":
+            serving += 1
+        elif c == "unknown":
+            unknown += 1       # never probed yet (boot window only)
+        else:
+            down += 1          # gated / empty / error / dead / cooldown / stale
     with STAT_LOCK:
         win = [e for e in REQLOG if now - e[0] <= REQ_WIN]
         req_min = len(win)
@@ -1160,7 +1178,9 @@ def pool_stats(rows, now=None):
     errs = sum(1 for e in tail if not e[1])
     return {"rows": len(rows),
             "disabled": sum(1 for r in rows if r.get("disabled")),
-            "serving": cls.count("ok"),
+            "serving": serving,
+            "down": down,
+            "unknown": unknown,
             "blocked": cls.count("gated") + cls.count("empty"),
             "cooldown": cls.count("cooldown"),
             "dead": cls.count("dead"),
@@ -1954,18 +1974,20 @@ def _curses_main(stdscr, port):
                     else "SERVER OFFLINE"))
         _putw(stdscr, 0, head, w, curses.A_REVERSE | curses.A_BOLD)
 
-        # ---- stat strip (row 1): rows / models / serving / blocked -----
-        stat_line = " %d ROWS    %d MODELS    %d SERVING    %d BLOCKED" % (
-            len(rows), nmodels, stats["serving"], stats["blocked"])
+        # ---- stat strip (row 1): rows / models / serving / down ---------
+        # DOWN is the reconcile aggregate (serving + down + unprobed == rows):
+        # an errored or rate-limited row is never invisible in the strip.
+        stat_line = " %d ROWS    %d MODELS    %d SERVING    %d DOWN" % (
+            len(rows), nmodels, stats["serving"], stats["down"])
         _putw(stdscr, 1, stat_line, w, curses.A_BOLD)
         if HAS_COLOR:
             try:
                 so = stat_line.index("%d SERVING" % stats["serving"])
                 stdscr.addnstr(1, so, str(stats["serving"]),
                                len(str(stats["serving"])), COLOR["ok"])
-                bo = stat_line.index("%d BLOCKED" % stats["blocked"])
-                stdscr.addnstr(1, bo, str(stats["blocked"]),
-                               len(str(stats["blocked"])), COLOR["fail"])
+                bo = stat_line.index("%d DOWN" % stats["down"])
+                stdscr.addnstr(1, bo, str(stats["down"]),
+                               len(str(stats["down"])), COLOR["fail"])
             except Exception:
                 pass
 

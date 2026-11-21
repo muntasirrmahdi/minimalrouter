@@ -12,6 +12,20 @@ OpenAI-compatible request/response shape, the endpoint, or the install command);
 for backward-compatible features (new providers, classes, dashboard capability, CLI verbs);
 **PATCH** for fixes only.
 
+## [1.2.2] — 2026-11-22
+
+### Fixed
+
+- **The POOL tiles now reconcile (Moon's "Where are the rest?" audit).** 1.2.1's
+  BLOCKED tile counted only account gates (403/402), so a 21-row pool showing 11
+  serving + 1 blocked left nine errored / rate-limited rows invisible in the
+  tiles. The tile is renamed DOWN and counts every row that cannot serve right
+  now (gated, empty, error, dead, cooldown, stale, parked): SERVING + DOWN +
+  UNPROBED == ROWS. The granular per-row states (GATED/EMPTY/COOLDOWN/DEAD/
+  STALE/OFF/ERROR) remain in the table's STATUS column — the tile is the
+  aggregate, the table is the detail. The curses fallback strip uses the same
+  DOWN aggregate. `/api/state` stats gain additive fields (`down`, `unknown`).
+
 ## [1.2.1] — 2026-11-21
 
 Fixes to the 1.2.0 Mission Control overhaul, all found by capturing the rendered
