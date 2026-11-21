@@ -630,7 +630,6 @@ class TestFetchModelsCw(unittest.TestCase):
         mr.RUNTIME_CW.update(self._saved_rt)
 
     def test_context_length_learned(self):
-        import io as _io
         body = {"data": [{"id": "foo-x", "context_length": 262144},
                          {"id": "bar-y", "max_input_tokens": 8192},
                          {"id": "baz-z"}]}
