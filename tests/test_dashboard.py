@@ -7,6 +7,7 @@ Run (with textual installed): python -m unittest discover -s tests -v
 """
 import asyncio
 import importlib.util
+import json
 import os
 import tempfile
 import unittest
@@ -284,3 +285,328 @@ class TestDashboardV12Helpers(unittest.TestCase):
             for field in ("bg", "line", "accent", "strong", "muted", "dim",
                           "sel", "ok", "warn", "bad", "dark"):
                 self.assertIn(field, t)
+# ---- GEOMETRY gate v2
+
+
+@unittest.skipUnless(HAVE_TEXTUAL, "textual not installed")
+class TestDashboardGeometry(unittest.TestCase):
+    """Composition gate. Per-widget CONTENT checks cannot see that a panel is
+    clipped off-screen or starved to border-only — these assertions measure the
+    rendered REGIONS.
+
+    Regression target: 1.2.0-1.2.2 shipped rows_visible = 0/21 at every terminal
+    size, because a Vertical gauge inside an auto-height Horizontal defaults to
+    `1fr` and never resolves: SELECTED blew up to 40 rows on a 42-row screen,
+    free space went negative, the route table's 1fr collapsed to border-only, and
+    EVENTS / toast / legend were pushed below the bottom edge.
+
+    Contract after 1.2.3: the frame never scrolls; ROUTES is the only flexible
+    panel (1fr + min-height floor); on a short terminal the secondary panels DROP
+    OUT (display: none) instead of being pushed off-screen.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.d = _load()
+        # ISOLATION: this class presses p/v/m, and every one of those calls
+        # save_prefs(). Without a private PREF_PATH the suite writes the real
+        # ~/.minimalrouter/dashboard.json and flips Moon's density between
+        # methods — the measured cause of the alternating OK/FAILED runs.
+        cls._tmp = tempfile.TemporaryDirectory()
+        cls._old = (cls.d.MR_HOME, cls.d.PREF_PATH, cls.d.LOG_PATH)
+        cls.d.MR_HOME = cls._tmp.name
+        cls.d.PREF_PATH = os.path.join(cls._tmp.name, "dashboard.json")
+        cls.d.LOG_PATH = os.path.join(cls._tmp.name, "minimalrouter.log")
+
+    @classmethod
+    def tearDownClass(cls):
+        (cls.d.MR_HOME, cls.d.PREF_PATH, cls.d.LOG_PATH) = cls._old
+        cls._tmp.cleanup()
+
+    def _prefs(self, theme="midnight", dense=False, motion=True):
+        """Write an explicit, deterministic prefs file before any mount, so
+        test ORDER can never change what a mount reads."""
+        with open(self.d.PREF_PATH, "w") as f:
+            json.dump({"theme": theme, "dense": dense, "motion": motion}, f)
+
+    ROWS = [{"name": "row-%d" % i, "model": "m/%d" % i,
+             "base": "https://x%d/v1" % i, "class": "api",
+             "provider": "api.x%d.com" % i, "oauth_provider": "",
+             "disabled": False, "cw": 131072, "key_src": "pasted", "ok_pct": 100,
+             "state": {"status": "ok", "ms": 1200, "hist": [1100, 1200],
+                       "tps": 20.0, "fail_streak": 0, "recent": [1, 1],
+                       "at": 0}}
+            for i in range(21)]
+
+    def _mount(self, w, h, press=None, dense=False):
+        d = self.d
+        self._prefs(dense=dense)
+
+        async def go():
+            app = d.MissionControl(port=8799)
+            async with app.run_test(size=(w, h)) as pilot:
+                # deterministic wait for the tier to converge (never a fixed
+                # sleep: the deciding event can land late, which was the flake)
+                for _ in range(40):
+                    await pilot.pause(0.1)
+                    if app._tier_now() == getattr(app, "_tier_key", None):
+                        break
+                app.online = True
+                app.rows = [dict(r) for r in self.ROWS]
+                app.nmodels = 20
+                app.stats = {"rows": 21, "serving": 12, "down": 8, "unknown": 0,
+                             "req_min": 0, "tok_s": 0, "err_pct": 0,
+                             "uptime": 300, "blocked": 1, "cooldown": 1,
+                             "dead": 0, "stale": 0, "disabled": 0}
+                app.probe = {"done": 0, "total": 0, "active": False}
+                app.render_wordmark()
+                app.rebuild_stats()
+                app.ensure_slots(21)
+                for i in range(len(app.row_statics)):
+                    app.row_statics["slot%d" % i].display = i < 21
+                app.repaint_rows()
+                app.update_selected()
+                app.update_events()
+                await pilot.pause(0.4)
+                if press:
+                    for k in press:
+                        await pilot.press(k)
+                    await pilot.pause(0.4)
+                snap = {"screen_h": app.screen.region.height,
+                        "tier": app._tier_now(),
+                        "classes": list(app.screen.classes),
+                        "regions": {}, "vis": {}}
+                for sel in ("#frame", "#mast", "#stats", "#tablebox", "#table",
+                            "#selbox", "#selrow", ".gauge", "#evbox", "#evbody",
+                            "#toast", "#foot", "#help"):
+                    try:
+                        wd = app.query_one(sel)
+                        r = wd.region
+                        snap["regions"][sel] = (r.y, r.height)
+                        snap["vis"][sel] = bool(wd.display)
+                    except Exception as e:
+                        snap["regions"][sel] = ("ERR", str(e)[:30])
+                        snap["vis"][sel] = False
+                try:
+                    tb = app.query_one("#table")
+                    snap["table_vp"] = tb.content_region.height
+                    vis = 0
+                    for i in range(21):
+                        wd = app.row_statics.get("slot%d" % i)
+                        if wd is None or not wd.display:
+                            continue
+                        if 0 <= wd.region.y - tb.region.y < tb.content_region.height:
+                            vis += 1
+                    snap["rows_visible"] = vis
+                except Exception:
+                    snap["table_vp"] = 0
+                    snap["rows_visible"] = 0
+                await pilot.press("q")
+                await pilot.pause(0.2)
+            return snap
+        return asyncio.run(go())
+
+    def test_routes_table_always_has_rows(self):
+        """The primary panel can never be starved — the 1.2.0-1.2.2 defect."""
+        for w, h in ((140, 42), (120, 35), (100, 30), (80, 24), (160, 50),
+                     (200, 60)):
+            with self.subTest(size=(w, h)):
+                s = self._mount(w, h)
+                self.assertGreaterEqual(s["table_vp"], 1,
+                                        "%s viewport=%s" % ((w, h), s["table_vp"]))
+                self.assertGreaterEqual(s["rows_visible"], 1,
+                                        "%s rows_visible=%s" % ((w, h), s["rows_visible"]))
+                self.assertGreaterEqual(s["regions"]["#tablebox"][1], 4,
+                                        "%s tablebox h=%s (floor 4)"
+                                        % ((w, h), s["regions"]["#tablebox"][1]))
+
+    def test_no_visible_panel_is_off_screen(self):
+        """Nothing may sit below the bottom edge. Panels that do not fit must be
+        display:none (dropped), never clipped-out-but-claimed-visible."""
+        for w, h in ((140, 42), (120, 35), (100, 30), (80, 24), (160, 50)):
+            with self.subTest(size=(w, h)):
+                s = self._mount(w, h)
+                sh = s["screen_h"]
+                for sel, (y, hh) in s["regions"].items():
+                    if y == "ERR" or not s["vis"][sel]:
+                        continue
+                    self.assertLessEqual(
+                        y + hh, sh + 1,
+                        "%s %s y=%s h=%s exceeds screen %s (visible=%s)"
+                        % ((w, h), sel, y, hh, sh, s["vis"][sel]))
+
+    def test_selected_and_gauges_stay_pinned(self):
+        """The blow-up class: an auto-height row holding a Vertical gauge.
+        SELECTED must never exceed its pinned budget at ANY size."""
+        for w, h in ((140, 42), (120, 35), (100, 30), (80, 24)):
+            with self.subTest(size=(w, h)):
+                s = self._mount(w, h)
+                if s["vis"]["#selbox"]:
+                    self.assertLessEqual(s["regions"]["#selbox"][1], 6,
+                                         "selbox h=%s" % s["regions"]["#selbox"][1])
+                    self.assertLessEqual(s["regions"][".gauge"][1], 4,
+                                         "gauge h=%s" % s["regions"][".gauge"][1])
+
+    def test_tier_bands_match_screen_height(self):
+        for h, want in ((42, "airy"), (50, "airy"), (35, "compact"),
+                        (32, "compact"), (31, "micro"), (26, "micro"),
+                        (24, "micro")):
+            with self.subTest(h=h):
+                s = self._mount(120, h)
+                self.assertEqual(s["tier"], want, "h=%s tier=%s" % (h, s["tier"]))
+                # the tier class must actually be applied after on_idle
+                self.assertIn("tier-" + want, s["classes"],
+                              "classes=%s" % s["classes"])
+
+    def test_micro_drops_events_keeps_selected_and_table(self):
+        s = self._mount(100, 26)
+        self.assertEqual(s["tier"], "micro")
+        self.assertFalse(s["vis"]["#evbox"], "EVENTS must drop in micro")
+        self.assertTrue(s["vis"]["#selbox"], "SELECTED is the cursor detail: keep")
+        self.assertTrue(s["vis"]["#tablebox"], "ROUTES must never drop")
+        self.assertGreaterEqual(s["rows_visible"], 1)
+
+    def test_routes_monotonic_within_each_tier(self):
+        """Inside a tier, a taller terminal must never show FEWER routes. The
+        first 1.2.3 attempt failed this outright (30 rows -> 4 routes while 28
+        rows -> 12, because the boundary kept both secondary panels on a short
+        screen). Measured bands: micro < 32, compact 32-39, airy >= 40."""
+        for band in ((22, 31), (32, 39), (40, 54)):
+            prev = -1
+            for h in range(band[0], band[1] + 1):
+                with self.subTest(h=h):
+                    s = self._mount(120, h)
+                    rv = s["rows_visible"]
+                    self.assertGreaterEqual(
+                        rv, prev,
+                        "h=%s shows %s routes but h=%s showed %s (band %s)"
+                        % (h, rv, h - 1, prev, band))
+                    prev = rv
+
+    def test_tier_boundary_drop_is_bounded(self):
+        """Crossing a tier UP may cost rows (the wordmark + pixel tiles + EVENTS
+        appear) but never below the usable floor, and never below what the
+        smallest screen of that band shows."""
+        for up, down in ((32, 31), (40, 39)):
+            with self.subTest(boundary=up):
+                above = self._mount(120, up)["rows_visible"]
+                below = self._mount(120, down)["rows_visible"]
+                self.assertGreaterEqual(above, 4,
+                                        "tier upgrade collapsed the table: %s" % above)
+                self.assertLessEqual(above, below,
+                                     "hero should cost rows, not gain them")
+
+    def test_every_screen_size_keeps_the_table_usable(self):
+        for h in range(22, 55, 3):
+            with self.subTest(h=h):
+                s = self._mount(120, h)
+                self.assertGreaterEqual(s["rows_visible"], 2,
+                                        "h=%s routes_visible=%s" % (h, s["rows_visible"]))
+
+    def test_labels_stay_below_numbers_every_tier(self):
+        """Moon's layout law: a tier or density change may shrink the DIGIT FACE
+        only. Labels stay below the numbers, never beside them. The tile is a
+        Vertical(number, label) in every tier, and the stats strip height equals
+        number rows + label row (+1 gap in airy)."""
+        for h, want_num in ((42, 3), (35, 1), (26, 1)):
+            for dense in (False, True):
+                with self.subTest(h=h, dense=dense):
+                    s = self._mount(120, h, dense=dense)
+                    want = 2 if dense else want_num + 1
+                    self.assertEqual(s["regions"]["#stats"][1], want,
+                                     "h=%s dense=%s stats h=%s expected %s"
+                                     % (h, dense, s["regions"]["#stats"][1], want))
+
+    def test_help_is_a_modal_that_never_displaces_the_layout(self):
+        """`?` opens an overlay: it must not push the legend or the table off a
+        short screen (the in-flow help did exactly that at 26 rows), and any key
+        must close it."""
+        d = self.d
+        self._prefs()
+
+        async def go():
+            app = d.MissionControl(port=8799)
+            async with app.run_test(size=(100, 26)) as pilot:
+                for _ in range(40):
+                    await pilot.pause(0.1)
+                    if app._tier_now() == getattr(app, "_tier_key", None):
+                        break
+                await pilot.press("question_mark")
+                await pilot.pause(0.4)
+                names = [type(s).__name__ for s in app._screen_stack]
+                opened = "HelpScreen" in names
+                # the layout underneath is untouched: legend still on screen
+                foot = app.query_one("#foot").region
+                sh = app.screen.region.height
+                fits = foot.y + foot.height <= sh + 1
+                await pilot.press("x")          # any key closes it
+                await pilot.pause(0.4)
+                names2 = [type(s).__name__ for s in app._screen_stack]
+                closed = "HelpScreen" not in names2
+                await pilot.press("q")
+                await pilot.pause(0.2)
+            return opened, fits, closed
+        opened, fits, closed = asyncio.run(go())
+        self.assertTrue(opened, "help modal must open on ?")
+        self.assertTrue(fits, "legend must stay on screen while help is up")
+        self.assertTrue(closed, "any key must close the help modal")
+
+    def test_keys_survive_the_help_modal(self):
+        """Regression for the class introduced (and caught) during the 1.2.3
+        layout fix: an app-level 'help is open' input guard that is never cleared
+        freezes the WHOLE keyboard after the modal closes — strictly worse than
+        the clipped panels it was meant to protect. A Textual modal owns key
+        events on its own, so no app-level guard may exist at all.
+        """
+        d = self.d
+        self._prefs()
+
+        async def go():
+            app = d.MissionControl(port=8799)
+            async with app.run_test(size=(120, 40)) as pilot:
+                for _ in range(40):
+                    await pilot.pause(0.1)
+                    if app._tier_now() == getattr(app, "_tier_key", None):
+                        break
+                # rows must exist or the cursor assertion measures nothing
+                app.online = True
+                app.rows = [dict(x) for x in TestDashboardGeometry.ROWS]
+                app.nmodels = 20
+                app.stats = {"rows": 21, "serving": 12, "down": 8, "unknown": 0,
+                             "req_min": 0, "tok_s": 0, "err_pct": 0,
+                             "uptime": 300, "blocked": 1, "cooldown": 1,
+                             "dead": 0, "stale": 0, "disabled": 0}
+                app.ensure_slots(21)
+                for i in range(len(app.row_statics)):
+                    app.row_statics["slot%d" % i].display = i < 21
+                app.repaint_rows()
+                theme_before = app.theme_ix
+                dens_before = app.dense
+                await pilot.press("question_mark")
+                await pilot.pause(0.4)
+                opened = "HelpScreen" in [type(s).__name__
+                                          for s in app._screen_stack]
+                await pilot.press("x")                 # any key pops it
+                await pilot.pause(0.4)
+                closed = "HelpScreen" not in [type(s).__name__
+                                              for s in app._screen_stack]
+                # the board must still respond to EVERY class of key
+                await pilot.press("p")
+                await pilot.pause(0.4)
+                theme_after = app.theme_ix
+                await pilot.press("v")
+                await pilot.pause(0.4)
+                dens_after = app.dense
+                await pilot.press("down")
+                await pilot.pause(0.2)
+                cursor_after = app.sel
+                await pilot.press("q")
+                await pilot.pause(0.2)
+            return (opened, closed, theme_before, theme_after,
+                    dens_before, dens_after, cursor_after)
+        (opened, closed, tb, ta, db, da, cur) = asyncio.run(go())
+        self.assertTrue(opened, "help modal must open")
+        self.assertTrue(closed, "help modal must close")
+        self.assertNotEqual(tb, ta, "p must still cycle themes after help")
+        self.assertNotEqual(db, da, "v must still toggle density after help")
+        self.assertEqual(cur, 1, "arrows must still move the cursor after help")

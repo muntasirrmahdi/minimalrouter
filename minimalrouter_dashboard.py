@@ -438,45 +438,150 @@ class AddScreen(ModalScreen):
             self.app.pop_screen()
 
 
+# ---------------------------------------------------------------- help modal
+HELP_CSS = """
+HelpScreen { align: center middle; }
+#helpbox { width: 82%; max-width: 78; height: auto; max-height: 86%;
+           border: round $panel; padding: 0 1; overflow-y: auto; }
+"""
+
+
+class HelpScreen(ModalScreen):
+    """Key reference as a MODAL, not an in-flow panel. The frame does not scroll
+    (a scrolling frame breaks `fr` resolution — that was the 1.2.3 defect), so an
+    in-flow 13-row help would push the legend below the bottom edge on a short
+    terminal: the same clipped-panel class Moon reported, reintroduced."""
+
+    CSS = HELP_CSS
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="helpbox"):
+            yield Static(self._body(), id="helpbody")
+
+    def _body(self):
+        app = self.app
+        p = app.pal()
+        t = Text()
+        t.append("MISSION CONTROL KEYS", style=f"bold {p['accent']}")
+        rows = [
+            ("up/down", "move cursor  (in EVENTS zone: scroll)"),
+            ("space", "mark / unmark row"),
+            ("t / T", "test row / test marked (all enabled if none)"),
+            ("r / R", "refresh row OAuth token / refresh ALL"),
+            ("f", "re-fetch every catalog (learns context windows)"),
+            ("a", "add a row (base URL + key + model, tested before save)"),
+            ("d d", "delete marked/cursor row - press twice within 4s"),
+            ("e", "disable/enable marked rows (parked rows never serve)"),
+            ("p / P", "theme next / previous"),
+            ("v", "density: airy / compact"),
+            ("m", "motion on / off (pauses every animation timer)"),
+            ("Tab", "focus the EVENTS panel  -  g/G newest / oldest"),
+            ("?", "this help  -  any key closes it"),
+            ("q", "quit (stops the server)"),
+        ]
+        for k, dsc in rows:
+            t.append("\n  %-9s" % k, style=f"bold {p['strong']}")
+            t.append(dsc, style=p["muted"])
+        t.append("\n\n  TILES: ", style=f"bold {p['dim']}")
+        t.append("serving + down + unprobed = rows (every row is counted)",
+                 style=p["muted"])
+        t.append("\n  LAYOUT: ", style=f"bold {p['dim']}")
+        t.append("tier from terminal height (%s now)" % app._tier_now(),
+                 style=p["muted"])
+        return t
+
+    def on_key(self, event):
+        event.stop()
+        self.app.pop_screen()
+
+
 # ---------------------------------------------------------------- the app
 def _build_css():
+    """Tiered layout. ONE flexible panel (ROUTES); the frame never scrolls.
+
+    Two laws this file exists to enforce, both learned the hard way:
+
+    1. No container may use `height: auto` while holding a Vertical child.
+       Textual's Vertical defaults to `1fr`, which never resolves inside an auto
+       parent — that is what blew SELECTED up to 40 rows on a 42-row terminal,
+       drove free space negative, and collapsed the route table to border-only
+       (rows_visible = 0/21 at every size, 1.2.0-1.2.2).
+
+    2. The frame must not scroll. `overflow-y: auto` makes a container size to
+       its content, which breaks `fr` resolution: `1fr` stops meaning "share of
+       the viewport" and panels balloon past the bottom edge. So ROUTES is the
+       only flexible panel and takes the real slack; on a short terminal the
+       secondary panels DROP OUT (display: none) instead of being pushed off-screen.
+
+    Tiers, from the LIVE screen height, re-evaluated after layout and on resize:
+      airy    (>= 40 rows): 4-row wordmark, 3-row pixel stat face, SELECTED + EVENTS
+      compact (>= 30 rows): 1-row wordmark, 1-row numbers, SELECTED + EVENTS
+      micro   (<  30 rows): 1-row wordmark, 1-row numbers, SELECTED + EVENTS hidden
+    The `v` density toggle shrinks only the digit face inside a tier — labels stay
+    BELOW the numbers in every tier (Moon's layout law), never beside them.
+    """
     base = """
     Screen { align: center top; }
     #frame { width: 96%; max-width: 148; height: 100%; border: round #222835;
              padding: 0 2; }
+
+    /* ---- hero ---- */
     .wordmark { height: 1; text-align: center; }
     .wmcompact { display: none; height: 1; text-align: center; }
-    Screen.dense .wordmark { display: none; }
-    Screen.dense .wmcompact { display: block; }
-    #mast { height: 1; text-align: center; margin-bottom: 1; }
+    Screen.tier-airy .wordmark { display: block; }
+    Screen.tier-airy .wmcompact { display: none; }
+    Screen.tier-compact .wordmark, Screen.tier-micro .wordmark { display: none; }
+    Screen.tier-compact .wmcompact, Screen.tier-micro .wmcompact { display: block; }
+    #mast { height: 1; text-align: center; }
+
+    /* ---- panels ---- */
     .box { border: round #222835; }
     .box.focused { border: heavy #4fd1c5; }
     .box { border-title-color: #4fd1c5; border-title-style: bold; }
-    #stats { height: 7; margin-bottom: 1; }
-    Screen.dense #stats { height: 4; }
-    .stat { width: 1fr; }
+
+    /* POOL: borderless hero strip — the tiles label themselves, and the 2-row
+       border costs the route table 9 visible rows on a 42-row terminal. */
+    #stats { height: 4; margin-top: 1; margin-bottom: 1; }
+    Screen.tier-compact #stats, Screen.tier-micro #stats,
+    Screen.dense #stats { height: 2; }
+    .stat { width: 1fr; height: 100%; }
     .statnum { height: 3; text-align: center; overflow-x: hidden; }
+    Screen.tier-compact .statnum, Screen.tier-micro .statnum,
     Screen.dense .statnum { height: 1; }
     .statlab { height: 1; text-align: center; }
-    #tablebox { height: 1fr; }
-    #table { height: 1fr; overflow-y: auto; }
+
+    /* ROUTES: the only flexible panel — it takes the real slack, with a floor
+       so it can never be squeezed to nothing. */
+    #tablebox { height: 1fr; min-height: 4; }
+    #table { height: 100%; overflow-y: auto; }
     .colhead { height: 1; }
     .row { height: 1; padding: 0 1; }
     .row.sel { background: #123330; }
-    #selbox { height: auto; margin-top: 1; }
-    #selrow { height: auto; }
-    #selid { width: 1fr; padding: 0 1; }
-    .gauge { width: 26; padding: 0 1; }
+
+    /* SELECTED: pinned. The gauges are Verticals, so THEY carry the pin. */
+    #selbox { height: 6; margin-top: 1; }
+    Screen.tier-compact #selbox, Screen.tier-micro #selbox { height: 4; }
+    #selrow { height: 4; }
+    Screen.tier-compact #selrow, Screen.tier-micro #selrow { height: 2; }
+    #selid { width: 1fr; height: 100%; padding: 0 1; overflow: hidden; }
+    .gauge { width: 24; height: 4; padding: 0 1; }
+    Screen.tier-compact .gauge, Screen.tier-micro .gauge { height: 2; }
     .gnum { height: 3; text-align: center; overflow-x: hidden; }
+    Screen.tier-compact .gnum, Screen.tier-micro .gnum { height: 1; }
     .glab { height: 1; text-align: center; }
-    #evbox { height: 9; margin-top: 1; }
-    Screen.dense #evbox { height: 6; }
-    #evbody { height: 100%; padding: 0 1; }
-    #toast { height: 1; margin-top: 1; padding-left: 1; }
-    #foot { height: auto; margin-top: 1; border: round #222835; padding: 0 1; }
-    #help { display: none; height: auto; margin-top: 1; border: round #222835;
-            padding: 0 1; }
-    #help.open { display: block; }
+
+
+    /* EVENTS: pinned, and dropped in micro for the same reason. */
+    #evbox { height: 5; margin-top: 1; }
+    Screen.tier-compact #evbox { height: 4; }
+    #evbody { height: 100%; padding: 0 1; overflow: hidden; }
+    /* micro: EVENTS drops — SELECTED is the cursor's detail, EVENTS is not */
+    Screen.tier-micro #evbox { display: none; }
+
+    /* toast + legend: one line each, never wrapping (full list lives behind ?) */
+    #toast { height: 1; padding-left: 1; }
+    #foot { height: 3; margin-top: 1; border: round #222835; padding: 0 1;
+            overflow: hidden; }
     * { scrollbar-size: 1 1; }
     """
     blocks = []
@@ -490,7 +595,6 @@ def _build_css():
         .theme-{k} .box.focused {{ border: heavy {accent}; }}
         .theme-{k} .row.sel {{ background: {sel}; }}
         .theme-{k} #foot {{ border: round {line}; }}
-        .theme-{k} #help {{ border: round {line}; }}
         .theme-{k} * {{ scrollbar-color: {line}; scrollbar-background: {bg}; }}
         """.format(k=k, **t))
     return base + "".join(blocks)
@@ -526,7 +630,6 @@ class MissionControl(App):
         self.log_off = None
         self.ev_scroll = 0
         self.zone = "table"
-        self.help_open = False
         self.del_arm = (None, 0.0)
         self.server_ver = ""
 
@@ -550,9 +653,58 @@ class MissionControl(App):
             return {"error": str(e)}
 
     # ---------- mount / timers ----------
+    def _tier_now(self):
+        """airy >= 40 (wordmark + both secondary panels), compact >= 32 (compact
+        mark + both), micro < 32 (compact mark + SELECTED only).
+
+        The boundary is 32, not 30, so the row count never goes DOWN when the
+        terminal gets TALLER: at 30 rows the old 30-boundary kept EVENTS and
+        showed 4 routes, while 28 rows dropped everything and showed 12."""
+        try:
+            h = self.screen.region.height
+        except Exception:
+            h = 40
+        return "airy" if h >= 40 else ("compact" if h >= 32 else "micro")
+
+    def _apply_tier(self):
+        """Re-pin the tier classes from the LIVE screen height. Called after
+        layout settles (on_idle) and on every resize — reading the height inside
+        on_mount was too early: the screen is not yet sized, so a 140x42 terminal
+        classified as tiny and the board rendered the compact hero."""
+        tier = self._tier_now()
+        for k in ("airy", "compact", "micro"):
+            self.screen.set_class(tier == k, "tier-" + k)
+
     def on_mount(self):
         self.screen.set_class(self.dense, "dense")
+        self._apply_tier()
         self._apply_theme_classes()
+
+    def _ensure_tier(self):
+        """Re-decide the tier and repaint ONLY on a change. Idempotent and cheap.
+
+        The tier must not depend on a single event arriving at the right moment:
+        on_mount reads a not-yet-laid-out screen height, and on_idle can land
+        late, so a one-shot decision renders the wrong hero (measured flaky:
+        2 of 3 runs showed the compact strip on a 42-row screen). Every caller
+        below re-runs this, so the board converges no matter which event wins.
+        """
+        tier = self._tier_now()
+        if tier == getattr(self, "_tier_key", None):
+            return False
+        self._tier_key = tier
+        self._apply_tier()
+        self.render_wordmark()
+        self.rebuild_stats()
+        self.repaint_rows()
+        self.update_selected()
+        self.update_events()
+        return True
+
+    def on_idle(self, event):
+        """First idle lands after the initial layout pass: converge the tier."""
+        event.stop()
+        self._ensure_tier()
         for wid, title in (("#stats", "POOL"), ("#tablebox", "ROUTES"),
                            ("#selbox", "SELECTED"), ("#evbox", "EVENTS")):
             try:
@@ -574,9 +726,13 @@ class MissionControl(App):
             pass
 
     def on_resize(self, event):
+        self._tier_key = self._tier_now()
+        self._apply_tier()
         self.render_wordmark()
+        self.rebuild_stats()
         self.repaint_rows()
         self.update_selected()
+        self.update_events()
 
     def tick_anim(self):
         self.live_ix = (self.live_ix + 1) % len(PULSE)
@@ -610,6 +766,7 @@ class MissionControl(App):
             self._set("#mast", self.termbar_text())
             return
         self.online = True
+        self._ensure_tier()          # self-healing tier (event-order independent)
         self.rows = st.get("rows", []) or []
         self.nmodels = st.get("models", 0)
         self.stats = st.get("stats", {}) or {}
@@ -897,11 +1054,10 @@ class MissionControl(App):
     def update_events(self):
         p = self.pal()
         e = Text()
-        room = 7 if not self.dense else 4
         try:
             room = max(1, self.query_one("#evbody").container_height)
         except Exception:
-            pass
+            room = 2
         n = self.events
         total = len(n)
         top = max(0, total - room - self.ev_scroll)
@@ -932,36 +1088,11 @@ class MissionControl(App):
             pass
 
     # ---------- help ----------
-    def help_text(self):
-        p = self.pal()
-        t = Text()
-        t.append("MISSION CONTROL KEYS", style=f"bold {p['accent']}")
-        rows = [
-            ("↑/↓", "move cursor  (in EVENTS zone: scroll)"),
-            ("space", "mark/unmark row"),
-            ("t / T", "test row / test marked (all enabled if none)"),
-            ("r / R", "refresh row OAuth token / refresh ALL"),
-            ("f", "re-fetch every catalog (learns CW)"),
-            ("a", "add row  ·  d d: delete marked/cursor (twice = confirm)"),
-            ("e", "disable/enable marked (or cursor) row — routing skips it"),
-            ("p / P", "theme next/prev  ·  v: density  ·  m: motion"),
-            ("Tab", "focus EVENTS panel  ·  g/G: newest/oldest"),
-            ("?", "this help  ·  q: quit (stops the server)"),
-        ]
-        for k, d in rows:
-            t.append(f"\n  {k:<9}", style=f"bold {p['strong']}")
-            t.append(d, style=p["muted"])
-        return t
-
     def toggle_help(self):
-        self.help_open = not self.help_open
-        try:
-            w = self.query_one("#help", Static)
-            w.display = self.help_open
-            if self.help_open:
-                w.update(self.help_text())
-        except Exception:
-            pass
+        """Open the key reference as a modal overlay. No in-app flag is needed:
+        while a ModalScreen is on top it owns key events, so this handler is not
+        reached until the modal has popped itself."""
+        self.app.push_screen(HelpScreen())
 
     # ---------- compose ----------
     def compose(self) -> ComposeResult:
@@ -971,8 +1102,7 @@ class MissionControl(App):
             yield Static(self.compact_mark(), id="wmcompact", classes="wmcompact")
             yield Static(self.termbar_text(), id="mast")
 
-            with Horizontal(classes="box", id="stats"):
-                self._stats_box = True
+            with Horizontal(id="stats"):
                 for i in range(8):
                     with Vertical(classes="stat", id=f"stat{i}"):
                         yield Static(Text(" "), classes="statnum", id=f"statnum{i}")
@@ -1018,19 +1148,19 @@ class MissionControl(App):
             with Vertical(classes="box", id="evbox"):
                 yield Static(Text(""), id="evbody")
             yield Static(Text(""), id="toast")
-            yield Static(Text(""), id="help", classes="box")
 
             foot = Text()
-            keys = [("t", "test"), ("T", "all"), ("space", "mark"),
-                    ("r", "refresh"), ("R", "all"), ("f", "catalog"),
-                    ("e", "off/on"), ("d", "del"), ("a", "add"),
-                    ("p", "theme"), ("v", "dense"), ("m", "motion"),
+            # ONE line, terse: the full reference lives behind `?`. Wrapping the
+            # legend to 3-4 rows is what stole the route table's height.
+            keys = [("t", "test"), ("T", "all"), ("spc", "mark"), ("r", "token"),
+                    ("R", "all"), ("f", "cat"), ("e", "off"), ("d", "del"),
+                    ("a", "add"), ("p", "theme"), ("v", "dens"), ("m", "move"),
                     ("?", "help"), ("q", "quit")]
             for i, (k, lab) in enumerate(keys):
                 if i:
-                    foot.append("  ", style="dim")
+                    foot.append(" ", style="dim")
                 foot.append(k, style="bold")
-                foot.append(" " + lab)
+                foot.append("=" + lab)
             yield Static(foot, id="foot")
 
     # ---------- actions ----------
@@ -1043,10 +1173,7 @@ class MissionControl(App):
     def on_key(self, event):
         k = event.key
         ch = getattr(event, "character", None)
-        if self.help_open and k not in ("?", "question_mark"):
-            self.toggle_help()
-            event.stop()
-            return
+
         if k in ("up",):
             event.stop()
             if self.zone == "events":

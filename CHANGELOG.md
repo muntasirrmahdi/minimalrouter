@@ -12,7 +12,79 @@ OpenAI-compatible request/response shape, the endpoint, or the install command);
 for backward-compatible features (new providers, classes, dashboard capability, CLI verbs);
 **PATCH** for fixes only.
 
-## [1.2.2] — 2026-11-22
+## [1.2.3] — 2026-11-22
+
+### Fixed
+
+- **The board was geometrically broken at every terminal size** (Moon: "nicher
+  dike blank keno eto? Baki shb kichu kothya? ... routes blank and selected er
+  niche ar kichui nei! Pure black blank?!"). `.gauge` is a Textual `Vertical`,
+  whose default height is `1fr`; inside `#selrow { height: auto }` it never
+  resolved, so SELECTED expanded to fill the screen (measured: 40 rows on a
+  42-row terminal). Total content then exceeded the frame, free space went
+  NEGATIVE, and the route table's `1fr` collapsed to its minimum — border only.
+  `rows_visible = 0/21` at every size from 80x24 to 200x60: an empty ROUTES box,
+  a black void under the selected model, and EVENTS / toast / key legend pushed
+  below the bottom edge, clipped and unreachable. The 1.2.0-1.2.2 board shipped
+  in that state because 52 per-widget CONTENT assertions passed while nothing
+  measured the rendered geometry.
+- **Every panel height is pinned and only ROUTES is flexible** (`1fr` +
+  `min-height`), so the route table takes the real slack and can never be
+  starved. No container may use `height: auto` while holding a Vertical child.
+- **Layout tier from the live screen height**, re-evaluated continuously. Bands
+  (measured): micro < 32 rows (1-line wordmark, 1-line numbers, SELECTED kept,
+  EVENTS dropped), compact 32-39, airy >= 40 (4-row wordmark, 3-row pixel stat
+  face, both secondary panels). Previously the board had one fixed shape and
+  simply lost panels on a short terminal.
+- **Tier boundaries are graduated so a taller terminal never shows fewer
+  routes.** The first cut of this fix used a 34-row boundary and produced a real
+  inversion — a 30-row screen showed 4 routes while a 28-row screen showed 12,
+  because the wider band kept both secondary panels. Measured monotonic within
+  every band now.
+- **The key legend is one line** (`t=test T=all spc=mark ...`); it was wrapping
+  to 3-4 rows and stealing the table's height. The full reference is the `?`
+  modal.
+- **POOL became a borderless hero strip** — its 2-row border was costing the
+  route table 9 visible rows on a 42-row terminal. The strip is pinned to exactly
+  number-rows + label-row in every tier (airy 3+1, compact/micro/dense 1+1); no
+  filler rows. Density and tier shrink only the digit face — labels stay BELOW
+  the numbers in every tier, per Moon's layout law.
+- **The tier is self-healing, not event-dependent.** It is re-decided on
+  `on_idle` AND on every 2-second poll, repainting only on change. A one-shot
+  decision in `on_mount` reads a not-yet-laid-out screen height, and `on_idle`
+  can land late: measured flaky at 2-of-3 runs, where a 42-row terminal rendered
+  the compact hero. The board now converges regardless of which event wins.
+
+### Added
+
+- **`?` opens the key reference as a MODAL overlay**, not an in-flow panel. An
+  in-flow 13-row help cannot coexist with a non-scrolling frame — on a 26-row
+  terminal it pushed the key legend below the bottom edge, reintroducing the very
+  defect this release fixes. The modal owns its key events, so any key closes it
+  and no app-level "help is open" guard is needed. Such a guard is actively
+  harmful: the first attempt used one that never cleared, freezing the entire
+  keyboard after the modal closed.
+
+### Notes
+
+- **The frame does not scroll.** `overflow-y: auto` makes a container size to its
+  content, which breaks `fr` resolution (`1fr` stops meaning "share of the
+  viewport"): with it on, EVENTS ballooned to 7 rows on a 24-row screen and sat
+  below the bottom edge. Panels that do not fit DROP OUT instead of being pushed
+  off-screen.
+- SELECTED keeps all four content lines in the airy tier (name / provider ·
+  class · model / endpoint · key / status · latency · ok%). No information was
+  removed to make the layout fit — the panels that were stealing the space got
+  pinned or dropped instead.
+- New permanent CI gate: `TestDashboardGeometry` (10 tests) measures rendered
+  REGIONS, not widget content — the table always has rows, no visible panel is
+  off-screen, SELECTED and the gauges stay pinned, tier bands match the screen
+  height, monotonicity within each band, the help modal never displaces the
+  layout, and keys still work after the modal closes. Sabotage-verified against
+  the 1.2.2 module: 33 composition failures, zero AttributeError, so the gate
+  bites for the right reason.
+
+## [1.2.2] — 2026-11-22## [1.2.2] — 2026-11-22
 
 ### Fixed
 
