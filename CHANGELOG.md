@@ -12,6 +12,77 @@ OpenAI-compatible request/response shape, the endpoint, or the install command);
 for backward-compatible features (new providers, classes, dashboard capability, CLI verbs);
 **PATCH** for fixes only.
 
+## [1.2.0] — 2026-11-21
+
+The Mission Control overhaul. The client contract (one OpenAI-compatible endpoint, the
+one-line install) is unchanged and every addition is backward-compatible — MINOR bump.
+
+### Added
+
+- **Mission Control v1.2 board.** Centered max-width frame (btop-class): hero zone
+  (wordmark, URL bar, stat tiles) dead-center, data table left-flush inside.
+  Wordmark shimmer + mast typewriter; `m` pauses every animation timer.
+- **8 pixel-digit stat tiles** (5x5 block face, labels at 1/4 wordmark height):
+  ROWS, MODELS, SERVING, BLOCKED, REQ/MIN, TOK/S (floor — streamed usage is not
+  parsed), ERR%, UPTIME. Values flash on change.
+- **Traffic ledger in the engine** (`REQLOG` + `note_req`): client requests through
+  `/v1` only — dashboard and boot probes never inflate REQ/MIN or ERR%.
+  `/api/state` now carries `stats`, `probe` progress and `version`.
+- **Route table rebuilt:** `ROW · PROV · CLASS · MODEL · CW · LAT · TPS · OK% · STATUS`.
+  The TREND-only column is gone; PROV derives from the OAuth label or the base host,
+  TPS is a per-row tokens/sec EMA (only when the upstream reports usage), OK% is the
+  last-10-outcomes ratio. Columns drop responsively on narrow terminals.
+- **Richer status vocabulary:** `COOLDOWN` (429), `DEAD` (3+ consecutive failures),
+  `STALE` (unverified-ok for 30+ min), `OFF` (parked). Account gates (403/402)
+  outrank streak death.
+- **Disabled rows.** `e` parks marked/cursor rows (persisted `disabled: true` on file
+  rows, profile-level for OAuth rows); parked rows stay visible on the board but can
+  never serve `/v1` — `enabled_rows()` gates `/v1/models`, `/health` counts and the
+  routing chain. `POST /api/disable {name, disabled?}`.
+- **Context windows (CW).** Resolution chain: per-row `context_length` override >
+  what the upstream's `/v1/models` publishes (learned at boot and by `f`/`POST
+  /api/refetch`) > a curated table of officially documented windows > `-`. The tool
+  never guesses a number.
+- **Background probes.** Every enabled row is probed at boot (bounded concurrency)
+  and re-probed every `MINIMALROUTER_PROBE_INTERVAL` seconds (default 600; 0 = boot
+  only). The board shows `probing n/N` in the mast until the pool warms — no more
+  all-UNKNOWN boot screen. This is the roadmap's "background refresh" item.
+- **Multi-row marks + batch actions.** `space` marks, `T` tests marked (all enabled
+  if none), `e` parks/unparks marked, `d d` deletes with a 4s confirm arm, `R`
+  refreshes every OAuth token, `f` re-fetches every catalog.
+- **In-board add.** `a` opens a modal (base/key/model/name); Enter advances fields;
+  the engine's test-before-save still gates the write.
+- **SELECTED gauges.** Live TPS + CW rendered in the pixel face at half-wordmark
+  height, auto-updating every poll; the model name is highlighted hardest, the
+  provider lighter but still highlighted.
+- **Events, fully.** Every log class (OK/FAIL/TEST/ADD/REMOVE/DISABLE/ENABLE/PROBE/
+  OAUTH-REFRESH/CATALOG/boot) with per-class colors, a 300-line buffer, `Tab` focus +
+  up/down scroll + `g`/`G` jumps.
+- **14 themes** (midnight, ocean, ember, nous, claude, dracula, gruvbox, nord,
+  tokyo, monokai, solarized, onedark, crtgreen, crtamber) — `p`/`P` cycle; the
+  claude board is the warm-cream light theme. `dashboard.json` persists
+  theme/density/motion.
+- **Help overlay** (`?`) and boxed btop-class zones with titled borders.
+
+### Changed
+
+- `/health` and `/api/state` response shapes (additive fields only: `disabled`,
+  `serving`, `blocked`, `stats`, `probe`, `version`, per-row `provider`/`cw`/
+  `disabled`/`ok_pct`).
+
+### Fixed
+
+- **Self-referential base guard.** A row whose base resolves to the router's own
+  listener made the router call itself in unbounded recursion (found live: a port
+  collision with the freebuff bridge sidecar produced 18 nested `all rows failed`
+  envelopes and flooded the traffic ledger). `_is_self_base` now refuses at the
+  `upstream()` choke point before any socket opens — honest error, no recursion,
+  and `/api/add` cannot save such a row (its probe fails first).
+- **Flat latency history** renders a steady mid-line sparkline (`▄▄▄`) instead of a
+  bottom bleed, in both the engine helper and the board.
+- **The mast refreshes on every poll.** With motion off it previously froze at the
+  pre-boot render (no version, no live dot).
+
 ## [1.1.0] — 2026-11-20
 
 Everything since the 1.0.0 baseline. The client contract (one OpenAI-compatible endpoint,

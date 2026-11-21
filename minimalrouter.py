@@ -26,7 +26,7 @@ Home:   ~/.minimalrouter/
           oauth-providers.json        OAuth provider profiles (user-authored)
           oauth.json                  OAuth tokens, chmod 600
           minimalrouter.log           request log
-Rows:   [{name, base, model, key_env|key, aliases?}]
+Rows:   [{name, base, model, key_env|key, aliases?, disabled?, context_length?}]
 Keys:   key_env rows resolve from ~/.hermes/.env at runtime.
 
 OAuth profiles are generic: authorize_url, token_url, optional refresh_url,
@@ -41,9 +41,17 @@ HTTP API:
   GET  /api/oauth/providers   configured OAuth profiles
   GET  /api/oauth/status      per-profile connected state
   POST /api/test              {base, key, model} -> probe result (no save)
-  POST /api/fetch_models      {base, key} -> upstream model ids
+  POST /api/fetch_models      {base, key} -> upstream model ids (+ learns context windows)
   POST /api/add               {base, key, model, name?} -> test, then save
   POST /api/remove            {name} -> drop row
+  POST /api/disable           {name, disabled?} -> park/restore a row (routing skips it)
+  POST /api/refetch           re-read every enabled base's /v1/models (learns CW)
+
+Rows may carry `disabled: true` (file rows) or their OAuth profile may; disabled
+rows stay visible on the dashboard but never serve /v1. GET /api/state carries
+per-row cw/tps/ok_pct + pool stats (req/min, tokens/s floor, err%, uptime) +
+probe progress. Enabled rows are probed at boot and every
+MINIMALROUTER_PROBE_INTERVAL seconds (default 600; 0 = boot probe only).
 """
 import json
 import os
@@ -55,6 +63,7 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Lock, Thread
+from concurrent.futures import ThreadPoolExecutor
 
 try:  # single guarded import: every UI helper resolves curses from here
     import curses
@@ -65,7 +74,7 @@ except ImportError:  # platform without curses -> main() degrades to serve
 # CHANGELOG and the git tag all derive from this one line. MAJOR.MINOR.PATCH per
 # semver.org: MAJOR on a breaking client contract, MINOR on backward-compatible
 # features, PATCH on fixes.
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 HOME = os.path.expanduser("~")
 MR_HOME = os.path.join(HOME, ".minimalrouter")
@@ -83,6 +92,43 @@ ROW_LOCK = Lock()
 ROW_STATE = {}
 # Three connection classes. Class is always DERIVED from row shape, never from a label.
 VALID_CLASSES = ("api", "oauth", "keyless")
+
+# Client-traffic ledger for pool stats: (ts, ok, completion_tokens, ms). Requests
+# through /v1 ONLY — dashboard/boot probes never inflate REQ/MIN or ERR%.
+STAT_LOCK = Lock()
+REQLOG = []
+REQLOG_MAX = 1000
+REQ_WIN = 60          # seconds — REQ/MIN and TOK/S window
+ERR_WIN = 100         # requests — ERR% rolling window
+BOOT_TIME = time.time()
+STALE_AFTER = 1800    # an ok row with no state update for 30 min reads STALE
+FAIL_STREAK_DEAD = 3  # consecutive failures before a row reads DEAD
+RECENT_MAX = 10       # per-row recent outcomes kept for OK%
+PROBE_INTERVAL = max(0, int(os.environ.get("MINIMALROUTER_PROBE_INTERVAL", "600")))
+PROBE_LOCK = Lock()
+PROBE_PROGRESS = {"done": 0, "total": 0, "active": False}
+PROBE_WORKERS = 4
+
+# Context windows (tokens). Curated seeds hold ONLY officially documented models;
+# everything else is learned at runtime from upstream /models (RUNTIME_CW) or
+# overridden per row via `context_length`. Unknown renders as '-' everywhere —
+# this table is never a place to guess.
+MODEL_CW = {
+    "gpt-oss-20b": 131072, "gpt-oss-120b": 131072,
+    "openai/gpt-oss-20b": 131072, "openai/gpt-oss-120b": 131072,
+    "llama-3.1-8b-instruct": 128000, "llama-3.1-70b-instruct": 128000,
+    "llama-3.2-1b-instruct": 128000, "llama-3.2-3b-instruct": 128000,
+    "meta-llama/llama-3.1-8b-instruct": 128000,
+    "meta-llama/llama-3.1-70b-instruct": 128000,
+    "mistral-small-latest": 32768, "mistral-large-latest": 128000,
+    "ministral-3b-latest": 128000, "ministral-8b-latest": 128000,
+    "deepseek-chat": 128000, "deepseek-reasoner": 128000,
+    "gpt-4o": 128000, "gpt-4o-mini": 128000,
+    "claude-sonnet-4-5": 200000, "claude-opus-4-1": 200000,
+}
+RUNTIME_CW = {}
+CW_KEYS = ("context_length", "context_window", "context_window_size",
+           "max_input_tokens")
 
 # Translator constants (data-driven: endpoints live in oauth-providers.json / registry).
 OMNIRUSH_GATEWAY_DEFAULT = "https://omnirush.ai/omnirush/v1"
@@ -405,6 +451,7 @@ def oauth_rows():
     auth = read_oauth()
     for provider, spec in read_oauth_profiles().items():
         token = oauth_access_token(provider)
+        dis = bool(spec.get("disabled"))
         for model in spec.get("models", []):
             if isinstance(model, str):
                 model, aliases = model, []
@@ -420,12 +467,19 @@ def oauth_rows():
                          "gateway_url": (auth.get(provider) or {}).get("gateway_url", ""),
                          "chat_path": spec.get("chat_path", ""),
                          "org_id": (auth.get(provider) or {}).get("org_id", ""),
-                         "oauth_label": spec.get("label", provider)})
+                         "oauth_label": spec.get("label", provider),
+                         "disabled": dis})
     return rows
 
 
 def all_rows():
+    """Every row including disabled ones — the dashboard/state surface. Routing
+    uses enabled_rows(); a disabled row can never serve a client request."""
     return read_rows() + oauth_rows()
+
+
+def enabled_rows():
+    return [r for r in all_rows() if not r.get("disabled")]
 
 
 def write_rows(rows):
@@ -441,6 +495,23 @@ def write_rows(rows):
         pass
 
 
+def _is_self_base(base):
+    """True when a row's base resolves to THIS router's own listener.
+
+    A self-referential row makes the router call itself in an unbounded
+    recursion (freebuff bridge port collision, 2026-11-21: 18 nested
+    'all rows failed' envelopes, thread pile-up, traffic ledger flooded).
+    Reject at the choke point, before any socket is opened."""
+    try:
+        u = urllib.parse.urlparse(str(base))
+        host = (u.hostname or "").lower()
+        port = u.port or (443 if u.scheme == "https" else 80)
+        return (host in ("127.0.0.1", "localhost", "::1", HOST.lower())
+                and port == PORT)
+    except Exception:
+        return False
+
+
 def ep(base, path):
     """Join base+path without doubling a version suffix (/v1)."""
     b = base.rstrip("/")
@@ -451,6 +522,9 @@ def ep(base, path):
 
 def upstream(base, key, path, payload=None, timeout=TIMEOUT, row=None):
     # Per-profile behavior only; no provider is known by name.
+    if _is_self_base(base):
+        raise ValueError("self-referential base %s (this router listens on %s:%d)"
+                         % (base, HOST, PORT))
     row = row or {}
     provider = row.get("oauth_provider", "")
     api_mode = row.get("api_mode", "chat_completions")
@@ -881,6 +955,8 @@ def probe(base, key, model, row=None):
 
 
 def fetch_models(base, key):
+    """Upstream model ids; also LEARNS context windows when the upstream
+    publishes them (context_length / context_window / max_input_tokens)."""
     resp = upstream(base, key, "/v1/models", timeout=PROBE_TIMEOUT)
     body = json.loads(resp.read() or b"{}")
     data = body.get("data", body if isinstance(body, list) else [])
@@ -889,7 +965,31 @@ def fetch_models(base, key):
         i = m.get("id") if isinstance(m, dict) else m
         if i and i not in ids:
             ids.append(i)
+        if isinstance(m, dict) and i:
+            for k in CW_KEYS:
+                v = m.get(k)
+                if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0:
+                    RUNTIME_CW[i] = int(v)
+                    RUNTIME_CW[str(i).lower()] = int(v)
+                    break
     return ids
+
+
+def resolve_cw(row):
+    """Context window in tokens: per-row override > learned upstream > curated
+    table > None. None renders as '-' everywhere; nothing is ever guessed."""
+    v = row.get("context_length")
+    if v:
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            pass
+    m = str(row.get("model", ""))
+    for key in (m, m.lower()):
+        cw = RUNTIME_CW.get(key) or MODEL_CW.get(key)
+        if cw:
+            return int(cw)
+    return None
 
 
 def BY_MODEL(rows):
@@ -924,16 +1024,34 @@ def class_label(cls):
     return {"api": "API", "oauth": "OAUTH", "keyless": "KEYLESS"}.get(cls, "?")
 
 
+def provider_of(row):
+    """Short provider tag for the board: OAuth label, else the base URL host."""
+    lab = row.get("oauth_label") or ""
+    if lab:
+        return lab
+    try:
+        return str(row.get("base", "")).split("//")[-1].split("/")[0] or "?"
+    except Exception:
+        return "?"
+
+
 def state_for(rows):
     out = []
     for r in rows:
         st = dict(ROW_STATE.get(r["name"], {"status": "unknown"}))
         cls = row_class(r)
+        recent = st.get("recent", [])
         out.append({"name": r["name"], "model": r["model"], "base": r["base"],
                     "class": cls, "oauth_provider": r.get("oauth_provider", ""),
+                    "provider": provider_of(r),
+                    "disabled": bool(r.get("disabled")),
+                    "cw": resolve_cw(r),
                     "key_src": ("env:" + r["key_env"]) if r.get("key_env")
                     else ("pasted" if r.get("key") else "none"),
-                    "aliases": r.get("aliases", []), "state": st})
+                    "aliases": r.get("aliases", []),
+                    "ok_pct": (int(round(100.0 * sum(recent) / len(recent)))
+                               if recent else None),
+                    "state": st})
     return out
 
 
@@ -943,53 +1061,162 @@ SPARK_BLOCKS = "▁▂▃▄▅▆▇█"
 SPARK_ASCII = "._-~=+*#"
 
 
-def classify_status(state):
-    """Live state -> display status: ok/gated/empty/error/unknown (pure)."""
+def classify_status(state, now=None):
+    """Live state -> display status (pure). Priority: account gates first
+    (403/402 are states, not flapping), then streak death, then rate-limit
+    cooldown, then staleness of an unverified-ok row, then plain error."""
     st = (state or {}).get("status", "unknown")
+    now = now if now is not None else time.time()
     if st == "ok":
+        at = float((state or {}).get("at") or 0)
+        if at and now - at > STALE_AFTER:
+            return "stale"
         return "ok"
     if st != "fail":
         return "unknown"
-    m = re.search(r"HTTP Error (\d{3})", str((state or {}).get("error", "")))
+    err = str((state or {}).get("error", ""))
+    m = re.search(r"HTTP Error (\d{3})", err)
     code = m.group(1) if m else ""
     if code == "403":
         return "gated"
     if code == "402":
         return "empty"
+    if int((state or {}).get("fail_streak", 0) or 0) >= FAIL_STREAK_DEAD:
+        return "dead"
+    if code == "429":
+        return "cooldown"
     return "error"
 
 
 def spark_chars(hist, width=5):
-    """Latency history -> block sparkline, <= width chars (pure)."""
+    """Latency history -> block sparkline, <= width chars (pure).
+    Flat history = steady mid line (▄), not a bottom bleed."""
     if not hist:
         return ""
     vals = hist[-width:]
     lo, hi = min(vals), max(vals)
-    span = (hi - lo) or 1
+    if hi == lo:
+        return "▄" * len(vals)
+    span = hi - lo
     return "".join(SPARK_BLOCKS[int((v - lo) / span * (len(SPARK_BLOCKS) - 1))]
                    for v in vals)
 
 
-def record_state(name, status, ms, at=None, error=""):
-    """Single write path for per-row live state + bounded latency history.
+def record_state(name, status, ms, at=None, error="", tokens=0):
+    """Single write path for per-row live state.
 
     hist is a JSON-safe list (NOT a deque) so /api/state can serialize it.
+    fail_streak: consecutive failures (DEAD at >= FAIL_STREAK_DEAD).
+    recent: last RECENT_MAX outcomes (1/0) for OK%.
+    tps: EMA of completion-tokens/sec, only when the upstream reported usage.
     """
-    hist = list(ROW_STATE.get(name, {}).get("hist", []))
+    prev = ROW_STATE.get(name, {})
+    hist = list(prev.get("hist", []))
     if ms is not None:
         hist.append(int(ms))
         hist = hist[-HIST_MAX:]
+    streak = int(prev.get("fail_streak", 0) or 0)
+    if status == "fail":
+        streak += 1
+    elif status == "ok":
+        streak = 0
+    recent = list(prev.get("recent", []))
+    recent.append(1 if status == "ok" else 0)
+    recent = recent[-RECENT_MAX:]
+    tps = float(prev.get("tps", 0.0) or 0.0)
+    if tokens and ms:
+        inst = float(tokens) / (ms / 1000.0)
+        tps = inst if tps <= 0 else tps * 0.7 + inst * 0.3
     ROW_STATE[name] = {"status": status, "ms": ms,
                        "at": at if at is not None else time.time(),
-                       "error": error, "hist": hist}
+                       "error": error, "hist": hist,
+                       "fail_streak": streak, "recent": recent,
+                       "tps": round(tps, 1)}
 
 
-def pool_stats(rows):
-    """Stat-strip counts from live row state (pure). models comes from /api/state."""
-    cls = [classify_status(r.get("state", {})) for r in rows]
+def note_req(ok, tokens=0, ms=0):
+    """Append one CLIENT request (through /v1) to the traffic ledger, bounded.
+    Dashboard probes never enter this ledger — REQ/MIN and ERR% measure real
+    consumer traffic, not self-tests."""
+    with STAT_LOCK:
+        REQLOG.append((time.time(), bool(ok), int(tokens or 0), int(ms or 0)))
+        if len(REQLOG) > REQLOG_MAX:
+            del REQLOG[:len(REQLOG) - REQLOG_MAX]
+
+
+def pool_stats(rows, now=None):
+    """Stat-strip counts from live row state + the client traffic ledger."""
+    now = now if now is not None else time.time()
+    cls = [classify_status(r.get("state", {}), now) for r in rows]
+    with STAT_LOCK:
+        win = [e for e in REQLOG if now - e[0] <= REQ_WIN]
+        req_min = len(win)
+        tok_s = sum(e[2] for e in win) / float(REQ_WIN)
+        tail = REQLOG[-ERR_WIN:]
+    errs = sum(1 for e in tail if not e[1])
     return {"rows": len(rows),
+            "disabled": sum(1 for r in rows if r.get("disabled")),
             "serving": cls.count("ok"),
-            "blocked": cls.count("gated") + cls.count("empty")}
+            "blocked": cls.count("gated") + cls.count("empty"),
+            "cooldown": cls.count("cooldown"),
+            "dead": cls.count("dead"),
+            "stale": cls.count("stale"),
+            "req_min": req_min,
+            "tok_s": round(tok_s, 1),
+            "err_pct": int(round(100.0 * errs / len(tail))) if tail else 0,
+            "uptime": int(now - BOOT_TIME)}
+
+
+def probe_row(r):
+    """Probe one configured row with its own credential; records state + log."""
+    ok, ms, err, content = probe(r["base"], r.get("key", ""), r["model"], row=r)
+    record_state(r["name"], "ok" if ok else "fail", ms,
+                 error="" if ok else str(err)[:200])
+    log("%s %s via %s %.1fs%s" % ("OK " if ok else "FAIL", r["model"], r["name"],
+                                  ms / 1000.0,
+                                  "" if ok else ": %s" % str(err)[:120]))
+    return ok, ms, err
+
+
+def probe_all(reason="boot"):
+    """Probe every enabled row with bounded concurrency (ThreadPoolExecutor)."""
+    try:
+        rows = [r for r in enabled_rows() if not r.get("disabled")]
+    except Exception:
+        rows = []
+    if not rows:
+        return
+    with PROBE_LOCK:
+        PROBE_PROGRESS.update(done=0, total=len(rows), active=True)
+    log("PROBE all (%s) start: %d rows" % (reason, len(rows)))
+
+    def one(r):
+        try:
+            probe_row(r)
+        except Exception as e:
+            log("PROBE %s error: %s" % (r.get("name", "?"), e))
+        finally:
+            with PROBE_LOCK:
+                PROBE_PROGRESS["done"] += 1
+
+    try:
+        with ThreadPoolExecutor(max_workers=PROBE_WORKERS) as ex:
+            list(ex.map(one, rows))
+    except Exception as e:
+        log("PROBE pool error: %s" % e)
+    with PROBE_LOCK:
+        ok_n = sum(1 for r in rows
+                   if ROW_STATE.get(r["name"], {}).get("status") == "ok")
+        PROBE_PROGRESS.update(active=False, done=0, total=0)
+    log("PROBE all (%s) done: %d/%d ok" % (reason, ok_n, len(rows)))
+
+
+def _probe_loop():
+    time.sleep(2)  # let the socket bind and the dashboard mount first
+    probe_all("boot")
+    while PROBE_INTERVAL > 0:
+        time.sleep(PROBE_INTERVAL)
+        probe_all("cycle")
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1042,17 +1269,30 @@ class Handler(BaseHTTPRequestHandler):
             for r in rows:
                 c = row_class(r)
                 by_class[c] = by_class.get(c, 0) + 1
-            return self._send(200, {"ok": True, "rows": len(rows),
-                                    "models": len(BY_MODEL(rows)),
+            # pool_stats classifies each row's LIVE state — it must receive the
+            # state_for projection; raw rows carry no "state" and every count
+            # would silently read zero (found by the v1.2.0 live battery).
+            st = pool_stats(state_for(rows))
+            return self._send(200, {"ok": True, "rows": st["rows"],
+                                    "disabled": st["disabled"],
+                                    "models": len(BY_MODEL(enabled_rows())),
                                     "classes": by_class,
+                                    "serving": st["serving"],
+                                    "blocked": st["blocked"],
                                     "port": PORT})
         if p == "/api/state":
             rows = all_rows()
-            return self._send(200, {"rows": state_for(rows),
-                                    "models": len(BY_MODEL(rows)),
+            with PROBE_LOCK:
+                prog = dict(PROBE_PROGRESS)
+            proj = state_for(rows)
+            return self._send(200, {"rows": proj,
+                                    "models": len(BY_MODEL(enabled_rows())),
+                                    "stats": pool_stats(proj),
+                                    "probe": prog,
+                                    "version": __version__,
                                     "port": PORT})
         if p in ("/v1/models", "/models"):
-            bm = BY_MODEL(all_rows())
+            bm = BY_MODEL(enabled_rows())
             return self._send(200, {"object": "list", "data": [
                 {"id": i, "object": "model", "owned_by": "minimalrouter"}
                 for i in sorted(bm)]})
@@ -1160,8 +1400,59 @@ class Handler(BaseHTTPRequestHandler):
             log("REMOVE %s" % name)
             return self._send(200, {"ok": True})
 
+        if p == "/api/disable":
+            name = body.get("name", "")
+            flag = bool(body.get("disabled", True))
+            with ROW_LOCK:
+                rows = read_rows()
+                for r in rows:
+                    if r["name"] == name:
+                        if flag:
+                            r["disabled"] = True
+                        else:
+                            r.pop("disabled", None)
+                        write_rows(rows)
+                        log("%s %s" % ("DISABLE" if flag else "ENABLE", name))
+                        return self._send(200, {"ok": True, "name": name,
+                                                 "disabled": flag})
+                prov = None
+                for r in oauth_rows():
+                    if r["name"] == name:
+                        prov = r.get("oauth_provider") or None
+                        break
+                if prov:
+                    profiles = read_oauth_profiles()
+                    spec = profiles.get(prov)
+                    if spec is not None:
+                        if flag:
+                            spec["disabled"] = True
+                        else:
+                            spec.pop("disabled", None)
+                        write_oauth_profiles(profiles)
+                        log("%s profile %s" % ("DISABLE" if flag else "ENABLE", prov))
+                        return self._send(200, {"ok": True, "name": name,
+                                                 "disabled": flag, "profile": prov})
+            return self._send(404, {"error": "no such row"})
+
+        if p == "/api/refetch":
+            bases = {}
+            for r in enabled_rows():
+                b = r["base"].rstrip("/")
+                if b not in bases:
+                    bases[b] = r.get("key", "")
+            n_ids = 0
+            for b, k in bases.items():
+                try:
+                    n_ids += len(fetch_models(b, k))
+                except Exception as e:
+                    log("CATALOG %s failed: %s" % (b, e))
+            log("CATALOG refetch %d bases, %d ids, %d context windows known"
+                % (len(bases), n_ids, len(RUNTIME_CW)))
+            return self._send(200, {"ok": True, "bases": len(bases),
+                                    "ids": n_ids, "cw": len(RUNTIME_CW)})
+
         if p in ("/v1/chat/completions", "/chat/completions"):
-            bm = BY_MODEL(all_rows())
+            bm = BY_MODEL(enabled_rows())
             model = body.get("model", "")
             stream = bool(body.get("stream", False))
             chain = bm.get(model)
@@ -1174,8 +1465,12 @@ class Handler(BaseHTTPRequestHandler):
                 t0 = time.time()
                 try:
                     if row.get("api_mode") == "omnirush":
-                        chat = chat_from_omnirush(row, dict(body, stream=False))["text"]
-                        record_state(row["name"], "ok", (time.time() - t0) * 1000)
+                        oc = chat_from_omnirush(row, dict(body, stream=False))
+                        chat = oc["text"]
+                        oms = (time.time() - t0) * 1000
+                        oct = int(((oc.get("usage") or {}).get("completion_tokens")) or 0)
+                        record_state(row["name"], "ok", oms, tokens=oct)
+                        note_req(True, oct, oms)
                         if stream:
                             chunk = {"id": "chatcmpl-omnirush",
                                      "object": "chat.completion.chunk",
@@ -1207,7 +1502,10 @@ class Handler(BaseHTTPRequestHandler):
                     if row.get("api_mode") == "zcode":
                         zc = chat_from_zcode(row, dict(body, stream=False))
                         chat = zc["text"]
-                        record_state(row["name"], "ok", (time.time() - t0) * 1000)
+                        zms = (time.time() - t0) * 1000
+                        # zcode's bridge reports no usage — tokens 0 is the honest floor.
+                        record_state(row["name"], "ok", zms)
+                        note_req(True, 0, zms)
                         if stream:
                             chunk = {"id": "chatcmpl-zcode",
                                      "object": "chat.completion.chunk",
@@ -1238,7 +1536,9 @@ class Handler(BaseHTTPRequestHandler):
                         return
                     if row.get("api_mode") == "responses":
                         chat = chat_from_responses(row, body)
-                        record_state(row["name"], "ok", (time.time() - t0) * 1000)
+                        rms = (time.time() - t0) * 1000
+                        record_state(row["name"], "ok", rms)
+                        note_req(True, 0, rms)
                         if stream:
                             chunk = {"id": "chatcmpl-responses",
                                      "object": "chat.completion.chunk",
@@ -1285,12 +1585,22 @@ class Handler(BaseHTTPRequestHandler):
                         except (BrokenPipeError, ConnectionResetError):
                             log("stream client disconnected mid-row %s"
                                 % row["name"])
-                        record_state(row["name"], "ok", (time.time() - t0) * 1000)
+                        sms = (time.time() - t0) * 1000
+                        record_state(row["name"], "ok", sms)
+                        note_req(True, 0, sms)  # streamed usage not parsed — floor
                         log("OK  %s via %s stream %.1fs"
                             % (model, row["name"], time.time() - t0))
                     else:
                         data = resp.read()
-                        record_state(row["name"], "ok", (time.time() - t0) * 1000)
+                        nms = (time.time() - t0) * 1000
+                        nct = 0
+                        try:
+                            nct = int((json.loads(data).get("usage", {}) or {}).get(
+                                "completion_tokens") or 0)
+                        except Exception:
+                            pass
+                        record_state(row["name"], "ok", nms, tokens=nct)
+                        note_req(True, nct, nms)
                         self._send(200, raw=data)
                         log("OK  %s via %s %.1fs"
                             % (model, row["name"], time.time() - t0))
@@ -1305,8 +1615,9 @@ class Handler(BaseHTTPRequestHandler):
                         except Exception:
                             pass
                     last_err = "%s: %s" % (row["name"], detail)
-                    record_state(row["name"], "fail", (time.time() - t0) * 1000,
-                                 error=detail[:200])
+                    fms = (time.time() - t0) * 1000
+                    record_state(row["name"], "fail", fms, error=detail[:200])
+                    note_req(False, 0, fms)
                     log("FAIL %s via %s: %s (%.1fs) -> next"
                         % (model, row["name"], detail, time.time() - t0))
             return self._send(502, {"error": "all rows failed for '%s'"
@@ -2122,6 +2433,7 @@ Usage:
   minimalrouter -v           show version
 
 Endpoint: http://127.0.0.1:%d/v1     (env MINIMALROUTER_PORT overrides the port)
+Env:   MINIMALROUTER_PROBE_INTERVAL=seconds (default 600; 0 = boot probe only)
 No server authentication. Localhost only. Three connection classes, one engine path:
   API     - a key or key_env in rows.json (dashboard: press a, paste URL + key).
   OAUTH   - a device-flow profile: `oauth add` then `oauth <id>`.
@@ -2131,11 +2443,22 @@ The dashboard and GET /api/state show the class of every row. Client format is O
 Completions.
 
 Dashboard: the installer bundles the Mission Control board (Textual, in a dedicated
-venv) so it works out of the box -- p cycle theme, v density. If that setup is not
-possible it falls back to the built-in curses board. Force a mode with
-MINIMALROUTER_TUI=textual|curses (default auto). The router engine needs no deps.
+venv) so it works out of the box. If that setup is not possible it falls back to
+the built-in curses board. Force a mode with MINIMALROUTER_TUI=textual|curses
+(default auto). The router engine needs no deps.
 
-Dashboard keys (curses):
+Mission Control keys:
+  up/down  move cursor       space  mark/unmark a row
+  t        test row          T      test marked rows (all enabled if none marked)
+  r        refresh row token R      refresh ALL OAuth tokens
+  f        re-fetch catalogs (learns model ids + context windows)
+  a        add a row         d      delete marked/cursor row (press twice = confirm)
+  e        disable/enable marked/cursor row (routing skips disabled rows)
+  p / P    theme next/prev   v      density     m  motion on/off
+  Tab      focus the EVENTS panel (up/down scroll it, g/G jump)
+  ?        help overlay      q      quit (stops the server)
+
+Curses fallback keys:
   up/down  select row     t  re-test row      a  add a row
   d        delete row     r  refresh          q  quit (stops the server)
   Esc      cancel a prompt
@@ -2146,7 +2469,8 @@ pick a model from the fetched list; the row is saved only if the test passes.
 Add an OAuth provider: `minimalrouter oauth add`, then `minimalrouter oauth <id>`.
 
 Files:
-  ~/.minimalrouter/rows.json           rows: {name, base, model, key_env|key}
+  ~/.minimalrouter/rows.json           rows: {name, base, model, key_env|key,
+                                              aliases?, disabled?, context_length?}
   ~/.minimalrouter/oauth-providers.json optional generic device-flow profiles
   ~/.minimalrouter/oauth.json           local OAuth tokens (chmod 600)
   ~/.minimalrouter/minimalrouter.log   per-request OK/FAIL log
@@ -2436,6 +2760,7 @@ def main():
         return 1
     log("MinimalRouter starting on %s:%d mode=%s" % (HOST, PORT, mode))
     write_pidfile()
+    Thread(target=_probe_loop, daemon=True).start()
     if mode == "serve":
         print("MinimalRouter serving on http://%s:%d/v1  (dashboard: "
               "run `minimalrouter`)" % (HOST, PORT))

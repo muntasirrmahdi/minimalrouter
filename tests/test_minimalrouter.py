@@ -371,6 +371,7 @@ class TestSparkChars(unittest.TestCase):
 
     def test_flat_history(self):
         self.assertEqual(len(mr.spark_chars([5, 5, 5])), 3)  # no div-by-zero
+        self.assertEqual(mr.spark_chars([5, 5, 5]), "▄▄▄")  # steady mid, not bleed
 
     def test_monotonic_uses_full_range(self):
         s = mr.spark_chars([1, 10])
@@ -488,3 +489,368 @@ class TestVersion(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+# ---- v1.2.0 regression tests (Mission Control overhaul) ----
+
+class TestClassifyV12(unittest.TestCase):
+    """Richer STATUS vocabulary: cooldown (429), dead (streak), stale (old ok)."""
+
+    def test_cooldown_429_single_fail(self):
+        self.assertEqual(mr.classify_status(
+            {"status": "fail", "error": "HTTP Error 429: Too Many Requests",
+             "fail_streak": 1}), "cooldown")
+
+    def test_dead_after_streak(self):
+        self.assertEqual(mr.classify_status(
+            {"status": "fail", "error": "HTTP Error 530: x",
+             "fail_streak": mr.FAIL_STREAK_DEAD}), "dead")
+
+    def test_gated_outranks_dead(self):
+        # 403 is an account state, not flapping — priority over streak death.
+        self.assertEqual(mr.classify_status(
+            {"status": "fail", "error": "HTTP Error 403: Forbidden",
+             "fail_streak": 9}), "gated")
+
+    def test_429_streak_is_dead(self):
+        self.assertEqual(mr.classify_status(
+            {"status": "fail", "error": "HTTP Error 429: x",
+             "fail_streak": 5}), "dead")
+
+    def test_stale_old_ok_row(self):
+        now = time.time()
+        self.assertEqual(mr.classify_status(
+            {"status": "ok", "at": now - mr.STALE_AFTER - 1}, now), "stale")
+        self.assertEqual(mr.classify_status(
+            {"status": "ok", "at": now - 60}, now), "ok")
+
+    def test_ok_without_at_is_ok(self):
+        self.assertEqual(mr.classify_status({"status": "ok"}), "ok")
+
+
+class TestRecordStateV12(unittest.TestCase):
+    def setUp(self):
+        self._saved = dict(mr.ROW_STATE)
+        mr.ROW_STATE.clear()
+
+    def tearDown(self):
+        mr.ROW_STATE.clear()
+        mr.ROW_STATE.update(self._saved)
+
+    def test_fail_streak_increments_and_resets(self):
+        mr.record_state("r", "fail", 10, error="HTTP Error 500: x")
+        mr.record_state("r", "fail", 10, error="HTTP Error 500: x")
+        self.assertEqual(mr.ROW_STATE["r"]["fail_streak"], 2)
+        mr.record_state("r", "ok", 10)
+        self.assertEqual(mr.ROW_STATE["r"]["fail_streak"], 0)
+
+    def test_recent_bounded_for_ok_pct(self):
+        for i in range(25):
+            mr.record_state("r", "ok" if i % 2 else "fail", 10,
+                            error="" if i % 2 else "HTTP Error 500: x")
+        recent = mr.ROW_STATE["r"]["recent"]
+        self.assertEqual(len(recent), mr.RECENT_MAX)
+        self.assertEqual(sum(recent), 5)
+
+    def test_tps_ema_only_with_usage(self):
+        mr.record_state("r", "ok", 1000, tokens=100)   # 100 tok/s
+        self.assertAlmostEqual(mr.ROW_STATE["r"]["tps"], 100.0, places=1)
+        mr.record_state("r", "ok", 1000, tokens=200)   # 200 tok/s -> EMA 0.7/0.3
+        self.assertAlmostEqual(mr.ROW_STATE["r"]["tps"], 130.0, places=1)
+        mr.record_state("r", "ok", 1000)               # no usage -> tps held
+        self.assertAlmostEqual(mr.ROW_STATE["r"]["tps"], 130.0, places=1)
+
+
+class TestNoteReqAndPoolStatsV12(unittest.TestCase):
+    def setUp(self):
+        self._saved_log = list(mr.REQLOG)
+        self._saved_boot = mr.BOOT_TIME
+        mr.REQLOG.clear()
+
+    def tearDown(self):
+        mr.REQLOG.clear()
+        mr.REQLOG.extend(self._saved_log)
+        mr.BOOT_TIME = self._saved_boot
+
+    def test_req_window_and_err_pct(self):
+        now = time.time()
+        mr.BOOT_TIME = now - 3600
+        rows = [{"state": {"status": "ok", "at": now}},
+                {"state": {"status": "fail", "error": "HTTP Error 402: x"},
+                 "disabled": True}]
+        # 3 requests inside the 60s window (1 failed), 1 outside.
+        with mr.STAT_LOCK:
+            mr.REQLOG.extend([(now - 10, True, 120, 900),
+                              (now - 5, True, 60, 500),
+                              (now - 2, False, 0, 100),
+                              (now - 120, True, 999, 800)])
+        s = mr.pool_stats(rows, now)
+        self.assertEqual(s["req_min"], 3)
+        self.assertEqual(s["tok_s"], round((120 + 60 + 0) / 60.0, 1))
+        self.assertEqual(s["err_pct"], 25)  # 1 of the last 100 requests (4 logged)
+        self.assertEqual(s["rows"], 2)
+        self.assertEqual(s["disabled"], 1)
+        self.assertEqual(s["blocked"], 1)
+        self.assertEqual(s["uptime"], 3600)
+
+    def test_note_req_bounded(self):
+        for i in range(mr.REQLOG_MAX + 50):
+            mr.note_req(True, 1, 1)
+        self.assertEqual(len(mr.REQLOG), mr.REQLOG_MAX)
+
+
+class TestResolveCw(unittest.TestCase):
+    def setUp(self):
+        self._saved_rt = dict(mr.RUNTIME_CW)
+
+    def tearDown(self):
+        mr.RUNTIME_CW.clear()
+        mr.RUNTIME_CW.update(self._saved_rt)
+
+    def test_override_wins(self):
+        mr.RUNTIME_CW["m"] = 64000
+        self.assertEqual(mr.resolve_cw({"model": "m", "context_length": 32000}),
+                         32000)
+
+    def test_runtime_beats_curated(self):
+        mr.RUNTIME_CW["gpt-oss-20b"] = 999
+        self.assertEqual(mr.resolve_cw({"model": "gpt-oss-20b"}), 999)
+
+    def test_curated_fallback_case_insensitive(self):
+        self.assertEqual(mr.resolve_cw({"model": "GPT-OSS-20B"}), 131072)
+
+    def test_unknown_is_none_never_guessed(self):
+        self.assertIsNone(mr.resolve_cw({"model": "totally-unknown-model-xyz"}))
+
+
+class TestFetchModelsCw(unittest.TestCase):
+    def setUp(self):
+        self._saved_rt = dict(mr.RUNTIME_CW)
+
+    def tearDown(self):
+        mr.RUNTIME_CW.clear()
+        mr.RUNTIME_CW.update(self._saved_rt)
+
+    def test_context_length_learned(self):
+        import io as _io
+        body = {"data": [{"id": "foo-x", "context_length": 262144},
+                         {"id": "bar-y", "max_input_tokens": 8192},
+                         {"id": "baz-z"}]}
+
+        class FakeResp:
+            def read(self, *a):
+                return json.dumps(body).encode()
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+
+        old = mr.upstream
+        mr.upstream = lambda base, key, path, payload=None, timeout=0, row=None: FakeResp()
+        try:
+            ids = mr.fetch_models("https://x/v1", "K")
+        finally:
+            mr.upstream = old
+        self.assertEqual(ids, ["foo-x", "bar-y", "baz-z"])
+        self.assertEqual(mr.RUNTIME_CW["foo-x"], 262144)
+        self.assertEqual(mr.RUNTIME_CW["bar-y"], 8192)
+        self.assertNotIn("baz-z", mr.RUNTIME_CW)
+
+
+class TestDisabledRouting(unittest.TestCase):
+    def test_enabled_rows_excludes_disabled(self):
+        old = mr.all_rows
+        mr.all_rows = lambda: [
+            {"name": "a", "base": "https://a/v1", "model": "m1", "key": "K"},
+            {"name": "b", "base": "https://b/v1", "model": "m2", "key": "K",
+             "disabled": True},
+        ]
+        try:
+            names = [r["name"] for r in mr.enabled_rows()]
+            self.assertEqual(names, ["a"])
+            bm = mr.BY_MODEL(mr.enabled_rows())
+            self.assertIn("m1", bm)
+            self.assertNotIn("m2", bm)  # a disabled row can never serve
+        finally:
+            mr.all_rows = old
+
+    def test_state_for_carries_new_fields(self):
+        rows = [{"name": "r", "base": "https://api.groq.com/v1", "model": "m",
+                 "key": "K", "disabled": True}]
+        st = mr.state_for(rows)[0]
+        self.assertTrue(st["disabled"])
+        self.assertEqual(st["provider"], "api.groq.com")
+        self.assertIn("cw", st)
+        self.assertIsNone(st["ok_pct"])  # no recent outcomes yet
+
+
+class TestDisableEndpoint(unittest.TestCase):
+    """Live /api/disable: parks a file row, routing + listings drop it, enable
+    restores it. OAuth profile disable is covered by shape, not network."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        rows = os.path.join(self.tmp.name, "rows.json")
+        with open(rows, "w") as f:
+            json.dump([
+                {"name": "r1", "base": "https://x1/v1", "model": "m1", "key": "K"},
+                {"name": "r2", "base": "https://x2/v1", "model": "m2", "key": ""},
+            ], f)
+        self._saved = (mr.ROWS_PATH, mr.OAUTH_PROFILES_PATH, mr.OAUTH_PATH)
+        mr.ROWS_PATH = rows
+        mr.OAUTH_PROFILES_PATH = os.path.join(self.tmp.name, "none.json")
+        mr.OAUTH_PATH = os.path.join(self.tmp.name, "none2.json")
+        self.srv = HTTPServer(("127.0.0.1", 0), mr.Handler)
+        self.port = self.srv.server_address[1]
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+
+    def tearDown(self):
+        self.srv.shutdown()
+        self.srv.server_close()
+        (mr.ROWS_PATH, mr.OAUTH_PROFILES_PATH, mr.OAUTH_PATH) = self._saved
+        self.tmp.cleanup()
+
+    def _get(self, path):
+        with urllib.request.urlopen("http://127.0.0.1:%d%s" % (self.port, path),
+                                    timeout=10) as r:
+            return json.loads(r.read() or b"{}")
+
+    def _post(self, path, obj):
+        rq = urllib.request.Request(
+            "http://127.0.0.1:%d%s" % (self.port, path),
+            data=json.dumps(obj).encode(), method="POST",
+            headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(rq, timeout=10) as r:
+                return json.loads(r.read() or b"{}")
+        except urllib.error.HTTPError as e:
+            return json.loads(e.read() or b"{}")
+
+    def test_disable_roundtrip(self):
+        models = [d["id"] for d in self._get("/v1/models")["data"]]
+        self.assertIn("m1", models)
+        res = self._post("/api/disable", {"name": "r1", "disabled": True})
+        self.assertTrue(res.get("ok"))
+        models = [d["id"] for d in self._get("/v1/models")["data"]]
+        self.assertNotIn("m1", models)
+        self.assertIn("m2", models)
+        st = self._get("/api/state")
+        by = {r["name"]: r for r in st["rows"]}
+        self.assertTrue(by["r1"]["disabled"])
+        self.assertFalse(by["r2"]["disabled"])
+        self.assertEqual(st["stats"]["disabled"], 1)
+        h = self._get("/health")
+        self.assertEqual(h["disabled"], 1)
+        # a disabled model 404s at the chat endpoint (never served, never 502)
+        rq = urllib.request.Request(
+            "http://127.0.0.1:%d/v1/chat/completions" % self.port,
+            data=json.dumps({"model": "m1", "messages": []}).encode(),
+            method="POST", headers={"Content-Type": "application/json"})
+        try:
+            urllib.request.urlopen(rq, timeout=10)
+            self.fail("disabled row served a request")
+        except urllib.error.HTTPError as e:
+            self.assertEqual(e.code, 404)
+        res = self._post("/api/disable", {"name": "r1", "disabled": False})
+        self.assertTrue(res.get("ok"))
+        models = [d["id"] for d in self._get("/v1/models")["data"]]
+        self.assertIn("m1", models)
+        with open(mr.ROWS_PATH) as f:
+            self.assertNotIn("disabled", json.load(f)[0])
+
+    def test_disable_unknown_row(self):
+        res = self._post("/api/disable", {"name": "nope", "disabled": True})
+        self.assertIn("error", res)
+
+
+class TestApiStateV12(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        rows = os.path.join(self.tmp.name, "rows.json")
+        with open(rows, "w") as f:
+            json.dump([{"name": "r1", "base": "https://x1/v1", "model": "gpt-oss-20b",
+                        "key": "K"}], f)
+        self._saved = (mr.ROWS_PATH, mr.OAUTH_PROFILES_PATH, mr.OAUTH_PATH)
+        mr.ROWS_PATH = rows
+        mr.OAUTH_PROFILES_PATH = os.path.join(self.tmp.name, "none.json")
+        mr.OAUTH_PATH = os.path.join(self.tmp.name, "none2.json")
+        self.srv = HTTPServer(("127.0.0.1", 0), mr.Handler)
+        self.port = self.srv.server_address[1]
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+
+    def tearDown(self):
+        self.srv.shutdown()
+        self.srv.server_close()
+        (mr.ROWS_PATH, mr.OAUTH_PROFILES_PATH, mr.OAUTH_PATH) = self._saved
+        self.tmp.cleanup()
+
+    def test_state_carries_stats_probe_version_cw(self):
+        # live state must reach the stats projection: an ok row reads SERVING=1
+        # (regression: /api/state ran pool_stats over RAW rows, which carry no
+        # "state" -> every tile read zero; found by the v1.2.0 live battery)
+        _saved = dict(mr.ROW_STATE)
+        mr.ROW_STATE.clear()
+        try:
+            mr.record_state("r1", "ok", 12)
+            with urllib.request.urlopen(
+                    "http://127.0.0.1:%d/api/state" % self.port, timeout=10) as r:
+                st = json.loads(r.read() or b"{}")
+            self.assertEqual(st["stats"]["serving"], 1)
+            self.assertEqual(st["stats"]["rows"], 1)
+        finally:
+            mr.ROW_STATE.clear()
+            mr.ROW_STATE.update(_saved)
+        with urllib.request.urlopen(
+                "http://127.0.0.1:%d/api/state" % self.port, timeout=10) as r:
+            st = json.loads(r.read() or b"{}")
+        self.assertIn("stats", st)
+        for k in ("rows", "serving", "blocked", "req_min", "tok_s", "err_pct",
+                  "uptime"):
+            self.assertIn(k, st["stats"])
+        self.assertIn("probe", st)
+        self.assertEqual(st["version"], mr.__version__)
+        row = st["rows"][0]
+        self.assertEqual(row["cw"], 131072)  # curated gpt-oss-20b, resolved server-side
+        self.assertEqual(row["provider"], "x1")  # host shortening happens board-side;
+        # engine carries the raw host
+# ---- v1.2.0 self-base guard tests ----
+
+class TestSelfBaseGuard(unittest.TestCase):
+    """A row pointing at the router's own listener must never be called."""
+
+    def test_detects_own_port_loopback(self):
+        self.assertTrue(mr._is_self_base("http://127.0.0.1:%d/v1" % mr.PORT))
+        self.assertTrue(mr._is_self_base("http://localhost:%d/v1" % mr.PORT))
+
+    def test_sidecar_port_is_not_self(self):
+        self.assertFalse(mr._is_self_base("http://127.0.0.1:%d/v1" % (mr.PORT + 1)))
+
+    def test_external_host_same_port_is_not_self(self):
+        # the router binds loopback only; an external host:PORT is someone else's
+        self.assertFalse(mr._is_self_base("https://api.example.com:%d/v1" % mr.PORT))
+
+    def test_upstream_refuses_before_socket(self):
+        old = mr.PORT
+        try:
+            mr.PORT = 9321
+            try:
+                mr.upstream("http://127.0.0.1:9321/v1", "k",
+                            "/v1/chat/completions", {})
+                self.fail("self-referential base was called")
+            except ValueError as e:
+                self.assertIn("self-referential", str(e))
+        finally:
+            mr.PORT = old
+
+    def test_probe_of_self_row_fails_honestly(self):
+        old = mr.PORT
+        _saved = dict(mr.ROW_STATE)
+        mr.ROW_STATE.clear()
+        try:
+            mr.PORT = 9322
+            ok, ms, err = mr.probe_row({"name": "self-row", "base":
+                                        "http://127.0.0.1:9322/v1",
+                                        "model": "m", "key": "k"})
+            self.assertFalse(ok)
+            self.assertIn("self-referential", str(err))
+            self.assertEqual(mr.ROW_STATE["self-row"]["status"], "fail")
+        finally:
+            mr.PORT = old
+            mr.ROW_STATE.clear()
+            mr.ROW_STATE.update(_saved)

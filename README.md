@@ -17,7 +17,7 @@ of every row in your terminal.
 | **One endpoint** | Every client that speaks the OpenAI format uses one base URL: `http://127.0.0.1:8790/v1`. No server auth, no lock-in, nothing to install by hand. |
 | **Three connection classes** | API key, OAuth device flow, or keyless — one engine path. The class is derived from the row's actual shape, never from a label. |
 | **Ordered fallback** | Rows sharing a model id form a chain. 401/402/403/429/5xx/timeout moves to the next row automatically, and the failure envelope carries the upstream's own error message. |
-| **A real terminal dashboard** | Mission Control board out of the box: block-pixel wordmark, stat strip (rows/models/serving/blocked), dense table with class, latency sparklines and status pills, selected-row detail, live event tail, 3 themes + a density toggle. The installer bundles it (Textual, in a dedicated venv); if that setup isn't possible the core falls back to a stdlib curses board. |
+| **A real terminal dashboard** | Mission Control board out of the box: centered btop-class frame, block-pixel wordmark, 8 pixel-digit stat tiles (rows / models / serving / blocked / req-per-min / tokens-per-s / error % / uptime), a dense table with provider, class, context window, latency, TPS, OK% and a live status vocabulary (OK/COOLDOWN/STALE/DEAD/GATED/EMPTY), multi-row marks with batch test/delete/park, a selected-row panel with TPS+CW gauges, a scrollable event tail, 14 themes (incl. Nous and Claude) + density + motion toggles. The installer bundles it (Textual, in a dedicated venv); if that setup isn't possible the core falls back to a stdlib curses board. |
 | **One-word provider connects** | A name-to-endpoint registry makes a known tool a single word: `oauth add`, type the name, approve in the browser. Unknown tools stay addable by pasting a base URL once. |
 | **Native translators** | Providers that need a transformed request (Responses-only gateways, Anthropic-Messages plan lanes) route through sibling transports in the same file — endpoints and identity assets are data, not code. |
 | **Runs anywhere Python runs** | Linux, macOS, WSL2. One file, Python 3.8+, no database, no web UI, nothing to configure beyond a JSON file of rows. |
@@ -102,6 +102,12 @@ dashboard shows a CLASS column, and `oauth list` prints each profile's class. Ke
 is not a separate auth mechanism in code — it is the existing file-row path with no
 credential.
 
+Rows may also carry `disabled: true` (parked: visible on the board, never served — the
+`e` key toggles it, or `POST /api/disable`) and `context_length` (a per-row context-window
+override). The CW column resolves per-row override first, then what the upstream's
+`/v1/models` publishes (learned by `f` / boot catalog reads), then a curated table of
+officially documented windows — and renders `-` when none knows. It never guesses.
+
 ## Use it from any client
 
 ```sh
@@ -148,9 +154,13 @@ format, which this router does not serve yet (404). The shim is on the roadmap.
 | `minimalrouter oauth list` / `oauth rm <id>` | inspect / remove profiles |
 | `minimalrouter -h` / `-v` | usage / version |
 
-Dashboard keys: Up/Down select, `t` re-test, `a` add, `d` delete, `r` refresh the
-selected row's OAuth token (API/keyless rows have none — use `t`), `q` quit (stops the
-server), Esc cancel.
+Mission Control keys: Up/Down move the cursor (or scroll EVENTS when `Tab` has
+focused it), `space` marks a row, `t`/`T` test the row / all marked (every enabled row
+if none marked), `r`/`R` refresh one / all OAuth tokens, `f` re-fetch every catalog
+(learns context windows), `a` add a row in-board, `d d` delete (second press within 4s
+confirms), `e` disable/enable marked rows (parked rows stay on the board, routing skips
+them), `p`/`P` theme next/prev, `v` density, `m` motion on/off, `?` help, `q` quit
+(stops the server). The curses fallback keeps: Up/Down, `t`, `a`, `d`, `r`, `q`, Esc.
 
 ## API
 
@@ -161,12 +171,14 @@ API key from your own machine. Provider logins are separate (OAuth profiles).
 |---|---|---|
 | POST | `/v1/chat/completions` | OpenAI-format chat, streaming and non-streaming |
 | GET | `/v1/models` | every pooled model id |
-| GET | `/health` | rows, models, classes, port |
-| GET | `/api/state` | rows plus per-row state (what the dashboard reads) |
+| GET | `/health` | rows, models, classes, disabled count, serving/blocked, port |
+| GET | `/api/state` | rows + per-row state (provider, cw, tps, ok%, disabled) + pool stats (req/min, tok/s, err%, uptime) + probe progress + version (what the dashboard reads) |
 | POST | `/api/test` | `{base, key, model}` probe, does not save |
 | POST | `/api/fetch_models` | `{base, key}` returns the provider's model ids |
 | POST | `/api/add` | `{base, key, model, name?}` tests, then saves |
 | POST | `/api/remove` | `{name}` |
+| POST | `/api/disable` | `{name, disabled?}` park/restore a row — routing skips parked rows |
+| POST | `/api/refetch` | re-read every enabled base's `/v1/models` (learns context windows) |
 | POST | `/api/refresh` | `{provider?}` force refresh; absent = every profile |
 
 Streaming is a passthrough: `"stream": true` returns the provider's SSE chunks byte for

@@ -51,7 +51,7 @@ class TestDashboardHelpers(unittest.TestCase):
         self.assertEqual(len(self.d.clip("x" * 100, 22)), 22)
 
     def test_spark_empty_and_flat(self):
-        self.assertEqual(self.d.spark([]), " ─    ")
+        self.assertEqual(self.d.spark([]), "     ")  # blank, not a dash
         flat = self.d.spark([100, 100, 100])
         self.assertEqual(len(flat), 5)
         self.assertIn("▄", flat)  # flat history = steady mid line, not bottom bleed
@@ -79,42 +79,37 @@ class TestDashboardHelpers(unittest.TestCase):
             d.MR_HOME = tmp
             d.PREF_PATH = os.path.join(tmp, "dashboard.json")
             try:
-                d.save_prefs("ocean", True)
-                self.assertEqual(d.load_prefs(), {"theme": "ocean", "dense": True})
-                d.save_prefs("not-a-theme", False)
+                d.save_prefs("ocean", True, True)
+                self.assertEqual(d.load_prefs(),
+                                 {"theme": "ocean", "dense": True, "motion": True})
+                d.save_prefs("ember", False, False)
+                self.assertEqual(d.load_prefs()["motion"], False)
+                d.save_prefs("not-a-theme", False, True)
                 self.assertEqual(d.load_prefs()["theme"], "midnight")  # invalid -> default
                 with open(d.PREF_PATH, "w") as f:
                     f.write("{corrupt")
-                self.assertEqual(d.load_prefs(), {"theme": "midnight", "dense": False})
+                self.assertEqual(d.load_prefs(),
+                                 {"theme": "midnight", "dense": False, "motion": True})
             finally:
                 d.MR_HOME, d.PREF_PATH = old_home, old_pref
 
-    def test_tail_events_missing_log(self):
+    def test_parse_event_line_v12(self):
         d = self.d
-        old = d.LOG_PATH
-        d.LOG_PATH = "/nonexistent/minimalrouter.log"
-        try:
-            self.assertEqual(d.tail_events(4), [])
-        finally:
-            d.LOG_PATH = old
-
-    def test_tail_events_parses_ok_fail(self):
-        d = self.d
-        with tempfile.TemporaryDirectory() as tmp:
-            old = d.LOG_PATH
-            d.LOG_PATH = os.path.join(tmp, "minimalrouter.log")
-            try:
-                with open(d.LOG_PATH, "w") as f:
-                    f.write("[2026-11-20 00:00:01] OK  m via row 1.2s\n")
-                    f.write("[2026-11-20 00:00:02] FAIL m via row: HTTP Error 403 (0.5s) -> next\n")
-                    f.write("[2026-11-20 00:00:03] MinimalRouter starting\n")
-                evs = d.tail_events(4)
-                self.assertEqual(len(evs), 2)
-                kinds = [k for _, k, _ in evs]
-                self.assertIn("ok", kinds)
-                self.assertIn("bad", kinds)
-            finally:
-                d.LOG_PATH = old
+        ev = d.parse_event_line("[2026-11-20 00:00:01] OK  m via row 1.2s")
+        self.assertEqual(ev, ("00:00:01", "OK  m via row 1.2s", "ok"))
+        ev = d.parse_event_line(
+            "[2026-11-20 00:00:02] FAIL m via row: HTTP Error 403 (0.5s) -> next")
+        self.assertEqual(ev[2], "bad")
+        ev = d.parse_event_line("[2026-11-20 00:00:03] MinimalRouter starting on x")
+        self.assertEqual(ev[2], "dim")
+        ev = d.parse_event_line("[2026-11-20 00:00:04] PROBE all (boot) start: 21 rows")
+        self.assertEqual(ev[2], "dim")
+        ev = d.parse_event_line("[2026-11-20 00:00:05] DISABLE r1")
+        self.assertEqual(ev[2], "warn")
+        ev = d.parse_event_line("[2026-11-20 00:00:06] TEST https://x m -> ok")
+        self.assertEqual(ev[2], "accent")
+        self.assertIsNone(d.parse_event_line("no timestamp here"))
+        self.assertIsNone(d.parse_event_line(""))
 
 
 @unittest.skipUnless(HAVE_TEXTUAL, "textual not installed")
@@ -190,3 +185,97 @@ class TestDashboardApp(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+# ---- v1.2.0 dashboard helper tests ----
+
+@unittest.skipUnless(HAVE_TEXTUAL, "textual not installed")
+class TestDashboardV12Helpers(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.d = _load()
+
+    def test_px_rows_shape(self):
+        d = self.d
+        rows = d.px_rows("42")
+        self.assertEqual(len(rows), 3)                    # 5 pixel rows -> 3 lines
+        self.assertTrue(all(len(r) == len(rows[0]) for r in rows))
+        self.assertEqual(len(rows[0]), 11)                # 5+1+5 glyphs
+        self.assertTrue(any("█" in r or "▀" in r for r in rows))
+
+    def test_px_rows_unknown_glyph_blank(self):
+        rows = self.d.px_rows("±")                        # not in the face -> blank
+        self.assertEqual(set("".join(rows)), {" "})
+
+    def test_compact(self):
+        d = self.d
+        self.assertEqual(d.compact(0), "0")
+        self.assertEqual(d.compact(999), "999")
+        self.assertEqual(d.compact(1234), "1K")
+        self.assertEqual(d.compact(12_345), "12K")
+        self.assertEqual(d.compact(2_600_000), "3M")
+        self.assertEqual(d.compact(None), "-")
+
+    def test_uptime_str(self):
+        d = self.d
+        self.assertEqual(d.uptime_str(59), "1M")          # never 0M
+        self.assertEqual(d.uptime_str(2790), "46M")
+        self.assertEqual(d.uptime_str(7500), "2H")
+        self.assertEqual(d.uptime_str(200000), "2D")
+
+    def test_cw_str(self):
+        d = self.d
+        self.assertEqual(d.cw_str(None), "-")
+        self.assertEqual(d.cw_str(131072), "131K")
+        self.assertEqual(d.cw_str(32768), "33K")
+        self.assertEqual(d.cw_str(512), "512")
+
+    def test_prov_short(self):
+        d = self.d
+        self.assertEqual(d.prov_short("api.groq.com"), "GROQ")
+        self.assertEqual(d.prov_short("Kilocode"), "KILOCODE")
+        self.assertEqual(d.prov_short(""), "?")
+
+    def test_plan_cols_full_and_drop_order(self):
+        d = self.d
+        cols, w = d.plan_cols(200)
+        self.assertEqual(cols, ["ROW", "PROV", "CLASS", "MODEL", "CW", "LAT",
+                                "TPS", "OK", "STATUS"])
+        cols, w = d.plan_cols(88)
+        self.assertNotIn("CW", cols)      # first drop (after MODEL floors at 14)
+        self.assertIn("TPS", cols)        # still standing at 88
+        self.assertIn("STATUS", cols)     # never dropped
+        self.assertIn("LAT", cols)        # never dropped
+        self.assertEqual(w["MODEL"], 14)  # floored, not gone
+        cols, w = d.plan_cols(60)
+        for c in ("TPS", "OK"):
+            self.assertNotIn(c, cols)
+        self.assertGreaterEqual(w["ROW"], 12)
+        self.assertGreaterEqual(w["MODEL"], 14)
+
+    def test_classify_v12_mirror(self):
+        d = self.d
+        self.assertEqual(d.classify(
+            {"status": "fail", "error": "HTTP Error 429: x", "fail_streak": 1}),
+            "cooldown")
+        self.assertEqual(d.classify(
+            {"status": "fail", "error": "HTTP Error 530: x", "fail_streak": 3}),
+            "dead")
+        import time as _t
+        self.assertEqual(d.classify(
+            {"status": "ok", "at": _t.time() - 2000}), "stale")
+
+    def test_status_key_covers_every_class(self):
+        d = self.d
+        for k in ("ok", "gated", "empty", "error", "cooldown", "stale", "dead",
+                  "unknown", "off"):
+            self.assertIn(k, d.STATUS_KEY)
+
+    def test_themes_fourteen_and_complete(self):
+        d = self.d
+        self.assertEqual(len(d.THEMES), 14)
+        keys = [t["key"] for t in d.THEMES]
+        for want in ("midnight", "ocean", "ember", "nous", "claude"):
+            self.assertIn(want, keys)
+        for t in d.THEMES:
+            for field in ("bg", "line", "accent", "strong", "muted", "dim",
+                          "sel", "ok", "warn", "bad", "dark"):
+                self.assertIn(field, t)
