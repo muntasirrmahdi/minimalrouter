@@ -9,6 +9,7 @@ import asyncio
 import importlib.util
 import json
 import os
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -434,6 +435,101 @@ class TestDashboardGeometry(unittest.TestCase):
                         y + hh, sh + 1,
                         "%s %s y=%s h=%s exceeds screen %s (visible=%s)"
                         % ((w, h), sel, y, hh, sh, s["vis"][sel]))
+
+    def test_columns_line_up_under_their_labels(self):
+        """Horizontal alignment. The geometry gate originally measured HEIGHTS
+        only, so 1.2.3 shipped with the first four table columns one character
+        LEFT of their header labels (header prefix 4 cells, row prefix 3) and a
+        LAT cell 2 cells wider in rows than the header allocated.
+
+        Left-justified columns (ROW/PROV/CLASS/MODEL/STATUS) must have their
+        token start exactly under the header token. Right-justified numeric
+        columns (CW/TPS/OK%) must share the header's cell RIGHT edge, because a
+        right-aligned value legitimately starts later than its label.
+        """
+        d = self.d
+        self._prefs()
+
+        async def go():
+            app = d.MissionControl(port=8799)
+            async with app.run_test(size=(140, 42)) as pilot:
+                for _ in range(40):
+                    await pilot.pause(0.1)
+                    if app._tier_now() == getattr(app, "_tier_key", None):
+                        break
+                app.online = True
+                app.rows = [dict(r) for r in self.ROWS]
+                app.nmodels = 20
+                app.stats = {"rows": 21, "serving": 12, "down": 8, "unknown": 0,
+                             "req_min": 0, "tok_s": 0, "err_pct": 0,
+                             "uptime": 300, "blocked": 1, "cooldown": 1,
+                             "dead": 0, "stale": 0, "disabled": 0}
+                app.ensure_slots(21)
+                for i in range(len(app.row_statics)):
+                    app.row_statics["slot%d" % i].display = i < 21
+                app.repaint_rows()
+                await pilot.pause(0.4)
+                head = app.query_one("#colhead").render().plain
+                rows_txt = [app.query_one("#slot%d" % i).render().plain
+                            for i in range(21)]
+                # the plan must come from the LIVE board (frame width is 96% of
+                # the terminal minus padding), never from an assumed width
+                plan = app.col_plan()
+                await pilot.press("q")
+                await pilot.pause(0.2)
+            return head, rows_txt, plan
+        head, rows_txt, (cols, w) = asyncio.run(go())
+
+        def toks(s):
+            return [(m.group(0), m.start()) for m in re.finditer(r"\S+", s)]
+
+        # cell START offsets, computed from the board's own column plan:
+        # 4-cell prefix, then each field's width plus one separating space.
+        starts, off = {}, 4
+        for c in cols:
+            starts[c] = off
+            off += d.col_width(cols, w, c) + 1
+        H = dict(toks(head))
+        self.assertIn("ROW", H, "header lost the ROW label: %r" % head)
+
+        # LEFT-justified: the header label must sit at the cell start, and so
+        # must the data field (its first non-space char at the cell start).
+        for c, label in (("ROW", "ROW"), ("PROV", "PROV"), ("CLASS", "CLASS"),
+                         ("MODEL", "MODEL"), ("STATUS", "STATUS")):
+            want = starts[c]
+            self.assertEqual(
+                H.get(label), want,
+                "header label %s at %s, cell starts at %d (header: %r)"
+                % (label, H.get(label), want, head))
+            for ri, ln in enumerate(rows_txt):
+                cell = ln[want:want + w[c]].rstrip()
+                if not cell:
+                    continue          # a blank cell cannot be judged
+                self.assertNotEqual(
+                    ln[want], " ",
+                    "col %s row %d: field starts at %d, cell starts at %d: %r"
+                    % (c, ri, ln.find(cell.strip()[:1]) if cell.strip() else -1,
+                       want, ln))
+
+        # right-justified numeric columns: the last character of the field must
+        # land on the cell's right edge, and the header label must too. A
+        # right-aligned value legitimately starts later than its label, so a
+        # token-start comparison would be wrong here.
+        for c, label in (("CW", "CW"), ("TPS", "TPS"), ("OK", "OK%")):
+            right = starts[c] + w[c]
+            self.assertEqual(
+                H[label] + len(label), right,
+                "header %s ends at %d, cell right edge is %d"
+                % (label, H[label] + len(label), right))
+            for ri, ln in enumerate(rows_txt):
+                window = ln[starts[c]:right]
+                stripped = window.rstrip()
+                if not stripped:
+                    continue          # a blank cell cannot be judged
+                self.assertEqual(
+                    starts[c] + len(stripped), right,
+                    "col %s row %d: value ends at %d, cell right edge is %d: %r"
+                    % (c, ri, starts[c] + len(stripped), right, ln))
 
     def test_selected_and_gauges_stay_pinned(self):
         """The blow-up class: an auto-height row holding a Vertical gauge.

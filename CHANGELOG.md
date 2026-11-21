@@ -12,6 +12,31 @@ OpenAI-compatible request/response shape, the endpoint, or the install command);
 for backward-compatible features (new providers, classes, dashboard capability, CLI verbs);
 **PATCH** for fixes only.
 
+## [1.2.4] — 2026-11-22
+
+### Fixed
+
+- **Table header and data columns did not line up** (found by capturing the
+  rendered 1.2.3 grid and measuring token offsets). The header emits a 4-cell
+  prefix (`" ✓▶ "`) while a data row emitted 3 (`mark + cursor + space`), so
+  ROW/PROV/CLASS/MODEL all started **one character left** of their labels
+  (header `ROW@4`, data `@3`). The latency cell diverged too: the header
+  allocated `w['LAT']+5` while a row emits `spark(5) + " " + lat.rjust(w) + " "`
+  = `w['LAT']+7`, so TPS/OK% drifted up to 5 cells from their headers.
+- **Single source of truth for the gutter**: `row_prefix()` and the
+  `LAT_SPARK`/`ROW_PREFIX` constants now build both the header line and every
+  data row, so the two cannot disagree again. `spark()` defaults to the shared
+  `LAT_SPARK` width.
+
+### Added
+
+- **Horizontal alignment assertion in the geometry gate**
+  (`test_columns_line_up_under_their_labels`): left-justified columns must have
+  their token start exactly under the header token; right-justified numeric
+  columns share the header's cell right edge. The gate previously measured
+  HEIGHTS only, which is why it certified a crooked table — a composition check
+  that measures one axis is not a composition check.
+
 ## [1.2.3] — 2026-11-22
 
 ### Fixed

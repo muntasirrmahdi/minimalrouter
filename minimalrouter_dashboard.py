@@ -43,6 +43,43 @@ from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Input, Static
 
+# The 4-char gutter every table line starts with: a leading space, the mark
+# column, the cursor column, a space. Header and rows MUST build it from here,
+# or the labels drift off their columns (1.2.3 shipped header@4 vs data@3).
+ROW_PREFIX = "  "          # leading pad
+MARK_COL = 2               # mark + cursor chars
+LAT_SPARK = 5              # sparkline cells before the latency value
+
+
+def row_prefix(mark, cursor):
+    """Exactly the prefix a table line starts with (4 cells)."""
+    return " %s%s " % (mark, cursor)
+
+
+# Column alignment for the table. Every column is emitted by table_line(), so
+# the header and the data rows cannot disagree about padding.
+COL_ALIGN = {"ROW": "l", "PROV": "l", "CLASS": "l", "MODEL": "l", "CW": "r",
+             "LAT": "l", "TPS": "r", "OK": "r", "STATUS": "l"}
+
+
+def col_width(cols, w, c):
+    """Effective cell width. LAT is a composite: sparkline + space + latency."""
+    if c == "LAT":
+        return LAT_SPARK + 1 + w["LAT"]
+    return w[c]
+
+
+def table_line(cols, w, values):
+    """One table line: 4-cell prefix + each field padded to its column width,
+    joined by a single space. Used by BOTH the header and every data row."""
+    cells = []
+    for c in cols:
+        txt = str(values.get(c, ""))
+        width = col_width(cols, w, c)
+        cells.append(txt.rjust(width) if COL_ALIGN.get(c) == "r" else txt.ljust(width))
+    return row_prefix(values.get("_mark", " "), values.get("_cursor", " ")) + " ".join(cells)
+
+
 BLOCKS = "▁▂▃▄▅▆▇█"
 SPIN = "⣾⣽⣻⢿⡿⣟⣯⣷"
 PULSE = "◐◑◒◓"
@@ -841,60 +878,67 @@ class MissionControl(App):
 
     # ---------- rows ----------
     def row_line(self, r, selected):
+        """One data row, built through table_line() so it lines up with the
+        header by construction. Styling is applied per column after the text is
+        laid out, so padding stays identical to the header's."""
         p = self.pal()
         s = r.get("state", {}) or {}
         name = r.get("name", "?")
         cols, w = self.col_plan()
-        line = Text()
-        mark = "✓" if name in self.marked else " "
-        line.append(f"{mark}{'▶' if selected else ' '} ")
         dis = bool(r.get("disabled"))
-        base_style = "dim" if dis else None
-        if name in self.testing:
-            line.append(f"{clip(name, w['ROW']):<{w['ROW']}} ",
-                        style=base_style or p["strong"])
-            if "PROV" in cols:
-                line.append(f"{clip(prov_short(r.get('provider') or r.get('oauth_provider') or '', name), w['PROV']):<{w['PROV']}} ", style=base_style or p["muted"])
-            if "CLASS" in cols:
-                line.append(f"{str(r.get('class', '?')).upper():<{w['CLASS']}} ", style=base_style or p["muted"])
-            if "MODEL" in cols:
-                line.append(f"{clip(r.get('model', '?'), w['MODEL']):<{w['MODEL']}} ", style=base_style or p["muted"])
-            line.append(SPIN[self.testing[name] % len(SPIN)] + " testing",
-                        style=f"bold {p['accent']}")
-            return line
+        dim = "dim" if dis else None
+        testing = name in self.testing
         cs = "off" if dis else classify(s)
         col = p[STATUS_KEY[cs]]
-        lat = ("%dms" % int(s.get("ms") or 0)) \
-            if cs not in ("unknown", "off") else "—"
-        line.append(f"{clip(name, w['ROW']):<{w['ROW']}} ",
-                    style=base_style or p["strong"])
-        if "PROV" in cols:
-            line.append(f"{clip(prov_short(r.get('provider') or r.get('oauth_provider') or '', name), w['PROV']):<{w['PROV']}} ", style=base_style or p["muted"])
-        if "CLASS" in cols:
-            line.append(f"{str(r.get('class', '?')).upper():<{w['CLASS']}} ", style=base_style or p["muted"])
-        if "MODEL" in cols:
-            line.append(f"{clip(r.get('model', '?'), w['MODEL']):<{w['MODEL']}} ", style=base_style or p["muted"])
-        if "CW" in cols:
-            line.append(f"{cw_str(r.get('cw')):>{w['CW'] - 1}} ", style=base_style or p["dim"])
-        if "LAT" in cols:
-            sp = spark(s.get("hist", []))
-            line.append(sp, style=base_style or
-                        (f"bold {p['accent']}" if cs == "ok" else p[STATUS_KEY[cs]]))
-            line.append(" ")
-            line.append(lat.rjust(w["LAT"]) + " ", style=base_style or p["dim"])
-        if "TPS" in cols:
-            tps = s.get("tps") or 0
-            line.append((f"{tps:>{w['TPS'] - 1}.0f} " if tps else
-                         f"{'—':>{w['TPS'] - 1}} "), style=base_style or p["dim"])
-        if "OK" in cols:
-            pct = r.get("ok_pct")
-            line.append((f"{pct:>{w['OK'] - 2}}% " if pct is not None else
-                         f"{'—':>{w['OK'] - 1}} "),
-                        style=base_style or (p["ok"] if (pct or 0) >= 80
-                                             else p["warn"] if pct is not None
-                                             else p["dim"]))
-        line.append(f"{cs.upper():<{w['STATUS']}}", style=f"bold {col}")
+
+        lat = ("%dms" % int(s.get("ms") or 0)) if cs not in ("unknown", "off") else "—"
+        tps = s.get("tps") or 0
+        pct = r.get("ok_pct")
+        values = {
+            "ROW": clip(name, w["ROW"]),
+            "PROV": clip(prov_short(r.get("provider") or r.get("oauth_provider") or "",
+                                    name), w["PROV"]),
+            "CLASS": str(r.get("class", "?")).upper().ljust(w["CLASS"])[:w["CLASS"]],
+            "MODEL": clip(r.get("model", "?"), w["MODEL"]),
+            "CW": cw_str(r.get("cw")),
+            "LAT": (spark(s.get("hist", [])) + " " + lat.rjust(w["LAT"]))
+                   if not testing else " " * col_width(cols, w, "LAT"),
+            "TPS": ("%d" % round(tps)) if tps else "-",
+            "OK": ("%d%%" % pct) if pct is not None else "-",
+            "STATUS": ("TESTING" if testing else cs.upper()).ljust(w["STATUS"]),
+            "_mark": "✓" if name in self.marked else " ",
+            "_cursor": "▶" if selected else " ",
+        }
+        line = Text()
+        line.append(row_prefix(values["_mark"], values["_cursor"]))
+        first = True
+        for c in cols:
+            if not first:
+                line.append(" ")
+            first = False
+            width = col_width(cols, w, c)
+            txt = str(values[c]).ljust(width) if COL_ALIGN.get(c) != "r" \
+                else str(values[c]).rjust(width)
+            if c == "STATUS":
+                style = f"bold {col}"
+            elif c == "LAT":
+                style = dim or (f"bold {p['accent']}" if cs == "ok" else col)
+            elif c == "OK":
+                style = dim or (p["ok"] if (pct or 0) >= 80
+                                else p["warn"] if pct is not None else p["dim"])
+            elif c in ("ROW",):
+                style = dim or p["strong"]
+            elif c in ("PROV", "CLASS", "MODEL"):
+                style = dim or p["muted"]
+            else:
+                style = dim or p["dim"]
+            if testing and c == "LAT":
+                line.append(SPIN[self.testing[name] % len(SPIN)] + " testing",
+                            style=f"bold {p['accent']}")
+            else:
+                line.append(txt, style=style)
         return line
+
 
     def repaint_rows(self):
         for i in range(len(self.row_statics)):
@@ -1110,28 +1154,13 @@ class MissionControl(App):
 
             with Vertical(classes="box", id="tablebox"):
                 self._stats_box = True
-                head = Text()
                 cols, w = self.col_plan()
-                head.append(" ✓▶ ")
-                for c in cols:
-                    if c == "ROW":
-                        head.append(f"{'ROW':<{w['ROW']}} ")
-                    elif c == "PROV":
-                        head.append(f"{'PROV':<{w['PROV']}} ")
-                    elif c == "CLASS":
-                        head.append(f"{'CLASS':<{w['CLASS']}} ")
-                    elif c == "MODEL":
-                        head.append(f"{'MODEL':<{w['MODEL']}} ")
-                    elif c == "CW":
-                        head.append(f"{'CW':>{w['CW'] - 1}} ")
-                    elif c == "TPS":
-                        head.append(f"{'TPS':>{w['TPS'] - 1}} ")
-                    elif c == "OK":
-                        head.append(f"{'OK%':>{w['OK'] - 1}} ")
-                    elif c == "LAT":
-                        head.append(f"{'TREND+LAT':<{w['LAT'] + 5}} ")
-                    elif c == "STATUS":
-                        head.append(f"{'STATUS':<{w['STATUS']}}")
+                head = Text()
+                head.append(table_line(cols, w, {
+                    "ROW": "ROW", "PROV": "PROV", "CLASS": "CLASS",
+                    "MODEL": "MODEL", "CW": "CW", "LAT": "TREND+LAT",
+                    "TPS": "TPS", "OK": "OK%", "STATUS": "STATUS",
+                    "_mark": "✓", "_cursor": "▶"}))
                 yield Static(head, classes="colhead", id="colhead")
                 yield Vertical(id="table")
 
@@ -1424,9 +1453,10 @@ class MissionControl(App):
             self.update_events()
 
 
-def spark(hist, width=5):
+def spark(hist, width=LAT_SPARK):
     """Latency history -> block sparkline (mirrors the engine's pure helper).
-    Flat history renders a steady mid line (▄), not a bottom bleed."""
+    Flat history renders a steady mid line (▄), not a bottom bleed. The default
+    width is the shared LAT_SPARK constant so header and rows cannot disagree."""
     if not hist:
         return " " * width
     vals = hist[-width:]
