@@ -12,6 +12,56 @@ OpenAI-compatible request/response shape, the endpoint, or the install command);
 for backward-compatible features (new providers, classes, dashboard capability, CLI verbs);
 **PATCH** for fixes only.
 
+## [1.2.5] — 2026-11-22
+
+### Fixed
+
+- **Pressing `?` could kill the whole board.** The help modal popped itself
+  through `app.pop_screen()` unconditionally. A key event queued behind a pop
+  reached the already-removed screen while the stack was back to one entry,
+  `pop_screen()` raised `ScreenStackError`, Textual rendered the traceback and
+  the app exited. The same unguarded pop also re-delivered the OPENING
+  keystroke to the new modal, which closed it before it could be read — help
+  looked like it never opened at all. The modal now swallows the opening
+  keystroke for 0.3s, dismisses through its own `ModalScreen.dismiss()`, and
+  refuses to pop when it is no longer on the stack.
+- **The context-window readout rendered broken digits.** The CW gauge is a
+  24-column box with one column of padding on each side, so 22 columns of
+  content, while `256K` in the pixel face is 23 columns wide —
+  `overflow-x: hidden` sliced the last glyph mid-stroke. A clipped pixel digit
+  reads as a broken number, not a long one. The gauges are 32 columns now, and
+  every pixel readout (gauges and the eight POOL tiles alike) measures its own
+  box and falls back to a single bold text line when the face does not fit, so
+  no digit is ever cut. `1049K` is written `1M` for the same reason.
+
+### Changed
+
+- **Four key handlers stopped blocking the UI thread.** `r` made its OAuth
+  refresh request synchronously on the board's own thread (30s timeout), and
+  `p` / `P` / `v` called the full poll — a synchronous `/api/state` request
+  plus a rebuild of every panel. A theme change needs no fresh server data, so
+  those keys repaint from cache now and the 2s poll brings the state; `r`
+  runs in a worker thread like `t` already did.
+- **Cursor movement repaints two rows instead of twenty-one.** Every arrow
+  press rebuilt the whole table through `repaint_rows()`.
+- **Animation costs halved.** The tick is 0.25s rather than 0.15s and the
+  wordmark shimmer advances on alternate ticks; the mast pulse, which carries
+  the live/probing signal, still moves every tick. While rows are testing only
+  the testing rows are repainted, not the table.
+- **The column plan is cached** per frame width, density and tier — `row_line`
+  recomputed the identical plan once per row, 21 times per repaint.
+- **Batch test runs four rows in parallel** instead of summing every row's
+  latency, which on slow free tiers read as a hung board.
+- **`t` honours marks, and `T` finally means all.** Marked rows are the
+  selection, so `t` tests them and falls back to the cursor row when nothing
+  is marked; `T` tests every enabled row and ignores marks. Previously `t`
+  ignored marks entirely, and `T` was documented as "all enabled" while
+  `_targets()` returned the cursor row whenever no row was marked — so `T`
+  tested one row and reported the toast as the whole pool. Disabled rows are
+  excluded from any batch.
+- The legend label `m=move` was wrong — the key toggles motion, not the
+  cursor. It reads `m=motion` now.
+
 ## [1.2.4] — 2026-11-22
 
 ### Fixed

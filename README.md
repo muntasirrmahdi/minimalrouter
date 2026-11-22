@@ -155,8 +155,9 @@ format, which this router does not serve yet (404). The shim is on the roadmap.
 | `minimalrouter -h` / `-v` | usage / version |
 
 Mission Control keys: Up/Down move the cursor (or scroll EVENTS when `Tab` has
-focused it), `space` marks a row, `t`/`T` test the row / all marked (every enabled row
-if none marked), `r`/`R` refresh one / all OAuth tokens, `f` re-fetch every catalog
+focused it), `space` marks rows, `t` tests the marked rows (the cursor row when
+nothing is marked), `T` tests every enabled row, `r`/`R` refresh one / all OAuth
+tokens, `f` re-fetch every catalog
 (learns context windows), `a` add a row in-board, `d d` delete (second press within 4s
 confirms), `e` disable/enable marked rows (parked rows stay on the board, routing skips
 them), `p`/`P` theme next/prev, `v` density, `m` motion on/off, `?` help, `q` quit

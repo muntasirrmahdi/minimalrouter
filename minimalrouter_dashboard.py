@@ -36,6 +36,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 
 from rich.text import Text
 from textual.app import App, ComposeResult
@@ -265,8 +266,31 @@ def cw_str(cw):
     if not cw:
         return "-"
     if cw >= 1000:
-        return "%dK" % round(cw / 1000.0)
+        k = round(cw / 1000.0)
+        if k >= 1000:            # 1049K is 5 glyphs; 1M is 2
+            return "%dM" % round(k / 1000.0)
+        return "%dK" % k
     return str(cw)
+
+
+def pixel_face(value, avail, style):
+    """Pixel face when it fits `avail` columns, else ONE bold text line.
+
+    A 5x5 glyph with a 1-col gap is 6n-1 wide. The CW gauge rendered '256K'
+    (23 cols) inside a 22-col box and overflow-x:hidden cut the last glyph
+    mid-stroke, so the number looked BROKEN rather than long (Moon, 1.2.5).
+    A readout is either whole pixels or plain text — never half a digit.
+    """
+    s = str(value)
+    t = Text(justify="center")
+    if 6 * len(s) - 1 <= max(0, avail):
+        for j, ln in enumerate(px_rows(s)):
+            if j:
+                t.append("\n")
+            t.append(ln, style=style)
+    else:
+        t.append(s, style=style)
+    return t
 
 
 # ---------------------------------------------------------------- helpers
@@ -491,6 +515,11 @@ class HelpScreen(ModalScreen):
 
     CSS = HELP_CSS
 
+    def on_mount(self):
+        # The keystroke that OPENS this modal can be re-delivered to it while
+        # the push settles; the mount stamp lets on_key swallow that echo.
+        self._opened_at = time.monotonic()
+
     def compose(self) -> ComposeResult:
         with Vertical(id="helpbox"):
             yield Static(self._body(), id="helpbody")
@@ -503,7 +532,7 @@ class HelpScreen(ModalScreen):
         rows = [
             ("up/down", "move cursor  (in EVENTS zone: scroll)"),
             ("space", "mark / unmark row"),
-            ("t / T", "test row / test marked (all enabled if none)"),
+            ("t / T", "test marked rows (cursor row if none) / EVERY enabled row"),
             ("r / R", "refresh row OAuth token / refresh ALL"),
             ("f", "re-fetch every catalog (learns context windows)"),
             ("a", "add a row (base URL + key + model, tested before save)"),
@@ -511,9 +540,9 @@ class HelpScreen(ModalScreen):
             ("e", "disable/enable marked rows (parked rows never serve)"),
             ("p / P", "theme next / previous"),
             ("v", "density: airy / compact"),
-            ("m", "motion on / off (pauses every animation timer)"),
+            ("m", "motion on / off — pauses every animation timer"),
             ("Tab", "focus the EVENTS panel  -  g/G newest / oldest"),
-            ("?", "this help  -  any key closes it"),
+            ("?", "this help  -  any key closes it (after a short guard)"),
             ("q", "quit (stops the server)"),
         ]
         for k, dsc in rows:
@@ -529,7 +558,13 @@ class HelpScreen(ModalScreen):
 
     def on_key(self, event):
         event.stop()
-        self.app.pop_screen()
+        if time.monotonic() - getattr(self, "_opened_at", 0) < 0.3:
+            return                      # swallow the opening keystroke's echo
+        stack = getattr(self.app, "_screen_stack", [])
+        if self not in stack or len(stack) <= 1:
+            return                     # already popped: a queued key must not
+        self.dismiss()                 # pop a 1-deep stack -> ScreenStackError
+
 
 
 # ---------------------------------------------------------------- the app
@@ -601,7 +636,9 @@ def _build_css():
     #selrow { height: 4; }
     Screen.tier-compact #selrow, Screen.tier-micro #selrow { height: 2; }
     #selid { width: 1fr; height: 100%; padding: 0 1; overflow: hidden; }
-    .gauge { width: 24; height: 4; padding: 0 1; }
+    /* 32 wide: 30 content cols holds a 5-glyph pixel face (29 cols). The
+       24-wide box clipped '256K' mid-glyph and the number looked broken. */
+    .gauge { width: 32; height: 4; padding: 0 1; }
     Screen.tier-compact .gauge, Screen.tier-micro .gauge { height: 2; }
     .gnum { height: 3; text-align: center; overflow-x: hidden; }
     Screen.tier-compact .gnum, Screen.tier-micro .gnum { height: 1; }
@@ -749,7 +786,7 @@ class MissionControl(App):
             except Exception:
                 pass
         self._poll_timer = self.set_interval(2.0, self.poll)
-        self._anim_timer = self.set_interval(0.15, self.tick_anim)
+        self._anim_timer = self.set_interval(0.25, self.tick_anim)
         if not self.motion:
             self._anim_timer.pause()
         self.poll()
@@ -777,7 +814,12 @@ class MissionControl(App):
         if self.type_n < 60:
             self.type_n += 4
         self._set("#mast", self.termbar_text())
-        self.render_wordmark()
+        # The wordmark is the board's most expensive re-render (4 Texts at
+        # full frame width). The mast pulse already carries the live signal,
+        # so the shimmer advances on alternate ticks and the cost halves.
+        self._tick_n = getattr(self, "_tick_n", 0) + 1
+        if self._tick_n % 2 == 0:
+            self.render_wordmark()
         for i in list(self.flash):
             self.flash[i] -= 1
             if self.flash[i] <= 0:
@@ -787,7 +829,9 @@ class MissionControl(App):
         if self.testing:
             for name in list(self.testing):
                 self.testing[name] = (self.testing[name] + 1) % len(SPIN)
-            self.repaint_rows()
+            for i, r in enumerate(self.rows):
+                if r.get("name") in self.testing:
+                    self._repaint_slot(i)
 
     def _set(self, sel, renderable):
         try:
@@ -873,8 +917,31 @@ class MissionControl(App):
         except Exception:
             return 100
 
+    def _avail(self, wid, fallback):
+        """Content columns of a widget, or `fallback` before first layout.
+
+        The pixel-face fit test must measure the REAL box, not a guess: a
+        gauge that renders before the screen is laid out reports 0 and would
+        fall back to text on every boot frame.
+        """
+        try:
+            w = self.query_one("#" + wid).content_region.width
+            if w > 0:
+                return w
+        except Exception:
+            pass
+        return fallback
+
     def col_plan(self):
-        return plan_cols(max(40, self.frame_w()))
+        """Cached per (frame width, density, tier): row_line() called this
+        once per row, so a 21-row repaint recomputed the same plan 21 times.
+        """
+        fw = max(40, self.frame_w())
+        key = (fw, self.dense, self._tier_now())
+        if getattr(self, "_plan_key", None) != key:
+            self._plan_key = key
+            self._plan = plan_cols(fw)
+        return self._plan
 
     # ---------- rows ----------
     def row_line(self, r, selected):
@@ -939,6 +1006,29 @@ class MissionControl(App):
                 line.append(txt, style=style)
         return line
 
+
+    def _repaint_slot(self, i):
+        """Repaint ONE row. Arrow keys moved the cursor through all 21.
+        """
+        if 0 <= i < len(self.rows):
+            w = self.row_statics.get("slot%d" % i)
+            if w is not None and w.display:
+                w.update(self.row_line(self.rows[i], i == self.sel))
+                w.set_class(i == self.sel, "sel")
+
+    def rerender_local(self):
+        """Re-paint from cached state WITHOUT a blocking HTTP poll.
+
+        The theme/density keys called poll(), which does a synchronous
+        /api/state request and then rebuilds every panel on the UI thread —
+        the 'ekta key chapar por onekkhok wait' Moon felt. Nothing about a
+        theme change needs fresh server data; the 2s poll brings it.
+        """
+        self.render_wordmark()
+        self.rebuild_stats()
+        self.repaint_rows()
+        self.update_selected(repaint=False)
+        self.update_events()
 
     def repaint_rows(self):
         for i in range(len(self.row_statics)):
@@ -1027,17 +1117,15 @@ class MissionControl(App):
                 t = Text(justify="center")
                 t.append(num, style=f"bold {style}")
             else:
-                t = Text(justify="center")
-                for ln in px_rows(num):
-                    if len(t) > 0 and t.plain:
-                        t.append("\n")
-                    t.append(ln, style=f"bold {style}")
+                t = pixel_face(num, self._avail("statnum%d" % i,
+                                                 max(8, self.frame_w() // 8)),
+                               f"bold {style}")
             self._set(f"#statnum{i}", t)
             self._set(f"#statlab{i}", Text(lab, justify="center",
                                            style=f"bold {p['dim']}"))
 
     # ---------- selected ----------
-    def update_selected(self):
+    def update_selected(self, repaint=True):
         p = self.pal()
         r = self.rows[self.sel] if self.rows else None
         s = Text()
@@ -1077,22 +1165,15 @@ class MissionControl(App):
         # Gauges: live TPS + context window, pixel face, half-wordmark height.
         tps = st.get("tps") or 0
         tn = compact(tps) if tps else "-"
-        t = Text(justify="center")
-        for j, ln in enumerate(px_rows(tn)):
-            if j:
-                t.append("\n")
-            t.append(ln, style=f"bold {p['accent'] if tps else p['dim']}")
-        self._set("#gtps", t)
+        self._set("#gtps", pixel_face(tn, self._avail("gtps", 30),
+                                       f"bold {p['accent'] if tps else p['dim']}"))
         self._set("#gtplab", Text("TPS", justify="center", style=f"bold {p['dim']}"))
         cwn = cw_str(r.get("cw"))
-        t = Text(justify="center")
-        for j, ln in enumerate(px_rows(cwn)):
-            if j:
-                t.append("\n")
-            t.append(ln, style=f"bold {p['ok'] if r.get('cw') else p['dim']}")
-        self._set("#gcw", t)
+        self._set("#gcw", pixel_face(cwn, self._avail("gcw", 30),
+                                       f"bold {p['ok'] if r.get('cw') else p['dim']}"))
         self._set("#gcwlab", Text("CW", justify="center", style=f"bold {p['dim']}"))
-        self.repaint_rows()
+        if repaint:
+            self.repaint_rows()
 
     # ---------- events ----------
     def update_events(self):
@@ -1183,7 +1264,7 @@ class MissionControl(App):
             # legend to 3-4 rows is what stole the route table's height.
             keys = [("t", "test"), ("T", "all"), ("spc", "mark"), ("r", "token"),
                     ("R", "all"), ("f", "cat"), ("e", "off"), ("d", "del"),
-                    ("a", "add"), ("p", "theme"), ("v", "dens"), ("m", "move"),
+                    ("a", "add"), ("p", "theme"), ("v", "dens"), ("m", "motion"),
                     ("?", "help"), ("q", "quit")]
             for i, (k, lab) in enumerate(keys):
                 if i:
@@ -1209,16 +1290,24 @@ class MissionControl(App):
                 self.ev_scroll += 1
                 self.update_events()
             else:
+                old = self.sel
                 self.sel = max(0, self.sel - 1)
-                self.update_selected()
+                if self.sel != old:
+                    self._repaint_slot(old)
+                    self._repaint_slot(self.sel)
+                self.update_selected(repaint=False)
         elif k == "down":
             event.stop()
             if self.zone == "events":
                 self.ev_scroll = max(0, self.ev_scroll - 1)
                 self.update_events()
             else:
+                old = self.sel
                 self.sel = min(len(self.rows) - 1, self.sel + 1)
-                self.update_selected()
+                if self.sel != old:
+                    self._repaint_slot(old)
+                    self._repaint_slot(self.sel)
+                self.update_selected(repaint=False)
         elif k == "tab":
             event.stop()
             self.zone = "events" if self.zone == "table" else "table"
@@ -1246,10 +1335,15 @@ class MissionControl(App):
                 self.update_events()
         elif k == "t":
             event.stop()
-            self._test_row()
+            # Marks ARE the selection. Testing only the cursor row after 3
+            # rows were marked is what Moon hit (1.2.5).
+            if self.marked:
+                self._test_many()
+            else:
+                self._test_row()
         elif k == "T":
             event.stop()
-            self._test_many()
+            self._test_many(all_rows=True)
         elif k == "r":
             event.stop()
             self._refresh_row()
@@ -1274,21 +1368,21 @@ class MissionControl(App):
             self._apply_theme_classes()
             self.toast = f"theme: {THEMES[self.theme_ix]['key']}"
             save_prefs(THEMES[self.theme_ix]["key"], self.dense, self.motion)
-            self.poll()
+            self.rerender_local()
         elif k == "P":
             event.stop()
             self.theme_ix = (self.theme_ix - 1) % len(THEMES)
             self._apply_theme_classes()
             self.toast = f"theme: {THEMES[self.theme_ix]['key']}"
             save_prefs(THEMES[self.theme_ix]["key"], self.dense, self.motion)
-            self.poll()
+            self.rerender_local()
         elif k == "v":
             event.stop()
             self.dense = not self.dense
             self.screen.set_class(self.dense, "dense")
             self.toast = "density: compact" if self.dense else "density: airy"
             save_prefs(THEMES[self.theme_ix]["key"], self.dense, self.motion)
-            self.poll()
+            self.rerender_local()
         elif k == "m":
             event.stop()
             self.motion = not self.motion
@@ -1336,11 +1430,27 @@ class MissionControl(App):
             self.call_from_thread(self.poll)
         threading.Thread(target=run, daemon=True).start()
 
-    def _test_many(self):
-        targets = self._targets()
+    def _test_many(self, all_rows=False):
+        """Batch test. `all_rows` is the T key: every ENABLED row, marks
+        ignored. Without it the scope is the marks, else the cursor row.
+
+        The help advertised 'all enabled' for T while _targets() returned the
+        cursor row whenever nothing was marked, so T tested one row and
+        reported it as the whole pool (found with the D4 fix, 1.2.5).
+        """
+        if all_rows:
+            targets = [r for r in self.rows if not r.get("disabled")]
+            label = "all enabled"
+        else:
+            targets = self._targets()
+            label = "marked" if self.marked else "cursor row"
         if not targets:
             return
-        label = ("marked" if self.marked else "all enabled")
+        targets = [r for r in targets if not r.get("disabled")]
+        if not targets:
+            self.toast = "no enabled rows in scope"
+            self.update_events()
+            return
         for r in targets:
             self.testing[r.get("name", "?")] = 0
         self.toast = f"testing {len(targets)} rows ({label}) …"
@@ -1348,16 +1458,19 @@ class MissionControl(App):
         self.update_events()
 
         def run():
-            with_ok = 0
-            for r in targets:
+            def one(r):
                 res = self.api("POST", "/api/test",
                                {"base": r.get("base", ""),
                                 "key": r.get("key", ""),
                                 "model": r.get("model", "")})
-                if res.get("ok"):
-                    with_ok += 1
                 self.testing.pop(r.get("name", "?"), None)
                 self.call_from_thread(self.repaint_rows)
+                return bool(res.get("ok"))
+            # Sequential probes summed every row's latency: 3 marked rows on
+            # slow free tiers read as a hung board. Four in a row, one result
+            # per row, same total requests.
+            with ThreadPoolExecutor(max_workers=min(4, len(targets))) as ex:
+                with_ok = sum(1 for ok in ex.map(one, targets) if ok)
             self.toast = f"tested {len(targets)} ({label}): {with_ok} ok"
             self.call_from_thread(self.poll)
         threading.Thread(target=run, daemon=True).start()
@@ -1371,10 +1484,16 @@ class MissionControl(App):
             self.toast = f"{r.get('name', '?')}: no token to refresh — press t"
             self.update_events()
             return
-        res = self.api("POST", "/api/refresh", {"provider": prov})
-        r0 = (res.get("results") or [{}])[0]
-        self.toast = f"{prov}: {r0.get('message', 'done')}"
+        self.toast = f"refreshing {prov} token …"
         self.update_events()
+
+        def run():
+            res = self.api("POST", "/api/refresh", {"provider": prov},
+                           timeout=60)
+            r0 = (res.get("results") or [{}])[0]
+            self.toast = f"{prov}: {r0.get('message', 'done')}"
+            self.call_from_thread(self.poll)
+        threading.Thread(target=run, daemon=True).start()
 
     def _refresh_all(self):
         self.toast = "refreshing ALL OAuth tokens …"

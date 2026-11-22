@@ -74,7 +74,7 @@ except ImportError:  # platform without curses -> main() degrades to serve
 # CHANGELOG and the git tag all derive from this one line. MAJOR.MINOR.PATCH per
 # semver.org: MAJOR on a breaking client contract, MINOR on backward-compatible
 # features, PATCH on fixes.
-__version__ = "1.2.4"
+__version__ = "1.2.5"
 
 HOME = os.path.expanduser("~")
 MR_HOME = os.path.join(HOME, ".minimalrouter")
@@ -2490,12 +2490,13 @@ the built-in curses board. Force a mode with MINIMALROUTER_TUI=textual|curses
 
 Mission Control keys:
   up/down  move cursor       space  mark/unmark a row
-  t        test row          T      test marked rows (all enabled if none marked)
+  t        test marked rows (the cursor row if none marked)
+  T        test EVERY enabled row
   r        refresh row token R      refresh ALL OAuth tokens
   f        re-fetch catalogs (learns model ids + context windows)
   a        add a row         d      delete marked/cursor row (press twice = confirm)
   e        disable/enable marked/cursor row (routing skips disabled rows)
-  p / P    theme next/prev   v      density     m  motion on/off
+  p / P    theme next/prev   v      density     m  motion (animation) on/off
   Tab      focus the EVENTS panel (up/down scroll it, g/G jump)
   ?        help overlay      q      quit (stops the server)
 
