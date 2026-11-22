@@ -76,7 +76,7 @@ except ImportError:  # platform without curses -> main() degrades to serve
 # CHANGELOG and the git tag all derive from this one line. MAJOR.MINOR.PATCH per
 # semver.org: MAJOR on a breaking client contract, MINOR on backward-compatible
 # features, PATCH on fixes.
-__version__ = "1.3.1"
+__version__ = "1.3.2"
 
 HOME = os.path.expanduser("~")
 MR_HOME = os.path.join(HOME, ".minimalrouter")
@@ -2659,6 +2659,11 @@ def doctor(fix=False, as_json=False):
       prefs name a dead theme            -> the board paints from defaults,
                                              silently ignoring the saved choice
 
+    SEVERITY IS DEFINED, NOT TASTED: FAIL means a request will break, so a
+    finding only earns FAIL when something actually depends on it. Unused
+    credentials, dead themes and cosmetic drift are WARN. A diagnostic that
+    cries wolf trains the user to ignore it, which is worse than none.
+
     Exit code 1 if any check FAILS, else 0. `--fix` applies only safe,
     reversible repairs (stale pidfile, secret-file permissions) and prints each
     one. It NEVER touches rows.json, oauth.json or dashboard.json: those hold
@@ -2911,22 +2916,34 @@ def doctor(fix=False, as_json=False):
                     "`minimalrouter oauth rm %s`" % (pid, pid))
             continue
         if exp and exp <= now:
-            if can_renew:
+            # SEVERITY LAW: FAIL means a request will break. An expired token on
+            # a profile that NO row uses breaks nothing, so it is a warning;
+            # reporting it as a failure is how a diagnostic teaches the user to
+            # ignore its own report. (Found on the first real run: the install
+            # had zero OAuth-backed rows and still printed UNHEALTHY.)
+            dead = "token EXPIRED %s" % time.strftime(
+                "%d %b %H:%M", time.localtime(exp))
+            how = ("minimalrouter refresh %s" % pid if can_renew
+                   else "interactive sign-in: minimalrouter oauth %s" % pid)
+            if pid in used_profs:
                 add("FAIL", "oauth:%s" % pid,
-                    "token EXPIRED %s (a refresh is available)"
-                    % time.strftime("%d %b %H:%M", time.localtime(exp)),
-                    "minimalrouter refresh %s" % pid)
+                    "%s and a row depends on it — that row cannot serve" % dead,
+                    how)
             else:
-                add("FAIL", "oauth:%s" % pid,
-                    "token EXPIRED %s and it CANNOT be renewed headlessly"
-                    % time.strftime("%d %b %H:%M", time.localtime(exp)),
-                    "interactive sign-in is required: minimalrouter oauth %s"
-                    % pid)
+                add("WARN", "oauth:%s" % pid,
+                    "%s, but no row uses it (nothing breaks today)" % dead,
+                    "sign in only if you mean to route a row through it — "
+                    + how)
         elif exp and exp - now < 900:
-            add("WARN", "oauth:%s" % pid, "expires in %d min"
-                % max(1, int((exp - now) / 60)),
-                "minimalrouter refresh %s   (before it goes 401 mid-request)"
-                % pid)
+            mins = max(1, int((exp - now) / 60))
+            if pid in used_profs:
+                add("WARN", "oauth:%s" % pid,
+                    "expires in %d min and a row depends on it" % mins,
+                    "minimalrouter refresh %s   (before it 401s mid-request)"
+                    % pid)
+            else:
+                add("OK", "oauth:%s" % pid,
+                    "connected, %d min left (no row uses it)" % mins)
         else:
             if not exp:
                 left = ", no expiry stored"
@@ -2935,8 +2952,11 @@ def doctor(fix=False, as_json=False):
                 left = (", %dh left" % (mins // 60) if mins >= 60
                         else ", %dm left" % max(1, mins))
             add("OK", "oauth:%s" % pid, "connected%s" % left)
-        if not can_renew and exp:
-            add("WARN", "oauth:%s" % pid, "no refresh path stored",
+        if not can_renew and exp and pid in used_profs:
+            # Only worth its own line when a row depends on it; for an unused
+            # profile the expiry line above already says everything.
+            add("WARN", "oauth:%s" % pid,
+                "no refresh path stored and a row depends on it",
                 "when this token dies, only an interactive `oauth %s` heals it"
                 % pid)
 

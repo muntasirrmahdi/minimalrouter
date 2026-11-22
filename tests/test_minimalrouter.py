@@ -1032,6 +1032,13 @@ class TestDoctor(unittest.TestCase):
     def names(self, data, level):
         return [c["name"] for c in self.findings(data, level)]
 
+    def oauth(self, data, level):
+        """OAuth findings only. The full WARN list legitimately carries a PATH
+        line under a fake HOME, so an assertion on the whole list measures the
+        fixture, not the credential logic."""
+        return [c for c in self.findings(data, level)
+                if c["name"].startswith("oauth:")]
+
     def text(self, data, level):
         return " | ".join(c["name"] + ": " + c["detail"] + " " + c["fix"]
                           for c in self.findings(data, level))
@@ -1184,32 +1191,86 @@ class TestDoctor(unittest.TestCase):
         self.assertIn("parked", self.text(data, "OK"))
 
     # ---------------- OAuth findings ----------------
-    def test_expired_token_with_a_refresh_path_says_refresh(self):
-        # ORDER MATTERS: healthy_install() rewrites oauth.json and the
-        # profiles file, so the expired token and its refresh path have to be
-        # laid down AFTER it or the test measures the wrong branch.
-        self.healthy_install(rows=[{"name": "live", "base": "https://a/v1",
-                                    "model": "m", "key": "k"}])
-        json.dump({"nous": {"label": "Nous", "class": "oauth",
-                            "refresh_url": "https://refresh"}},
-                  open(mr.OAUTH_PROFILES_PATH, "w"))
-        json.dump({"nous": {"access_token": "a", "refresh_token": "r",
-                            "expires_at": time.time() - 10}},
-                  open(mr.OAUTH_PATH, "w"))
-        code, data = self.run_doctor()
+    def _expired(self, used, can_renew):
+        """Fixture builder: an expired token, optionally with a refresh path,
+        optionally backing a row. Returns (code, data)."""
+        rows = [{"name": "api-row", "base": "https://a/v1", "model": "m",
+                 "key": "k"}]
+        if used:
+            rows.append({"name": "nous-row", "base": "https://b/v1",
+                         "model": "m", "oauth_provider": "nous"})
+        self.healthy_install(rows=rows)
+        prof = {"nous": {"label": "Nous", "class": "oauth"}}
+        if can_renew:
+            prof["nous"]["refresh_url"] = "https://refresh"
+        json.dump(prof, open(mr.OAUTH_PROFILES_PATH, "w"))
+        tok = {"access_token": "a", "expires_at": time.time() - 10}
+        if can_renew:
+            tok["refresh_token"] = "r"
+        json.dump({"nous": tok}, open(mr.OAUTH_PATH, "w"))
+        return self.run_doctor()
+
+    def test_expired_token_behind_a_row_is_a_failure(self):
+        """A request WILL break, so this is the only shape that earns FAIL."""
+        code, data = self._expired(used=True, can_renew=False)
+        self.assertIn("oauth:nous", self.names(data, "FAIL"))
         blob = self.text(data, "FAIL")
         self.assertIn("EXPIRED", blob)
-        self.assertIn("oauth:nous", self.names(data, "FAIL"))
-        self.assertIn("refresh", blob.lower())
-
-    def test_expired_token_without_refresh_says_interactive(self):
-        json.dump({"nous": {"access_token": "a", "expires_at": time.time() - 10}},
-                  open(mr.OAUTH_PATH, "w"))
-        json.dump({}, open(mr.OAUTH_PROFILES_PATH, "w"))
-        code, data = self.run_doctor()
-        blob = self.text(data, "FAIL")
-        self.assertIn("CANNOT be renewed headlessly", blob)
+        self.assertIn("cannot serve", blob)
         self.assertIn("interactive", blob.lower())
+        self.assertEqual(code, 1)
+
+    def test_expired_token_behind_a_row_with_a_refresh_path_says_refresh(self):
+        code, data = self._expired(used=True, can_renew=True)
+        blob = self.text(data, "FAIL")
+        self.assertIn("EXPIRED", blob)
+        self.assertIn("minimalrouter refresh nous", blob,
+                      "when a headless refresh exists the remedy must name it")
+        self.assertEqual(code, 1)
+
+    def test_expired_token_on_an_unused_profile_is_a_warning_not_a_failure(self):
+        """THE SEVERITY DEFECT, now pinned. Moon's real install had zero
+        OAuth-backed rows and an expired `inference` token, and the first
+        doctor run printed UNHEALTHY — '1 thing(s) will break requests' —
+        while nothing could break. An unused dead credential is hygiene."""
+        code, data = self._expired(used=False, can_renew=False)
+        self.assertNotIn("oauth:nous", self.names(data, "FAIL"),
+                         "no row depends on it, so no request breaks")
+        self.assertIn("oauth:nous", self.names(data, "WARN"))
+        blob = self.text(data, "WARN")
+        self.assertIn("no row uses it", blob)
+        self.assertEqual(code, 0, "unused hygiene must not fail the exit code")
+        self.assertTrue(data["healthy"])
+
+    def test_near_expiry_behind_a_row_is_a_warning(self):
+        self.healthy_install(rows=[
+            {"name": "nous-row", "base": "https://b/v1", "model": "m",
+             "oauth_provider": "nous"}])
+        json.dump({"nous": {"label": "Nous", "refresh_url": "https://r"}},
+                  open(mr.OAUTH_PROFILES_PATH, "w"))
+        json.dump({"nous": {"access_token": "a", "refresh_token": "r",
+                            "expires_at": time.time() + 300}},
+                  open(mr.OAUTH_PATH, "w"))
+        code, data = self.run_doctor()
+        blob = self.text(data, "WARN")
+        self.assertIn("a row depends on it", blob)
+        self.assertIn("minimalrouter refresh nous", blob)
+        self.assertEqual(code, 0, "a warning is not a failure")
+
+    def test_near_expiry_on_an_unused_profile_is_informational(self):
+        self.healthy_install(rows=[{"name": "api-row", "base": "https://a/v1",
+                                    "model": "m", "key": "k"}])
+        json.dump({"nous": {"label": "Nous", "refresh_url": "https://r"}},
+                  open(mr.OAUTH_PROFILES_PATH, "w"))
+        json.dump({"nous": {"access_token": "a", "refresh_token": "r",
+                            "expires_at": time.time() + 300}},
+                  open(mr.OAUTH_PATH, "w"))
+        code, data = self.run_doctor()
+        self.assertEqual([c for c in self.findings(data, "FAIL")
+                          if c["name"].startswith("oauth:")], [])
+        self.assertEqual(self.oauth(data, "WARN"), [],
+                         "unused and merely expiring soon is not even a warning")
+        self.assertIn("no row uses it", self.text(data, "OK"))
 
     def test_unused_unsigned_profile_is_a_warning_not_a_failure(self):
         """Severity must mean "will break requests". A profile that was created
@@ -1268,15 +1329,34 @@ class TestDoctor(unittest.TestCase):
         self.assertIn("unknown profile", blob)
         self.assertIn("PRESET", blob, "the fix text must name the real trap")
 
-    def test_soon_to_expire_token_is_a_warning(self):
-        json.dump({"nous": {"access_token": "a", "refresh_token": "r",
-                            "expires_at": time.time() + 300}},
-                  open(mr.OAUTH_PATH, "w"))
-        json.dump({"nous": {"label": "Nous", "refresh_url": "https://r"}},
+    def test_unused_credential_gets_one_line_not_two(self):
+        """The refresh-path note used to fire as a SECOND warning for the same
+        unused credential, so one hygiene item cost two lines to read. It now
+        earns its own line only when a row depends on it."""
+        self.healthy_install(rows=[{"name": "api-row", "base": "https://a/v1",
+                                    "model": "m", "key": "k"}])
+        json.dump({"nous": {"label": "Nous", "class": "oauth"}},
                   open(mr.OAUTH_PROFILES_PATH, "w"))
+        json.dump({"nous": {"access_token": "a",
+                            "expires_at": time.time() - 10}},
+                  open(mr.OAUTH_PATH, "w"))
         code, data = self.run_doctor()
-        self.assertIn("expires in", self.text(data, "WARN"))
-        self.assertEqual(code, 0, "a warning is not a failure")
+        self.assertEqual(len(self.oauth(data, "WARN")), 1,
+                         "one unused dead credential = one line, got %s"
+                         % [c["detail"] for c in self.oauth(data, "WARN")])
+        self.assertEqual(code, 0)
+
+    def test_refresh_path_note_fires_when_a_row_depends(self):
+        self.healthy_install(rows=[
+            {"name": "nous-row", "base": "https://b/v1", "model": "m",
+             "oauth_provider": "nous"}])
+        json.dump({"nous": {"label": "Nous", "class": "oauth"}},
+                  open(mr.OAUTH_PROFILES_PATH, "w"))
+        json.dump({"nous": {"access_token": "a",
+                            "expires_at": time.time() + 9e4}},
+                  open(mr.OAUTH_PATH, "w"))
+        code, data = self.run_doctor()
+        self.assertIn("no refresh path stored", self.text(data, "WARN"))
 
     def test_clobbered_registry_device_fields_are_caught(self):
         """`oauth add` rewrites provider-registry.json to a minimal shape; the
@@ -1427,6 +1507,20 @@ class TestDoctor(unittest.TestCase):
         with mock.patch.dict(os.environ, {"MINIMALROUTER_TUI": "pretty"}):
             code, data = self.run_doctor()
         self.assertIn("MINIMALROUTER_TUI", self.names(data, "WARN"))
+
+    def test_fail_is_only_ever_claimed_for_something_that_breaks_requests(self):
+        """Structural guard on the severity law: every FAIL must name a row, a
+        key, a port, a file the engine must read, or a schema problem. A FAIL
+        that names only a credential nobody routes through is the defect class
+        this release fixed."""
+        code, data = self.run_doctor()
+        for c in self.findings(data, "FAIL"):
+            blob = (c["name"] + " " + c["detail"] + " " + c["fix"]).lower()
+            self.assertTrue(
+                any(t in blob for t in ("row", "key", "port", "rows.json",
+                                       "oauth.json", "schema", "base", "model",
+                                       "registry", "cannot serve", "recursion")),
+                "FAIL with no request-breaking subject: %r" % c)
 
     def test_every_finding_carries_a_fix_line(self):
         """A diagnosis without a next step is a status report, not a doctor."""

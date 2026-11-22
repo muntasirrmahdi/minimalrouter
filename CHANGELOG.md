@@ -12,6 +12,28 @@ OpenAI-compatible request/response shape, the endpoint, or the install command);
 for backward-compatible features (new providers, classes, dashboard capability, CLI verbs);
 **PATCH** for fixes only.
 
+## [1.3.2] — 2026-11-22
+
+### Fixed
+
+- **`doctor` reported an unused expired credential as a broken request.** Its own
+  docstring defines severity — FAIL means a request will break — but the expiry
+  branch fired FAIL whenever any stored token was past its `expires_at`, whether
+  or not a row depended on it. The first real run on a live install printed
+  `UNHEALTHY — 1 thing(s) will break requests` for an `inference` token that had
+  been dead for four days while **zero** of the install's eight rows rode an
+  OAuth profile: nothing could break. A diagnostic that cries wolf about hygiene
+  trains the user to ignore every finding it produces, which is the exact failure
+  the command exists to prevent.
+
+  Expired and near-expiry tokens are now graded by dependency: FAIL only when a
+  row references the profile, WARN when it does not, and a purely informational
+  line when an unused token is merely expiring soon. The remedy text still names
+  the right verb in each case — `minimalrouter refresh <id>` when a headless
+  refresh path is stored, interactive `minimalrouter oauth <id>` when it is not.
+  The law is now stated in the docstring and pinned by a structural test that
+  rejects any FAIL without a request-breaking subject.
+
 ## [1.3.1] — 2026-11-22
 
 ### Fixed
