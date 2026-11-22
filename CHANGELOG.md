@@ -12,6 +12,28 @@ OpenAI-compatible request/response shape, the endpoint, or the install command);
 for backward-compatible features (new providers, classes, dashboard capability, CLI verbs);
 **PATCH** for fixes only.
 
+## [1.3.1] — 2026-11-22
+
+### Fixed
+
+- **The test suite was writing to the live log, and `doctor` then reported that
+  noise as a real failure.** `probe_row()`, `api_disable()` and the OAuth
+  translators call `log()` on their own code path, so any test that exercises
+  them appends to `~/.minimalrouter/minimalrouter.log` no matter what the test
+  class patches. Per-class isolation cannot cover an indirect write: the module
+  global is reached from inside the engine function, not from the test.
+  `test_probe_of_self_row_fails_honestly` left
+  `FAIL m via self-row … 127.0.0.1:9322` lines in the real log, and the first
+  `minimalrouter doctor` run printed that as its last log line — a diagnostic
+  reporting the estate's own test noise is worse than no diagnostic, because it
+  trains the user to distrust every finding.
+
+  The log is now redirected once, at module import, into a session temp
+  directory, so the live path is unavailable to the suite rather than opt-in.
+  Verified by measurement rather than by reading the code: a full 122-test run
+  leaves the real log byte-identical (mtime `07:13:06.164316945`, 828,185 bytes
+  before and after). No engine test reads the log, so nothing lost a fixture.
+
 ## [1.3.0] — 2026-11-22
 
 ### Added

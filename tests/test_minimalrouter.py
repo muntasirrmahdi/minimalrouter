@@ -31,6 +31,21 @@ assert _spec is not None and _spec.loader is not None
 mr = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(mr)
 
+# SESSION-WIDE LOG ISOLATION. Per-class patching of LOG_PATH cannot work, because
+# engine functions call log() INTERNALLY: probe_row(), api_disable() and the
+# translators all write the module global on their own code path, so a test that
+# never mentions LOG_PATH still appends to the real file. Found by
+# `minimalrouter doctor`, which read the live log tail and displayed
+# "FAIL m via self-row ... 127.0.0.1:9322" — pollution written by
+# test_probe_of_self_row_fails_honestly — as if it were a real outage.
+#
+# Redirect once, here, so the wrong path is unavailable rather than opt-in. No
+# engine test reads the log (verified: only the doctor class references LOG_PATH
+# at all), and a diagnostic that reports the estate's own test noise is worse
+# than no diagnostic.
+_LOG_TMP = tempfile.TemporaryDirectory(prefix="mr-tests-log-")
+setattr(mr, "LOG_PATH", os.path.join(_LOG_TMP.name, "minimalrouter.log"))
+
 
 def free_port():
     s = socket.socket()
