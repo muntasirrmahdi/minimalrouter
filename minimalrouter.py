@@ -53,9 +53,11 @@ per-row cw/tps/ok_pct + pool stats (req/min, tokens/s floor, err%, uptime) +
 probe progress. Enabled rows are probed at boot and every
 MINIMALROUTER_PROBE_INTERVAL seconds (default 600; 0 = boot probe only).
 """
+import ast
 import json
 import os
 import re
+import socket
 import sys
 import time
 import urllib.error
@@ -74,7 +76,7 @@ except ImportError:  # platform without curses -> main() degrades to serve
 # CHANGELOG and the git tag all derive from this one line. MAJOR.MINOR.PATCH per
 # semver.org: MAJOR on a breaking client contract, MINOR on backward-compatible
 # features, PATCH on fixes.
-__version__ = "1.2.5"
+__version__ = "1.3.0"
 
 HOME = os.path.expanduser("~")
 MR_HOME = os.path.join(HOME, ".minimalrouter")
@@ -2470,6 +2472,8 @@ Usage:
   minimalrouter oauth rm <id>  delete a profile and its token
   minimalrouter refresh [id] refresh OAuth token(s) now (all, or one provider)
   minimalrouter stop         stop the running server/dashboard by verified PID
+  minimalrouter doctor       self-diagnose this install (never spends a token)
+  minimalrouter doctor --fix apply the safe reversible repairs
   minimalrouter -h|--help    show this help
   minimalrouter -v           show version
 
@@ -2547,6 +2551,567 @@ def _load_textual_dashboard():
         log("textual dashboard failed to load: %s" % e)
         return None
 
+
+# --- splice source: inserted into minimalrouter.py before def main() --------
+def _dash_sibling():
+    """Path of the dashboard module that sits NEXT TO this engine file.
+
+    The installer copies both into ~/.minimalrouter and the repo carries both,
+    so the sibling directory is always right — never assume MR_HOME: a checkout
+    run imports the engine from the repo, not from the home install.
+    """
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "minimalrouter_dashboard.py")
+
+
+def _theme_keys():
+    """Theme keys read out of the dashboard SOURCE, without importing it.
+
+    doctor must work when Textual is broken or absent — that is frequently the
+    very reason it was called — so the keys are parsed as text rather than
+    imported through a module that starts with `import textual`.
+    """
+    try:
+        with open(_dash_sibling(), encoding="utf-8") as f:
+            src = f.read()
+    except OSError:
+        return []
+    m = re.search(r"^THEMES = \[(.*?)^\]", src, re.S | re.M)
+    if not m:
+        return []
+    return re.findall(r'key="([a-z0-9_-]+)"', m.group(1))
+
+
+def _port_holder(port):
+    """Who is listening on `port`? Linux-only pid resolution, never a signal.
+
+    Returns (listening, pid_or_None, cmdline). A diagnostic tool that kills or
+    signals processes is not a diagnostic tool.
+    """
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=0.35):
+            pass
+    except OSError:
+        return (False, None, "")
+    try:
+        inodes = set()
+        for proto in ("tcp", "tcp6"):
+            with open("/proc/net/%s" % proto, encoding="utf-8") as f:
+                for line in list(f)[1:]:
+                    p = line.split()
+                    if len(p) < 10:
+                        continue
+                    try:
+                        pnum = int(p[1].rsplit(":", 1)[1], 16)
+                    except ValueError:
+                        continue
+                    if pnum == port and p[3] == "0A":      # 0A = LISTEN
+                        inodes.add(p[9])
+        if not inodes:
+            return (True, None, "")
+        for pid in os.listdir("/proc"):
+            if not pid.isdigit():
+                continue
+            try:
+                for ent in os.listdir("/proc/%s/fd" % pid):
+                    try:
+                        link = os.readlink("/proc/%s/fd/%s" % (pid, ent))
+                    except OSError:
+                        continue
+                    if link.startswith("socket:[") and link[8:-1] in inodes:
+                        with open("/proc/%s/cmdline" % pid,
+                                  encoding="utf-8", errors="replace") as f:
+                            return (True, int(pid),
+                                    f.read().replace("\0", " ").strip()[:110])
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return (True, None, "")
+
+
+def doctor(fix=False, as_json=False):
+    """Self-diagnosis for THIS install. stdlib only, and it never spends a token.
+
+    Cost: zero. The only network reads are loopback (`/api/state`, `/v1/models`)
+    when a server is already up. No inference request is ever issued, so this is
+    safe to run against a wallet-backed pool without a spend disclosure.
+
+    Every check maps to a failure mode this project actually has, because the
+    installer's failures are SILENT — a venv that cannot be built, or a pip that
+    cannot reach the network, leaves a working router with a plain curses board
+    and no message anywhere explaining why:
+
+      install.sh venv/pip fails          -> launcher pins bare python3
+      ~/.local/bin not on PATH           -> `minimalrouter: command not found`
+      bridges/zcode-identity.json lost   -> zcode rows answer 405 code 3012
+      `oauth add` rewrites the registry  -> device-flow fields gone, so a
+                                             expired token cannot be renewed
+      key_env set in the SHELL only      -> load_env() reads ~/.hermes/.env and
+                                             never merges os.environ, so the
+                                             engine cannot see the key at all
+      a row points at our own port       -> unbounded self-recursion (freebuff
+                                             bridge, 2026-11-21: 18 nested
+                                             'all rows failed' envelopes)
+      stale pidfile                      -> `stop` and the bind check lie
+      served version != file on disk     -> the board shows a version that is
+                                             not the code answering requests
+      prefs name a dead theme            -> the board paints from defaults,
+                                             silently ignoring the saved choice
+
+    Exit code 1 if any check FAILS, else 0. `--fix` applies only safe,
+    reversible repairs (stale pidfile, secret-file permissions) and prints each
+    one. It NEVER touches rows.json, oauth.json or dashboard.json: those hold
+    the user's data and his live preferences, and a diagnostic that overwrites
+    them is a second incident, not a fix.
+    """
+    L = []
+
+    def add(level, name, detail="", hint=""):
+        L.append((level, name, detail, hint))
+
+    eng = os.path.abspath(__file__)
+    from_repo = os.path.exists(os.path.join(os.path.dirname(eng), ".git"))
+
+    # ---------------------------------------------------------- install
+    try:
+        with open(eng, encoding="utf-8") as f:
+            src = f.read()
+        try:
+            ast.parse(src)
+            add("OK", "engine", "%s parses, %d lines"
+                % (eng, src.count("\n") + 1))
+        except SyntaxError as e:
+            add("FAIL", "engine", "syntax error at line %d: %s"
+                % (e.lineno or 0, e.msg),
+                "this install is corrupt. Re-run:\n"
+                "      curl -fsSL https://raw.githubusercontent.com/"
+                "muntasirrmahdi/minimalrouter/main/install.sh | sh")
+        m = re.search(r'^__version__ = "([^"]+)"', src, re.M)
+        ver = m.group(1) if m else "?"
+    except OSError as e:
+        add("FAIL", "engine", "unreadable: %s" % e, "re-run the installer")
+        ver = "?"
+
+    if os.path.exists(_dash_sibling()):
+        add("OK", "dashboard module", "minimalrouter_dashboard.py present")
+    else:
+        add("WARN", "dashboard module", "absent next to the engine",
+            "the board falls back to the built-in curses UI. Re-run install.sh "
+            "(without --curses) to get Mission Control.")
+
+    binp = os.path.join(HOME, ".local", "bin", "minimalrouter")
+    venv_py = ""
+    if not os.path.exists(binp):
+        if from_repo:
+            add("OK", "launcher", "not installed — running from a git checkout",
+                "install with: sh install.sh   (from the repo root)")
+        else:
+            add("FAIL", "launcher", "%s does not exist" % binp,
+                "re-run install.sh; nothing on PATH can start the router")
+    else:
+        try:
+            with open(binp, encoding="utf-8") as f:
+                lt = f.read()
+        except OSError as e:
+            lt = ""
+            add("FAIL", "launcher", "unreadable: %s" % e, "re-run install.sh")
+        mv = re.search(r'^exec "([^"]+)" "([^"]+)/minimalrouter\.py"', lt, re.M)
+        ms = re.search(r'^exec (python3) "([^"]+)/minimalrouter\.py"', lt, re.M)
+        if not (mv or ms):
+            add("FAIL", "launcher", "unrecognised launcher text",
+                "re-run install.sh — it rewrites this file")
+        elif mv:
+            venv_py = mv.group(1)
+            if os.path.exists(venv_py):
+                add("OK", "launcher", "pins %s (Mission Control lane)" % venv_py)
+            else:
+                add("FAIL", "launcher",
+                    "pins %s which DOES NOT EXIST — every `minimalrouter` call "
+                    "dies before Python starts" % venv_py,
+                    "re-run install.sh to rebuild the dashboard venv")
+        else:
+            add("WARN", "launcher", "pins system python3 — the curses board only",
+                "the beautiful board is not opt-in on this install. Re-run "
+                "install.sh (no --curses) to bundle Textual in "
+                "~/.minimalrouter/.venv")
+        if os.access(binp, os.X_OK) and (mv or ms):
+            add("OK", "launcher exec bit", "executable")
+        elif (mv or ms):
+            add("WARN", "launcher exec bit", "not executable",
+                "chmod +x %s" % binp)
+
+    local_bin = os.path.join(HOME, ".local", "bin")
+    on_path = False
+    for p in os.environ.get("PATH", "").split(os.pathsep):
+        if not p or not os.path.isdir(p):
+            continue
+        try:
+            if os.path.samefile(p, local_bin):
+                on_path = True
+                break
+        except OSError:
+            continue
+    if on_path:
+        add("OK", "PATH", "~/.local/bin is on it")
+    else:
+        add("WARN", "PATH", "%s is NOT on your PATH" % local_bin,
+            "type `minimalrouter` and the shell says command not found. Fix:\n"
+            "      echo 'export PATH=\"$HOME/.local/bin:$PATH\"' >> ~/.bashrc "
+            "&& exec $SHELL")
+
+    pref = os.environ.get("MINIMALROUTER_TUI", "auto").strip().lower()
+    if pref in ("auto", "textual", "curses"):
+        add("OK", "MINIMALROUTER_TUI", pref)
+    else:
+        add("WARN", "MINIMALROUTER_TUI", "%r is not auto|textual|curses" % pref,
+            "an unrecognised value is treated as auto by the engine")
+
+    # ---------------------------------------------------------- rows
+    rows_raw = None
+    if not os.path.exists(ROWS_PATH):
+        add("FAIL", "rows.json", "missing: %s" % ROWS_PATH,
+            "seed it: cp %s %s" % (os.path.join(MR_HOME, "rows.example.json"),
+                                   ROWS_PATH))
+    else:
+        try:
+            with open(ROWS_PATH, encoding="utf-8") as f:
+                rows_raw = json.load(f)
+        except json.JSONDecodeError as e:
+            add("FAIL", "rows.json", "invalid JSON at line %d: %s"
+                % (e.lineno, e.msg),
+                "the engine cannot load the pool at all until this parses")
+        except OSError as e:
+            add("FAIL", "rows.json", "unreadable: %s" % e, "check permissions")
+
+    rows = rows_raw if isinstance(rows_raw, list) else []
+    if isinstance(rows_raw, list) and not rows:
+        add("WARN", "rows.json", "the pool is EMPTY — nothing can be routed",
+            "start the board and press a, or copy rows.example.json")
+
+    # resolved view: the engine's own loader, so the key rule cannot drift
+    resolved = {}
+    try:
+        for r in read_rows():
+            resolved[r.get("name")] = r
+    except Exception as e:
+        add("WARN", "rows.json", "engine loader failed: %s" % e,
+            "the pool will not load; fix the file above")
+
+    bad, dupes, self_ref, shell_only, no_key = [], [], [], [], []
+    seen = set()
+    for i, r in enumerate(rows):
+        if not isinstance(r, dict):
+            bad.append("#%d is not an object" % i)
+            continue
+        name = str(r.get("name") or "").strip()
+        tag = name or "#%d" % i
+        if not name:
+            bad.append("%s has no name" % tag)
+        elif name in seen:
+            dupes.append(name)
+        else:
+            seen.add(name)
+        base = str(r.get("base") or "")
+        if not base.startswith("http"):
+            bad.append("%s base %r is not an http(s) URL" % (tag, base[:44]))
+        if not str(r.get("model") or "").strip():
+            bad.append("%s has no model" % tag)
+        if _is_self_base(base):
+            self_ref.append(tag)
+        if r.get("oauth_provider"):
+            continue
+        kenv = str(r.get("key_env") or "").strip()
+        inline = str(resolved.get(name, r).get("key") or "")
+        if inline:
+            continue
+        if kenv:
+            # load_env() reads ~/.hermes/.env ONLY — it never merges os.environ.
+            # A var exported in the shell is invisible to the engine.
+            if os.environ.get(kenv):
+                shell_only.append("%s (%s is set in the shell, absent from "
+                                  "~/.hermes/.env)" % (tag, kenv))
+            else:
+                no_key.append("%s (needs %s)" % (tag, kenv))
+    if bad:
+        add("FAIL", "row schema", "; ".join(bad[:6]),
+            "the engine skips what it cannot use, so that provider is silently "
+            "missing from the pool")
+    elif rows:
+        add("OK", "row schema", "%d rows: name/base/model all valid" % len(rows))
+    if dupes:
+        add("FAIL", "row names", "duplicate: %s" % ", ".join(sorted(set(dupes))),
+            "row state is keyed by name — a duplicate overwrites the other's "
+            "health and both look broken")
+    if self_ref:
+        add("FAIL", "self-recursion", "row(s) point at this router: %s"
+            % ", ".join(self_ref),
+            "delete them. A self-referential row makes the router call itself "
+            "in an unbounded loop")
+    elif rows:
+        add("OK", "self-recursion", "no row points at 127.0.0.1:%d" % PORT)
+    if shell_only:
+        add("FAIL", "key resolution", "key visible to the SHELL but not the "
+            "engine: %s" % ", ".join(shell_only[:5]),
+            "load_env() reads ~/.hermes/.env and never merges os.environ, so "
+            "an `export` alone does not reach the router. Append it to "
+            "~/.hermes/.env instead")
+    if no_key:
+        add("FAIL", "key resolution", "row(s) that can NEVER serve: %s"
+            % ", ".join(no_key[:6]),
+            "add the variable to ~/.hermes/.env, or paste the key in the board")
+    if not (shell_only or no_key) and rows:
+        add("OK", "key resolution", "every api/keyless row resolves a key")
+    parked = [str(r.get("name")) for r in rows
+              if isinstance(r, dict) and r.get("disabled")]
+    if parked:
+        add("OK", "parked rows", "%d disabled, never routed: %s"
+            % (len(parked), ", ".join(parked[:8])))
+
+    # ---------------------------------------------------------- OAuth
+    profiles = read_oauth_profiles()
+    auth = read_oauth()
+    now = time.time()
+    if not profiles and not auth:
+        add("OK", "OAuth", "none configured (api/keyless rows only)")
+    if any(isinstance(r, dict) and r.get("oauth_provider") == "zcode"
+           for r in rows):
+        if os.path.exists(ZCODE_IDENTITY_PATH):
+            add("OK", "zcode bridge", "bridges/zcode-identity.json present")
+        else:
+            add("FAIL", "zcode bridge", "zcode row exists but the identity "
+                "asset is missing",
+                "the vendor answers 405 code 3012 on an empty identity. Re-run "
+                "install.sh — it fetches bridges/zcode-identity.json")
+    used_profs = {str(r.get("oauth_provider")) for r in rows
+                  if isinstance(r, dict) and r.get("oauth_provider")}
+    orphan = sorted(used_profs - set(profiles))
+    if orphan:
+        add("FAIL", "OAuth profiles", "row(s) reference unknown profile(s): %s"
+            % ", ".join(orphan),
+            "a registry PRESET is not a profile: create it first with "
+            "`minimalrouter oauth add <id>`")
+    for pid in sorted(set(list(profiles) + list(auth))):
+        tok = auth.get(pid) or {}
+        acc = tok.get("access_token")
+        exp = float(tok.get("expires_at") or 0)
+        spec = profiles.get(pid) or {}
+        can_renew = bool(spec.get("refresh_url") and tok.get("refresh_token"))
+        if not acc:
+            if pid in used_profs:
+                add("FAIL", "oauth:%s" % pid,
+                    "profile created, never signed in, and a row uses it — "
+                    "that row cannot serve",
+                    "minimalrouter oauth %s" % pid)
+            elif pid in profiles:
+                add("WARN", "oauth:%s" % pid,
+                    "profile created, never signed in (no row uses it)",
+                    "harmless until a row points at it: sign in with "
+                    "`minimalrouter oauth %s`, or remove it with "
+                    "`minimalrouter oauth rm %s`" % (pid, pid))
+            continue
+        if exp and exp <= now:
+            if can_renew:
+                add("FAIL", "oauth:%s" % pid,
+                    "token EXPIRED %s (a refresh is available)"
+                    % time.strftime("%d %b %H:%M", time.localtime(exp)),
+                    "minimalrouter refresh %s" % pid)
+            else:
+                add("FAIL", "oauth:%s" % pid,
+                    "token EXPIRED %s and it CANNOT be renewed headlessly"
+                    % time.strftime("%d %b %H:%M", time.localtime(exp)),
+                    "interactive sign-in is required: minimalrouter oauth %s"
+                    % pid)
+        elif exp and exp - now < 900:
+            add("WARN", "oauth:%s" % pid, "expires in %d min"
+                % max(1, int((exp - now) / 60)),
+                "minimalrouter refresh %s   (before it goes 401 mid-request)"
+                % pid)
+        else:
+            if not exp:
+                left = ", no expiry stored"
+            else:
+                mins = int((exp - now) / 60)
+                left = (", %dh left" % (mins // 60) if mins >= 60
+                        else ", %dm left" % max(1, mins))
+            add("OK", "oauth:%s" % pid, "connected%s" % left)
+        if not can_renew and exp:
+            add("WARN", "oauth:%s" % pid, "no refresh path stored",
+                "when this token dies, only an interactive `oauth %s` heals it"
+                % pid)
+
+    reg = read_provider_registry()
+    if not reg:
+        add("FAIL", "provider registry", "empty, missing or unparseable",
+            "restore provider-registry.json from the repo. The `oauth add` flow "
+            "rewrites it to a minimal shape and the device-flow fields are lost")
+    else:
+        thin = [p for p, e in sorted(reg.items()) if not (e or {}).get("base_url")]
+        no_flow = [p for p in sorted(profiles)
+                   if not (reg.get(p) or {}).get("authorize_url")
+                   or not (reg.get(p) or {}).get("token_url")]
+        if thin:
+            add("FAIL", "provider registry", "entries without base_url: %s"
+                % ", ".join(thin), "restore the rich copy from the repo")
+        else:
+            add("OK", "provider registry", "%d providers, every entry has a "
+                "base_url" % len(reg))
+        if no_flow:
+            add("WARN", "provider registry",
+                "device-flow fields lost for: %s" % ", ".join(no_flow),
+                "`oauth add` rewrote this file to a minimal shape. Those "
+                "profiles cannot be signed in again after expiry — restore the "
+                "repo copy of provider-registry.json")
+
+    # ---------------------------------------------------------- prefs
+    prefs_path = os.path.join(MR_HOME, "dashboard.json")
+    keys = _theme_keys()
+    if not os.path.exists(prefs_path):
+        add("OK", "prefs", "none saved — board defaults apply")
+    else:
+        try:
+            with open(prefs_path, encoding="utf-8") as f:
+                pf = json.load(f)
+            if not isinstance(pf, dict):
+                raise ValueError("not an object")
+            th = pf.get("theme")
+            if keys and th not in keys:
+                add("WARN", "prefs", "theme %r does not exist" % th,
+                    "the board paints from defaults and ignores the saved "
+                    "choice. Known: %s. Repick with p / P." % ", ".join(keys))
+            else:
+                add("OK", "prefs", "theme %s · dense %s · motion %s"
+                    % (th, pf.get("dense"), pf.get("motion")))
+        except (OSError, ValueError) as e:
+            add("WARN", "prefs", "unparseable (%s) — defaults apply" % e,
+                "delete it: rm %s" % prefs_path)
+    if keys:
+        add("OK", "themes", "%d available: %s" % (len(keys), ", ".join(keys)))
+
+    # ---------------------------------------------------------- runtime
+    listening, hpid, hcmd = _port_holder(PORT)
+    srv = None
+    try:
+        with urllib.request.urlopen("http://%s:%d/api/state" % (HOST, PORT),
+                                    timeout=1.5) as r:
+            srv = json.loads(r.read().decode("utf-8", "replace"))
+    except Exception:
+        srv = None
+    if isinstance(srv, dict) and "rows" in srv:
+        st = srv.get("stats") or {}
+        v = srv.get("version", "?")
+        if v == ver:
+            add("OK", "server", "live on %d, v%s: %s serving / %s down of %s"
+                % (PORT, v, st.get("serving"), st.get("down"), st.get("rows")))
+        else:
+            add("WARN", "server", "serving v%s but the file on disk says v%s"
+                % (v, ver),
+                "the process answers with code that is not what you are "
+                "reading. Restart it: minimalrouter stop && minimalrouter")
+        try:
+            with urllib.request.urlopen("http://%s:%d/v1/models" % (HOST, PORT),
+                                        timeout=3.0) as r:
+                n = len((json.loads(r.read().decode("utf-8", "replace"))
+                         or {}).get("data") or [])
+            add("OK" if n else "WARN", "/v1/models", "%d models exposed" % n,
+                "" if n else "nothing is exposed: every row is parked, "
+                "unresolvable, or the pool is empty")
+        except Exception as e:
+            add("WARN", "/v1/models", "unreadable: %s" % e, "")
+    elif listening:
+        add("FAIL", "port %d" % PORT,
+            "listens, but it is NOT this router (pid %s: %s)"
+            % (hpid or "?", hcmd or "unknown"),
+            "free it or move the router: MINIMALROUTER_PORT=8790 minimalrouter. "
+            "This is also how a row can end up pointing at itself.")
+    else:
+        add("OK", "port %d" % PORT, "free — no server running")
+
+    pid = 0
+    try:
+        with open(PID_PATH, encoding="utf-8") as f:
+            pid = int((f.read() or "0").strip() or 0)
+    except (OSError, ValueError):
+        pid = 0
+    if pid:
+        if pid_alive(pid):
+            add("OK", "pidfile", "server pid %d alive" % pid)
+        else:
+            add("WARN", "pidfile", "stale: pid %d is dead, %s still exists"
+                % (pid, PID_PATH), "minimalrouter doctor --fix clears it")
+            if fix:
+                try:
+                    os.remove(PID_PATH)
+                    add("OK", "fix applied", "removed the stale pidfile", "")
+                except OSError as e:
+                    add("WARN", "fix", "could not remove pidfile: %s" % e, "")
+    elif isinstance(srv, dict) and "rows" in srv:
+        add("WARN", "pidfile", "a server answers but no pidfile exists",
+            "`minimalrouter stop` cannot verify the PID, so it may refuse to "
+            "kill the wrong process. Restart it to rewrite the pidfile.")
+    else:
+        add("OK", "pidfile", "none (clean state)")
+
+    try:
+        with open(LOG_PATH, "a", encoding="utf-8"):
+            pass
+        tail = ""
+        try:
+            with open(LOG_PATH, encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()
+                tail = lines[-1].strip()[:64] if lines else ""
+        except OSError:
+            pass
+        add("OK", "log", "writable%s" % (" · last: " + tail if tail else ""), "")
+    except OSError as e:
+        add("FAIL", "log", "not writable: %s" % e,
+            "the engine cannot record events; check ownership of ~/.minimalrouter")
+
+    for p, tag in ((ROWS_PATH, "rows.json"), (OAUTH_PATH, "oauth.json")):
+        try:
+            mode = os.stat(p).st_mode & 0o777
+        except OSError:
+            continue
+        if mode & 0o077:
+            add("WARN", "perms · %s" % tag,
+                "mode %03o is group/world readable and it holds keys" % mode,
+                "chmod 600 %s" % p)
+            if fix:
+                try:
+                    os.chmod(p, 0o600)
+                    add("OK", "fix applied", "chmod 600 %s" % p, "")
+                except OSError as e:
+                    add("WARN", "fix", "chmod failed on %s: %s" % (tag, e), "")
+        else:
+            add("OK", "perms · %s" % tag, "mode %03o" % mode)
+
+    # ---------------------------------------------------------- report
+    n_fail = sum(1 for x in L if x[0] == "FAIL")
+    n_warn = sum(1 for x in L if x[0] == "WARN")
+    n_ok = len(L) - n_fail - n_warn
+    if as_json:
+        print(json.dumps({"version": ver, "port": PORT, "home": MR_HOME,
+                          "ok": n_ok, "warn": n_warn, "fail": n_fail,
+                          "healthy": n_fail == 0,
+                          "checks": [{"level": a, "name": b, "detail": c,
+                                      "fix": d} for a, b, c, d in L]}, indent=2))
+        return 1 if n_fail else 0
+    tag = {"OK": "[ ok ]", "WARN": "[warn]", "FAIL": "[FAIL]"}
+    print("minimalrouter doctor · v%s · home %s · port %d" % (ver, MR_HOME, PORT))
+    print("=" * 76)
+    for lvl, nm, detail, hint in L:
+        print("%-6s %-24s %s" % (tag[lvl], nm, detail))
+        if hint:
+            for hl in hint.split("\n"):
+                print("            %s" % hl)
+    print("=" * 76)
+    verdict = ("UNHEALTHY — %d thing(s) will break requests" % n_fail if n_fail
+               else "HEALTHY%s" % (" (%d warning(s))" % n_warn if n_warn else ""))
+    print("%d checks · %d ok · %d warn · %d fail · %s"
+          % (len(L), n_ok, n_warn, n_fail, verdict))
+    if (n_fail or n_warn) and not fix:
+        print("Safe reversible repairs run with: minimalrouter doctor --fix")
+    return 1 if n_fail else 0
 
 def main():
     os.makedirs(MR_HOME, exist_ok=True)
@@ -2788,6 +3353,9 @@ def main():
             print("%-12s %s" % (pid, ("OK " if ok else "FAIL ") + msg))
             bad += 0 if ok else 1
         return 1 if bad else 0
+    if args and args[0].lower() == "doctor":
+        return doctor(fix=("--fix" in args[1:] or "-f" in args[1:]),
+                      as_json="--json" in args[1:])
     mode = args[0] if args else "tui"
     if mode not in ("tui", "serve"):
         print("minimalrouter: unknown command %r\n" % mode)

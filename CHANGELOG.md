@@ -12,6 +12,20 @@ OpenAI-compatible request/response shape, the endpoint, or the install command);
 for backward-compatible features (new providers, classes, dashboard capability, CLI verbs);
 **PATCH** for fixes only.
 
+## [1.3.0] — 2026-11-22
+
+### Added
+
+- **`minimalrouter doctor`** — self-diagnosis for the install a stranger just made. stdlib only, no Textual import, and it never issues an inference request, so it is safe to run against a wallet-backed pool: the only network reads are loopback `/api/state` and `/v1/models` when a server is already up.
+
+  The installer's failure modes are silent, which is the gap this closes. A venv that cannot be built or a `pip install textual` that cannot reach the network leaves a working router with a plain curses board and no message anywhere saying why. Doctor checks each promise the installer makes and prints a one-line fix per finding: launcher pinned to a missing interpreter, launcher pinned to bare `python3` (curses lane), `~/.local/bin` off `PATH`, missing `bridges/zcode-identity.json` (the vendor answers 405 code 3012), a provider registry whose device-flow fields were lost to the `oauth add` rewrite, rows that can never serve, duplicate row names, a row pointing at the router's own port, an expired OAuth token with or without a headless renewal path, a saved theme that no longer exists, a stale pidfile, a port held by a foreign process, and secret files readable by the group.
+
+  One finding is new knowledge, not a restatement: `load_env()` reads `~/.hermes/.env` and never merges `os.environ`, so a key the user `export`ed into his shell is invisible to the engine while looking perfectly set in every other tool. Doctor reports that row as a failure and says where the variable has to live.
+
+  `--fix` applies only safe reversible repairs (stale pidfile, `chmod 600` on the two secret files). It never touches `rows.json`, `oauth.json` or `dashboard.json`: those hold the user's data and his live preferences, and a diagnostic that overwrites them creates a second incident. `--json` emits the same findings machine-readably for a heartbeat cron. Exit code is 1 when anything FAILs, 0 otherwise.
+
+  Contribution taken from PR #1 (`akash-xzh`, closed 2026-11-19 with the approved note at comment `6989476775`), which proposed a `doctor` command; the implementation here is ours, written against this project's own recorded failure modes.
+
 ## [1.2.5] — 2026-11-22
 
 ### Fixed

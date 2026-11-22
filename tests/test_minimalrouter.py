@@ -941,3 +941,528 @@ class TestSelfBaseGuard(unittest.TestCase):
             mr.PORT = old
             mr.ROW_STATE.clear()
             mr.ROW_STATE.update(_saved)
+
+
+# ---- v1.3.0 doctor tests (the install's silent failures, made loud) ----
+#
+# The installer's failure modes are silent by construction: a venv that cannot
+# be built, or a pip that cannot reach the network, still produces a working
+# router — with a plain curses board and no message anywhere saying why. These
+# tests pin the findings doctor exists to produce, and one of them is new
+# knowledge rather than a restatement: load_env() reads ~/.hermes/.env and never
+# merges os.environ, so an exported key is invisible to the engine.
+
+
+class TestDoctor(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        home = self._tmp.name
+        self.home = home
+        self._saved = {}
+        for attr in ("MR_HOME", "ROWS_PATH", "OAUTH_PATH", "OAUTH_PROFILES_PATH",
+                     "PROVIDER_REGISTRY_PATH", "ZCODE_IDENTITY_PATH", "PID_PATH",
+                     "LOG_PATH", "ENV", "PORT", "HOME"):
+            self._saved[attr] = getattr(mr, attr)
+        mr.MR_HOME = home
+        mr.ROWS_PATH = os.path.join(home, "rows.json")
+        mr.OAUTH_PATH = os.path.join(home, "oauth.json")
+        mr.OAUTH_PROFILES_PATH = os.path.join(home, "oauth-providers.json")
+        mr.PROVIDER_REGISTRY_PATH = os.path.join(home, "provider-registry.json")
+        mr.ZCODE_IDENTITY_PATH = os.path.join(home, "bridges",
+                                              "zcode-identity.json")
+        mr.PID_PATH = os.path.join(home, "minimalrouter.pid")
+        mr.LOG_PATH = os.path.join(home, "minimalrouter.log")
+        mr.ENV = {}
+        mr.HOME = home
+        mr.PORT = free_port()          # nothing listens -> the free branch
+        self.healthy_install()
+
+    def tearDown(self):
+        for attr, val in self._saved.items():
+            setattr(mr, attr, val)
+        self._tmp.cleanup()
+
+    # ---------------- fixtures ----------------
+    def healthy_install(self, rows=None):
+        json.dump(rows if rows is not None else [
+            {"name": "groq-qwen", "base": "https://api.groq.com/openai/v1",
+             "model": "openai/gpt-oss-120b", "key": "sk-inline"}],
+            open(mr.ROWS_PATH, "w"))
+        os.chmod(mr.ROWS_PATH, 0o600)
+        json.dump({}, open(mr.OAUTH_PATH, "w"))
+        json.dump({}, open(mr.OAUTH_PROFILES_PATH, "w"))
+        os.chmod(mr.OAUTH_PATH, 0o600)
+        json.dump({"providers": {
+            "nous": {"label": "Nous", "base_url": "https://portal.nousresearch.com",
+                     "models": ["x"], "authorize_url": "https://a",
+                     "token_url": "https://t"}}},
+            open(mr.PROVIDER_REGISTRY_PATH, "w"))
+        json.dump({"theme": "midnight", "dense": False, "motion": True},
+                  open(os.path.join(mr.MR_HOME, "dashboard.json"), "w"))
+        open(mr.LOG_PATH, "w").close()
+
+    def run_doctor(self, fix=False):
+        import io
+        from contextlib import redirect_stdout
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = mr.doctor(fix=fix, as_json=True)
+        data = json.loads(buf.getvalue())
+        return code, data
+
+    def findings(self, data, level=None):
+        out = [c for c in data["checks"] if level is None or c["level"] == level]
+        return out
+
+    def names(self, data, level):
+        return [c["name"] for c in self.findings(data, level)]
+
+    def text(self, data, level):
+        return " | ".join(c["name"] + ": " + c["detail"] + " " + c["fix"]
+                          for c in self.findings(data, level))
+
+    # ---------------- the contract ----------------
+    def test_healthy_install_reports_zero_failures(self):
+        code, data = self.run_doctor()
+        self.assertEqual(code, 0, "exit code must be 0 with nothing failing")
+        self.assertTrue(data["healthy"])
+        self.assertEqual(data["fail"], 0,
+                         "unexpected FAILs: %s" % self.text(data, "FAIL"))
+
+    def test_json_output_is_machine_readable(self):
+        code, data = self.run_doctor()
+        for k in ("version", "port", "home", "ok", "warn", "fail", "healthy",
+                  "checks"):
+            self.assertIn(k, data)
+        self.assertTrue(data["checks"])
+        for c in data["checks"]:
+            self.assertIn(c["level"], ("OK", "WARN", "FAIL"))
+            for k in ("name", "detail", "fix"):
+                self.assertIsInstance(c[k], str)
+
+    def test_exit_code_is_one_when_anything_fails(self):
+        json.dump([{"name": "broken", "base": "not-a-url", "model": ""}],
+                  open(mr.ROWS_PATH, "w"))
+        code, data = self.run_doctor()
+        self.assertEqual(code, 1)
+        self.assertFalse(data["healthy"])
+        self.assertGreater(data["fail"], 0)
+
+    def test_it_never_spends_a_token(self):
+        """The wallet-disclosure guarantee: doctor must not issue an inference
+        request, so it is safe to run against a wallet-backed pool."""
+        seen = []
+
+        def spy(url, *a, **k):
+            u = url if isinstance(url, str) else getattr(url, "full_url", str(url))
+            seen.append(u)
+            raise mr.urllib.error.URLError("doctor test: no network")
+        with mock.patch.object(mr.urllib.request, "urlopen", spy):
+            code, data = self.run_doctor()
+        for u in seen:
+            self.assertIn("127.0.0.1", u, "doctor touched a non-loopback host: %s" % u)
+            self.assertNotIn("chat/completions", u)
+            self.assertNotIn("completions", u)
+        self.assertEqual(code, 0, "an unreachable server must not be a failure")
+
+    def test_a_dead_server_is_not_reported_as_broken(self):
+        """doctor is called BEFORE anything runs, most of the time."""
+        code, data = self.run_doctor()
+        self.assertEqual(code, 0)
+        self.assertIn("port %d" % mr.PORT, self.names(data, "OK"))
+
+    # ---------------- the rows findings ----------------
+    def test_key_set_in_the_shell_but_not_in_env_file_is_a_failure(self):
+        """THE new finding. load_env() reads ~/.hermes/.env only and never
+        merges os.environ — so an `export` looks set everywhere except in the
+        engine that has to use it."""
+        self.healthy_install(rows=[
+            {"name": "groq-qwen", "base": "https://api.groq.com/openai/v1",
+             "model": "openai/gpt-oss-120b", "key_env": "MR_DOCTOR_TEST_KEY"}])
+        with mock.patch.dict(os.environ, {"MR_DOCTOR_TEST_KEY": "sk-secret"}):
+            code, data = self.run_doctor()
+        blob = self.text(data, "FAIL")
+        self.assertIn("key resolution", self.names(data, "FAIL"))
+        self.assertIn("shell", blob, "must name the shell-vs-env-file split")
+        self.assertIn(".env", blob, "must say where the variable has to live")
+        self.assertEqual(code, 1)
+
+    def test_missing_key_variable_is_a_failure(self):
+        self.healthy_install(rows=[
+            {"name": "groq-qwen", "base": "https://api.groq.com/openai/v1",
+             "model": "openai/gpt-oss-120b", "key_env": "MR_NOWHERE_SET"}])
+        code, data = self.run_doctor()
+        blob = self.text(data, "FAIL")
+        self.assertIn("MR_NOWHERE_SET", blob)
+        self.assertIn("NEVER serve", blob)
+
+    def test_key_present_in_the_env_file_passes(self):
+        self.healthy_install(rows=[
+            {"name": "groq-qwen", "base": "https://api.groq.com/openai/v1",
+             "model": "openai/gpt-oss-120b", "key_env": "MR_IN_ENV_FILE"}])
+        mr.ENV = {"MR_IN_ENV_FILE": "sk-real"}
+        code, data = self.run_doctor()
+        self.assertNotIn("key resolution", self.names(data, "FAIL"),
+                         "the engine's own resolution rule must be reused")
+        self.assertEqual(code, 0)
+
+    def test_keyless_row_is_not_flagged(self):
+        """A row with no key and no key_env is a legitimate KEYLESS row —
+        doctor must not invent a failure for it."""
+        self.healthy_install(rows=[
+            {"name": "kilo-free", "base": "https://api.kilo.ai/api/openrouter",
+             "model": "kilo-auto/free"}])
+        code, data = self.run_doctor()
+        self.assertEqual(self.findings(data, "FAIL"), [],
+                         "a keyless row is legitimate: %s"
+                         % self.text(data, "FAIL"))
+        self.assertEqual(mr.row_class({"name": "kilo-free", "base": "b",
+                                       "model": "m"}), "keyless",
+                         "the engine itself must agree the row is keyless")
+
+    def test_self_referential_row_is_a_failure(self):
+        """The freebuff-bridge incident: a row pointing at our own port makes
+        the router call itself in an unbounded loop."""
+        self.healthy_install(rows=[
+            {"name": "loop", "base": "http://127.0.0.1:%d/v1" % mr.PORT,
+             "model": "m", "key": "k"}])
+        code, data = self.run_doctor()
+        self.assertIn("self-recursion", self.names(data, "FAIL"))
+        self.assertEqual(code, 1)
+
+    def test_duplicate_row_names_are_a_failure(self):
+        """Row state is keyed by name, so a duplicate silently overwrites the
+        other's health and both look broken."""
+        self.healthy_install(rows=[
+            {"name": "same", "base": "https://a/v1", "model": "m", "key": "k"},
+            {"name": "same", "base": "https://b/v1", "model": "m", "key": "k"}])
+        code, data = self.run_doctor()
+        self.assertIn("row names", self.names(data, "FAIL"))
+
+    def test_malformed_rows_are_a_failure_not_a_silent_skip(self):
+        self.healthy_install(rows=[
+            {"name": "no-base", "model": "m", "key": "k"},
+            {"name": "no-model", "base": "https://a/v1", "key": "k"}])
+        code, data = self.run_doctor()
+        blob = self.text(data, "FAIL")
+        self.assertIn("no-base", blob)
+        self.assertIn("no-model", blob)
+
+    def test_empty_pool_is_a_warning_not_a_crash(self):
+        self.healthy_install(rows=[])
+        code, data = self.run_doctor()
+        self.assertIn("EMPTY", self.text(data, "WARN").upper())
+        self.assertEqual(code, 0, "an empty pool is usable, just idle")
+
+    def test_unparseable_rows_file_is_a_failure(self):
+        open(mr.ROWS_PATH, "w").write("{not json")
+        code, data = self.run_doctor()
+        self.assertIn("rows.json", self.names(data, "FAIL"))
+        self.assertEqual(code, 1)
+
+    def test_parked_rows_are_reported_not_hidden(self):
+        self.healthy_install(rows=[
+            {"name": "live", "base": "https://a/v1", "model": "m", "key": "k"},
+            {"name": "parked", "base": "https://b/v1", "model": "m", "key": "k",
+             "disabled": True}])
+        code, data = self.run_doctor()
+        self.assertIn("parked", self.text(data, "OK"))
+
+    # ---------------- OAuth findings ----------------
+    def test_expired_token_with_a_refresh_path_says_refresh(self):
+        # ORDER MATTERS: healthy_install() rewrites oauth.json and the
+        # profiles file, so the expired token and its refresh path have to be
+        # laid down AFTER it or the test measures the wrong branch.
+        self.healthy_install(rows=[{"name": "live", "base": "https://a/v1",
+                                    "model": "m", "key": "k"}])
+        json.dump({"nous": {"label": "Nous", "class": "oauth",
+                            "refresh_url": "https://refresh"}},
+                  open(mr.OAUTH_PROFILES_PATH, "w"))
+        json.dump({"nous": {"access_token": "a", "refresh_token": "r",
+                            "expires_at": time.time() - 10}},
+                  open(mr.OAUTH_PATH, "w"))
+        code, data = self.run_doctor()
+        blob = self.text(data, "FAIL")
+        self.assertIn("EXPIRED", blob)
+        self.assertIn("oauth:nous", self.names(data, "FAIL"))
+        self.assertIn("refresh", blob.lower())
+
+    def test_expired_token_without_refresh_says_interactive(self):
+        json.dump({"nous": {"access_token": "a", "expires_at": time.time() - 10}},
+                  open(mr.OAUTH_PATH, "w"))
+        json.dump({}, open(mr.OAUTH_PROFILES_PATH, "w"))
+        code, data = self.run_doctor()
+        blob = self.text(data, "FAIL")
+        self.assertIn("CANNOT be renewed headlessly", blob)
+        self.assertIn("interactive", blob.lower())
+
+    def test_unused_unsigned_profile_is_a_warning_not_a_failure(self):
+        """Severity must mean "will break requests". A profile that was created
+        and never signed in, while no row references it, is dead weight — the
+        real install had exactly this (kilocode) and flagging it as a failure
+        would train Moon to ignore the report."""
+        json.dump({}, open(mr.OAUTH_PATH, "w"))
+        json.dump({"nous": {"label": "Nous", "class": "oauth"}},
+                  open(mr.OAUTH_PROFILES_PATH, "w"))
+        code, data = self.run_doctor()
+        self.assertIn("never signed in", self.text(data, "WARN"))
+        self.assertNotIn("oauth:nous", self.names(data, "FAIL"))
+        self.assertEqual(code, 0, "an unused profile breaks nothing")
+        self.assertIn("oauth rm nous", self.text(data, "WARN"),
+                      "the remedy must offer removal as well as sign-in")
+
+    def test_signed_in_profile_used_by_a_row_is_a_failure(self):
+        """The same shape, but a row points at it: now it really cannot serve."""
+        self.healthy_install(rows=[
+            {"name": "nous-row", "base": "https://a/v1", "model": "m",
+             "oauth_provider": "nous"}])
+        json.dump({}, open(mr.OAUTH_PATH, "w"))
+        json.dump({"nous": {"label": "Nous", "class": "oauth"}},
+                  open(mr.OAUTH_PROFILES_PATH, "w"))
+        code, data = self.run_doctor()
+        self.assertIn("oauth:nous", self.names(data, "FAIL"))
+        self.assertIn("cannot serve", self.text(data, "FAIL"))
+        self.assertEqual(code, 1)
+
+    def test_sub_hour_expiry_prints_minutes_not_zero_hours(self):
+        """A token alive for 45 minutes printed "0h left" — a number that reads
+        as broken. Sub-hour shows minutes."""
+        json.dump({"nous": {"access_token": "a", "refresh_token": "r",
+                            "expires_at": time.time() + 2700}},
+                  open(mr.OAUTH_PATH, "w"))
+        json.dump({"nous": {"label": "Nous", "refresh_url": "https://r"}},
+                  open(mr.OAUTH_PROFILES_PATH, "w"))
+        code, data = self.run_doctor()
+        blob = self.text(data, "OK")
+        # the SHAPE is the invariant, not the digit: the clock advances between
+        # the fixture write and the read, so 2700s can legitimately read as 44m.
+        self.assertRegex(blob, r"\b\d+m left\b",
+                         "sub-hour expiry must print minutes, got: %s" % blob)
+        self.assertNotIn("0h left", blob)
+        self.assertNotRegex(blob, r"\b\d+h left\b",
+                            "45 minutes must not be rounded to hours")
+
+    def test_row_referencing_a_missing_profile_is_a_failure(self):
+        """A registry PRESET is not a profile — the incident that makes a new
+        user think the row is broken when it was never created."""
+        self.healthy_install(rows=[
+            {"name": "nous-x", "base": "https://a/v1", "model": "m",
+             "oauth_provider": "nous"}])
+        code, data = self.run_doctor()
+        blob = self.text(data, "FAIL")
+        self.assertIn("unknown profile", blob)
+        self.assertIn("PRESET", blob, "the fix text must name the real trap")
+
+    def test_soon_to_expire_token_is_a_warning(self):
+        json.dump({"nous": {"access_token": "a", "refresh_token": "r",
+                            "expires_at": time.time() + 300}},
+                  open(mr.OAUTH_PATH, "w"))
+        json.dump({"nous": {"label": "Nous", "refresh_url": "https://r"}},
+                  open(mr.OAUTH_PROFILES_PATH, "w"))
+        code, data = self.run_doctor()
+        self.assertIn("expires in", self.text(data, "WARN"))
+        self.assertEqual(code, 0, "a warning is not a failure")
+
+    def test_clobbered_registry_device_fields_are_caught(self):
+        """`oauth add` rewrites provider-registry.json to a minimal shape; the
+        device-flow fields vanish and an expired profile can never be re-signed
+        in. This is the recorded trap the rich copy has to be restored from."""
+        json.dump({"providers": {"nous": {"label": "Nous",
+                                          "base_url": "https://b"}}},
+                  open(mr.PROVIDER_REGISTRY_PATH, "w"))
+        json.dump({"nous": {"access_token": "a", "expires_at": time.time() + 9e4}},
+                  open(mr.OAUTH_PATH, "w"))
+        json.dump({"nous": {"label": "Nous", "class": "oauth"}},
+                  open(mr.OAUTH_PROFILES_PATH, "w"))
+        code, data = self.run_doctor()
+        blob = self.text(data, "WARN")
+        self.assertIn("device-flow fields", blob)
+        self.assertIn("oauth add", blob, "the fix text must name the cause")
+
+    def test_zcode_row_without_the_bridge_asset_is_a_failure(self):
+        """Without bridges/zcode-identity.json the vendor answers 405 code
+        3012 — the exact hole PR #1's installer left."""
+        self.healthy_install(rows=[
+            {"name": "z", "base": "https://a/v1", "model": "m",
+             "oauth_provider": "zcode"}])
+        json.dump({"zcode": {"access_token": "a",
+                             "expires_at": time.time() + 9e4}},
+                  open(mr.OAUTH_PATH, "w"))
+        json.dump({"zcode": {"label": "Z", "class": "oauth"}},
+                  open(mr.OAUTH_PROFILES_PATH, "w"))
+        code, data = self.run_doctor()
+        self.assertIn("zcode bridge", self.names(data, "FAIL"))
+        self.assertIn("3012", self.text(data, "FAIL"))
+
+    # ---------------- prefs + themes ----------------
+    def test_theme_keys_parse_without_importing_textual(self):
+        """doctor has to work when Textual is missing — that is often why it was
+        called — so the theme list is parsed from source, not imported."""
+        before = set(sys.modules)
+        keys = mr._theme_keys()
+        self.assertNotIn("textual", set(sys.modules) - before,
+                         "_theme_keys must not drag textual into the process")
+        self.assertGreaterEqual(len(keys), 14)
+        for k in ("midnight", "nous", "claude"):
+            self.assertIn(k, keys)
+
+    def test_a_dead_theme_in_prefs_is_a_warning(self):
+        json.dump({"theme": "bogus-theme", "dense": False, "motion": True},
+                  open(os.path.join(mr.MR_HOME, "dashboard.json"), "w"))
+        code, data = self.run_doctor()
+        self.assertIn("does not exist", self.text(data, "WARN"))
+        self.assertEqual(code, 0)
+
+    def test_corrupt_prefs_warn_and_name_the_delete(self):
+        open(os.path.join(mr.MR_HOME, "dashboard.json"), "w").write("{{")
+        code, data = self.run_doctor()
+        self.assertIn("unparseable", self.text(data, "WARN"))
+        self.assertIn("rm ", self.text(data, "WARN"))
+
+    def test_missing_prefs_is_fine(self):
+        os.remove(os.path.join(mr.MR_HOME, "dashboard.json"))
+        code, data = self.run_doctor()
+        self.assertEqual(code, 0)
+        self.assertIn("defaults", self.text(data, "OK"))
+
+    # ---------------- runtime ----------------
+    def test_foreign_listener_on_the_port_is_a_failure(self):
+        s = socket.socket()
+        s.bind(("127.0.0.1", mr.PORT))
+        s.listen(1)
+        try:
+            code, data = self.run_doctor()
+            self.assertIn("port %d" % mr.PORT, self.names(data, "FAIL"))
+            self.assertIn("NOT this router", self.text(data, "FAIL"))
+            self.assertEqual(code, 1)
+        finally:
+            s.close()
+
+    def test_stale_pidfile_is_a_warning_and_survives_without_fix(self):
+        # a pid that cannot exist: reserved range
+        open(mr.PID_PATH, "w").write("4194304")
+        code, data = self.run_doctor()
+        self.assertIn("stale", self.text(data, "WARN"))
+        self.assertTrue(os.path.exists(mr.PID_PATH),
+                        "a diagnostic must not delete anything unasked")
+        code2, data2 = self.run_doctor(fix=True)
+        self.assertFalse(os.path.exists(mr.PID_PATH),
+                         "--fix clears the stale pidfile")
+        self.assertIn("removed the stale pidfile", self.text(data2, "OK"))
+        self.assertEqual(code2, 0)
+
+    def test_fix_never_touches_user_data(self):
+        """rows.json / oauth.json / dashboard.json hold his data and his LIVE
+        preferences. A diagnostic that overwrites them creates a second
+        incident — dense:true was set by him, not by a bug."""
+        before_rows = open(mr.ROWS_PATH, "rb").read()
+        pref = os.path.join(mr.MR_HOME, "dashboard.json")
+        json.dump({"theme": "midnight", "dense": True, "motion": True},
+                  open(pref, "w"))
+        before_pref = open(pref, "rb").read()
+        open(mr.PID_PATH, "w").write("4194304")
+        code, data = self.run_doctor(fix=True)
+        self.assertEqual(open(mr.ROWS_PATH, "rb").read(), before_rows,
+                         "--fix must not rewrite rows.json")
+        self.assertEqual(open(pref, "rb").read(), before_pref,
+                         "--fix must not reset a saved preference")
+
+    def test_group_readable_secrets_are_flagged_and_fixed(self):
+        os.chmod(mr.ROWS_PATH, 0o644)
+        code, data = self.run_doctor()
+        self.assertIn("perms · rows.json", self.names(data, "WARN"))
+        self.assertIn("600", self.text(data, "WARN"))
+        code2, data2 = self.run_doctor(fix=True)
+        self.assertEqual(os.stat(mr.ROWS_PATH).st_mode & 0o777, 0o600)
+        self.assertIn("chmod 600", self.text(data2, "OK"))
+
+    def test_server_version_drift_is_reported(self):
+        """The board shows a version; the code answering requests may be
+        another one after an un-restarted update."""
+        payload = json.dumps({"rows": [], "version": "0.0.1",
+                              "stats": {"serving": 0, "down": 0, "rows": 0},
+                              "models": 0}).encode()
+
+        class Resp:
+            """A urlopen-shaped stub: doctor uses it as a context manager and
+            calls .read(). No BytesIO inheritance — that was the first draft's
+            bug (it passed payload twice and read() ignored the buffer)."""
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self, *a):
+                return payload
+
+        def spy(url, *a, **k):
+            u = url if isinstance(url, str) else getattr(url, "full_url", "")
+            if "/api/state" in u:
+                return Resp()
+            raise mr.urllib.error.URLError("no models endpoint in test")
+        with mock.patch.object(mr.urllib.request, "urlopen", spy):
+            code, data = self.run_doctor()
+        blob = self.text(data, "WARN")
+        self.assertIn("serving v0.0.1", blob)
+        self.assertIn("file on disk", blob)
+
+    def test_bad_minimalrouter_tui_value_is_a_warning(self):
+        with mock.patch.dict(os.environ, {"MINIMALROUTER_TUI": "pretty"}):
+            code, data = self.run_doctor()
+        self.assertIn("MINIMALROUTER_TUI", self.names(data, "WARN"))
+
+    def test_every_finding_carries_a_fix_line(self):
+        """A diagnosis without a next step is a status report, not a doctor."""
+        self.healthy_install(rows=[
+            {"name": "loop", "base": "http://127.0.0.1:%d/v1" % mr.PORT,
+             "model": "m", "key": "k"}])
+        os.chmod(mr.ROWS_PATH, 0o644)
+        code, data = self.run_doctor()
+        for c in data["checks"]:
+            if c["level"] in ("FAIL", "WARN"):
+                self.assertTrue(c["fix"].strip(),
+                                "%s (%s) has no remedy text"
+                                % (c["name"], c["level"]))
+
+    def test_a_healthy_report_is_not_vacuously_green(self):
+        """The real risk in a self-check tool is a report that says nothing.
+        A healthy install must still enumerate what it actually inspected, so
+        "0 fail" means "20 things checked and passed", not "nothing ran"."""
+        code, data = self.run_doctor()
+        self.assertEqual(code, 0)
+        self.assertGreaterEqual(data["ok"], 12,
+                                "a healthy install reported only %d checks"
+                                % data["ok"])
+        self.assertEqual(data["ok"] + data["warn"] + data["fail"],
+                         len(data["checks"]),
+                         "the counts must partition the findings")
+        names = [c["name"] for c in data["checks"]]
+        for must in ("engine", "row schema", "key resolution", "prefs",
+                     "port %d" % mr.PORT, "pidfile", "log"):
+            self.assertIn(must, names, "doctor skipped %s entirely" % must)
+
+    def test_doctor_runs_against_the_real_install_without_crashing(self):
+        """The synthetic fixtures prove the logic; this proves the tool. It runs
+        against the live home read-only and must return a valid exit code and
+        parseable JSON whatever the estate state is."""
+        import io
+        from contextlib import redirect_stdout
+        saved = {a: getattr(mr, a) for a in
+                 ("MR_HOME", "ROWS_PATH", "OAUTH_PATH", "OAUTH_PROFILES_PATH",
+                  "PROVIDER_REGISTRY_PATH", "ZCODE_IDENTITY_PATH", "PID_PATH",
+                  "LOG_PATH", "PORT", "HOME", "ENV")}
+        mr.PORT = free_port()      # never touch a server Moon may be running
+        buf = io.StringIO()
+        try:
+            with redirect_stdout(buf):
+                code = mr.doctor(fix=False, as_json=True)
+            data = json.loads(buf.getvalue())
+        finally:
+            for a, v in saved.items():
+                setattr(mr, a, v)
+        self.assertIn(code, (0, 1))
+        self.assertTrue(data["checks"], "the real install produced no findings")
+        for c in data["checks"]:
+            self.assertIn(c["level"], ("OK", "WARN", "FAIL"))

@@ -152,6 +152,8 @@ format, which this router does not serve yet (404). The shim is on the roadmap.
 | `minimalrouter oauth add` | create a profile (registry name or a base URL once) |
 | `minimalrouter oauth <id>` | sign in: prints URL + code, waits for browser approval |
 | `minimalrouter oauth list` / `oauth rm <id>` | inspect / remove profiles |
+| `minimalrouter doctor` | self-diagnose the install: launcher, venv, rows, OAuth expiry, registry, ports, perms — never spends a token |
+| `minimalrouter doctor --fix` | apply the safe reversible repairs (stale pidfile, `chmod 600`) |
 | `minimalrouter -h` / `-v` | usage / version |
 
 Mission Control keys: Up/Down move the cursor (or scroll EVENTS when `Tab` has
