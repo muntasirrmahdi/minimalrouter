@@ -76,7 +76,7 @@ except ImportError:  # platform without curses -> main() degrades to serve
 # CHANGELOG and the git tag all derive from this one line. MAJOR.MINOR.PATCH per
 # semver.org: MAJOR on a breaking client contract, MINOR on backward-compatible
 # features, PATCH on fixes.
-__version__ = "1.3.2"
+__version__ = "1.3.3"
 
 HOME = os.path.expanduser("~")
 MR_HOME = os.path.join(HOME, ".minimalrouter")
@@ -2502,6 +2502,9 @@ Mission Control keys:
   e        disable/enable marked/cursor row (routing skips disabled rows)
   p / P    theme next/prev   v      density     m  motion (animation) on/off
   Tab      focus the EVENTS panel (up/down scroll it, g/G jump)
+  ?        key reference.  Board trouble? Start outside it:
+           minimalrouter doctor     (diagnoses the install, spends nothing)
+           minimalrouter doctor --fix   (applies the safe repairs)
   ?        help overlay      q      quit (stops the server)
 
 Curses fallback keys:
@@ -2709,8 +2712,13 @@ def doctor(fix=False, as_json=False):
     venv_py = ""
     if not os.path.exists(binp):
         if from_repo:
-            add("OK", "launcher", "not installed — running from a git checkout",
-                "install with: sh install.sh   (from the repo root)")
+            # OK rows carry NO remedy text (the spec's invariant): a fix line
+            # means "act here", so guidance that belongs to a working state goes
+            # in the detail, or the report cannot tell informational from
+            # actionable. Found by the gap audit against the self-diagnostic spec.
+            add("OK", "launcher",
+                "not installed — running from a git checkout "
+                "(install with: sh install.sh, from the repo root)")
         else:
             add("FAIL", "launcher", "%s does not exist" % binp,
                 "re-run install.sh; nothing on PATH can start the router")

@@ -797,6 +797,123 @@ class TestPixelFaceNeverClips(unittest.TestCase):
 
 
 @unittest.skipUnless(HAVE_TEXTUAL, "textual not installed")
+class TestTimersAreCreatedOnce(unittest.TestCase):
+    """v1.3.3: on_idle created the poll + anim timers and Textual fires Idle
+    after EVERY message batch, so the board stacked a new live pair per cycle.
+    Measured 8 timers at boot -> 162 after 40 s, row rebuild 227 -> 1353 rows/sec,
+    no plateau. Moon felt it as progressive slowdown ("still slow hye jacche")
+    and as lag on the first keypress, since dozens of timers were already
+    running by then.
+
+    A board must not degrade with uptime. This gate samples the live timer
+    registry and the poll count at two points in an idle run and requires both
+    to be FLAT, plus a static assertion on where set_interval lives.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.d = _load()
+        cls._tmp = tempfile.TemporaryDirectory()
+        cls._old = (cls.d.MR_HOME, cls.d.PREF_PATH, cls.d.LOG_PATH)
+        cls.d.MR_HOME = cls._tmp.name
+        cls.d.PREF_PATH = os.path.join(cls._tmp.name, "dashboard.json")
+        cls.d.LOG_PATH = os.path.join(cls._tmp.name, "minimalrouter.log")
+
+    @classmethod
+    def tearDownClass(cls):
+        (cls.d.MR_HOME, cls.d.PREF_PATH, cls.d.LOG_PATH) = cls._old
+        cls._tmp.cleanup()
+
+    def _prefs(self):
+        with open(self.d.PREF_PATH, "w") as f:
+            json.dump({"theme": "midnight", "dense": False, "motion": True}, f)
+
+    def test_timer_count_and_poll_rate_stay_flat(self):
+        d = self.d
+        self._prefs()
+
+        async def go():
+            app = d.MissionControl(port=8799)
+            out = {}
+            polls = {"n": 0}
+            async with app.run_test(size=(140, 42)) as pilot:
+                for _ in range(40):
+                    await pilot.pause(0.1)
+                    if app._tier_now() == getattr(app, "_tier_key", None):
+                        break
+                real_poll = app.poll
+
+                def counted():
+                    polls["n"] += 1
+                    real_poll()
+                app.poll = counted
+                import time as _t
+
+                async def snap(secs):
+                    t0 = _t.monotonic()
+                    while _t.monotonic() - t0 < secs:
+                        await pilot.pause(0.25)
+                    return (len(app._timers), polls["n"])
+
+                out["t1"], out["p1"] = await snap(6.0)
+                polls["n"] = 0
+                out["t2"], out["p2"] = await snap(14.0)
+                await pilot.press("q")
+                await pilot.pause(0.2)
+            return out
+
+        o = asyncio.run(go())
+        self.assertLessEqual(
+            o["t2"], o["t1"] + 1,
+            "timers GREW while idle: %d -> %d. Something creates a timer per "
+            "cycle, so the board gets slower the longer it is open."
+            % (o["t1"], o["t2"]))
+        # 6 s and 14 s at a 2.0 s interval => ~3 and ~7 polls. Generous slack,
+        # but a multiplied timer blows past 2x immediately.
+        self.assertLessEqual(o["p1"], 8,
+                             "early window ran %d polls in 6 s (expect ~3)"
+                             % o["p1"])
+        self.assertLessEqual(o["p2"], 14,
+                             "late window ran %d polls in 14 s (expect ~7) — "
+                             "timer multiplication is back" % o["p2"])
+
+    def test_on_idle_creates_no_timers(self):
+        """Static half: the defect was set_interval living inside on_idle."""
+        src = (Path(__file__).resolve().parent.parent /
+               "minimalrouter_dashboard.py").read_text()
+        body = src.split("def on_idle(self, event):", 1)[1].split("\n    def ", 1)[0]
+        self.assertNotIn("set_interval", body,
+                         "on_idle must never create timers — it fires on every "
+                         "message batch, not once")
+        self.assertNotIn("self.poll()", body,
+                         "on_idle must not poll either; the timer owns that")
+        # scope to MissionControl: the file holds THREE on_mount methods (the
+        # modals have their own) and splitting on the first measures the wrong
+        # class — the same trap as the on_key scan in the help-modal test.
+        mc = src.split("class MissionControl", 1)[1]
+        mount = mc.split("def on_mount(self):", 1)[1].split("\n    def ", 1)[0]
+        self.assertEqual(mount.count("set_interval"), 2,
+                         "exactly two timers, created in MissionControl.on_mount")
+        self.assertIn("is None", mount,
+                      "timer creation must be guarded against a second call")
+
+    def test_doctor_is_discoverable_from_the_board(self):
+        """`doctor` is a shell verb. Nothing in the board said it existed, so
+        the instrument built to diagnose an install could not be found by the
+        person using the install."""
+        src = (Path(__file__).resolve().parent.parent /
+               "minimalrouter_dashboard.py").read_text()
+        help_body = src.split("class HelpScreen", 1)[1].split("\nclass ", 1)[0]
+        self.assertIn("minimalrouter doctor", help_body,
+                      "the help overlay must name the doctor command")
+        eng = (Path(__file__).resolve().parent.parent /
+               "minimalrouter.py").read_text()
+        usage = eng.split("def usage():", 1)[1].split("\ndef ", 1)[0]
+        self.assertIn("minimalrouter doctor", usage,
+                      "usage must point at doctor from the dashboard section")
+
+
+@unittest.skipUnless(HAVE_TEXTUAL, "textual not installed")
 class TestHelpModalCannotCrashTheBoard(unittest.TestCase):
     """1.2.4: HelpScreen.on_key called app.pop_screen() unconditionally. A key
     event queued behind a pop reached the already-removed screen while the stack
@@ -865,6 +982,7 @@ class TestHelpModalCannotCrashTheBoard(unittest.TestCase):
                 #     the keystroke that CLOSES it (1.2.4 flash-closed help, so
                 #     Moon read it as "help does not open")
                 hs._opened_at = d.time.monotonic()
+                hs._open_key = "question_mark"
                 ev = self.Evt("question_mark")
                 err = None
                 try:
@@ -961,6 +1079,146 @@ class TestHelpModalCannotCrashTheBoard(unittest.TestCase):
                       "stack membership is checked before popping")
         self.assertIn("_opened_at", on_key,
                       "the opening-keystroke guard is present")
+
+    def test_a_fast_different_key_still_closes_the_help(self):
+        """v1.2.5's blanket 0.3 s guard ate LEGITIMATE keys: `?` then `x` in
+        quick succession left the modal up, so help looked like it would not
+        close. Only the echo of the opening key may be swallowed."""
+        # no _prefs(): this class writes deterministic prefs in
+        # setUpClass and the probes never press p/v.
+        d = self.d
+
+        async def go():
+            app = d.MissionControl(port=8799)
+            out = {}
+            async with app.run_test(size=(120, 40)) as pilot:
+                for _ in range(40):
+                    await pilot.pause(0.1)
+                    if app._tier_now() == getattr(app, "_tier_key", None):
+                        break
+                stack = lambda: [type(s).__name__ for s in app._screen_stack]
+
+                async def open_help():
+                    """Press ? and wait until the modal is MOUNTED and has taken
+                    its opening key. Without this the follow-up key can be
+                    delivered before the push settles, which measures the harness
+                    race instead of the guard (measured flake: 1 of 3 runs)."""
+                    await pilot.press("question_mark")
+                    for _ in range(40):
+                        await pilot.pause(0.02)
+                        scr = app.screen
+                        if (type(scr).__name__ == "HelpScreen"
+                                and getattr(scr, "_open_key", None) is not None):
+                            return True
+                    return False
+
+                out["mounted"] = await open_help()
+                out["opened"] = "HelpScreen" in stack()
+                # A DIFFERENT key closes the modal whether the guard window is
+                # active or expired, so this half is timing-INDEPENDENT. The
+                # echo behaviour is NOT asserted here: open_help() can spend up
+                # to 0.8 s waiting for the mount, which by itself expires the
+                # 0.3 s window, so a live echo assertion races the very clock
+                # it is trying to measure (measured flake: 1 of 5 full runs).
+                # It lives in the deterministic unit probe below instead.
+                await pilot.press("x")
+                out["closed_fast"] = "HelpScreen" not in stack()
+                await pilot.press("q")
+                await pilot.pause(0.2)
+            return out
+
+        o = asyncio.run(go())
+        self.assertTrue(o["mounted"],
+                        "the modal must mount and take its opening key, or the "
+                        "guard has nothing to compare against")
+        self.assertTrue(o["opened"], "? must open help")
+        self.assertTrue(o["closed_fast"],
+                        "a different key pressed right after ? must close help — "
+                        "the blanket guard ate it (v1.2.5 regression)")
+
+    def test_the_echo_behaviour_is_exact_and_deterministic(self):
+        """The echo rule, with the clock SET BY HAND instead of raced.
+
+        The guard is: the SAME key, within 0.3 s of mount, consumed ONCE. All
+        three branches are driven by direct on_key calls with controlled
+        _opened_at / _open_key values, so no pilot timing can flip a result.
+        """
+        d = self.d
+
+        async def go():
+            app = d.MissionControl(port=8799)
+            out = {}
+            async with app.run_test(size=(120, 40)) as pilot:
+                for _ in range(40):
+                    await pilot.pause(0.1)
+                    if app._tier_now() == getattr(app, "_tier_key", None):
+                        break
+
+                def stack():
+                    return [type(s).__name__ for s in app._screen_stack]
+
+                async def mount():
+                    await pilot.press("question_mark")
+                    for _ in range(60):
+                        await pilot.pause(0.02)
+                        if stack()[-1] == "HelpScreen":
+                            return app.screen
+                    return None
+
+                # --- branch 1: same key, INSIDE the window -> swallowed once,
+                #     modal stays up, and the echo token is consumed
+                hs = await mount()
+                if hs is None:
+                    return {"mount_failed": True}
+                hs._opened_at = d.time.monotonic()
+                hs._open_key = "question_mark"
+                hs.on_key(self.Evt("question_mark"))
+                out["echo_held"] = "HelpScreen" in stack()
+                out["echo_consumed"] = getattr(hs, "_open_key", "x") is None
+
+                # --- branch 2: same key again, echo already consumed -> closes
+                hs.on_key(self.Evt("question_mark"))
+                out["second_closes"] = "HelpScreen" not in stack()
+
+                # --- branch 3: same key but the window EXPIRED -> closes
+                hs2 = await mount()
+                if hs2 is None:
+                    return {"mount_failed": True}
+                hs2._opened_at = d.time.monotonic() - 1.0
+                hs2._open_key = "question_mark"
+                hs2.on_key(self.Evt("question_mark"))
+                out["expired_closes"] = "HelpScreen" not in stack()
+
+                # --- branch 4: a DIFFERENT key inside the window -> closes
+                #     (this is the v1.2.5 blanket-guard regression)
+                hs3 = await mount()
+                if hs3 is None:
+                    return {"mount_failed": True}
+                hs3._opened_at = d.time.monotonic()
+                hs3._open_key = "question_mark"
+                hs3.on_key(self.Evt("x"))
+                out["different_key_closes"] = "HelpScreen" not in stack()
+
+                await pilot.press("q")
+                await pilot.pause(0.2)
+            return out
+
+        o = asyncio.run(go())
+        self.assertFalse(o.get("mount_failed"),
+                         "the help modal must mount for the echo branches to "
+                         "measure anything")
+        self.assertTrue(o["echo_held"],
+                        "the opening key's own echo must be swallowed while the "
+                        "window is open, or help flashes shut as it did in 1.2.4")
+        self.assertTrue(o["echo_consumed"],
+                        "the echo must be consumed exactly once, never held")
+        self.assertTrue(o["second_closes"],
+                        "after the echo is consumed the same key must close it")
+        self.assertTrue(o["expired_closes"],
+                        "once the window expires the same key must close it")
+        self.assertTrue(o["different_key_closes"],
+                        "a different key must close it inside the window — the "
+                        "blanket guard ate exactly this")
 
     def test_no_app_level_help_guard_exists(self):
         """The 1.2.3 lesson: an app-level 'help is open' flag that is never

@@ -543,6 +543,9 @@ class HelpScreen(ModalScreen):
             ("m", "motion on / off — pauses every animation timer"),
             ("Tab", "focus the EVENTS panel  -  g/G newest / oldest"),
             ("?", "this help  -  any key closes it (after a short guard)"),
+            ("cli", "outside the board: `minimalrouter doctor` diagnoses the "
+                   "install (launcher, keys, tokens, ports) and never spends "
+                   "a token  -  --fix applies the safe repairs"),
             ("q", "quit (stops the server)"),
         ]
         for k, dsc in rows:
@@ -557,13 +560,24 @@ class HelpScreen(ModalScreen):
         return t
 
     def on_key(self, event):
+        """Close on any key, except the echo of the keystroke that opened us.
+
+        v1.2.5 swallowed EVERY key for 0.3 s to kill that echo, which made a
+        fast follow-up key vanish: `?` then `x` left the modal up (measured
+        down=False). The echo is the same key, once, right after mount — so the
+        guard is keyed to it and consumed on use. Nothing else is filtered.
+        """
         event.stop()
-        if time.monotonic() - getattr(self, "_opened_at", 0) < 0.3:
-            return                      # swallow the opening keystroke's echo
+        open_key = getattr(self, "_open_key", None)
+        if (open_key is not None and event.key == open_key
+                and time.monotonic() - getattr(self, "_opened_at", 0) < 0.3):
+            self._open_key = None       # consume the echo exactly once
+            return
+        self._open_key = None
         stack = getattr(self.app, "_screen_stack", [])
         if self not in stack or len(stack) <= 1:
-            return                     # already popped: a queued key must not
-        self.dismiss()                 # pop a 1-deep stack -> ScreenStackError
+            return                      # already popped: a queued key must not
+        self.dismiss()                  # pop a 1-deep stack -> ScreenStackError
 
 
 
@@ -753,6 +767,18 @@ class MissionControl(App):
         self.screen.set_class(self.dense, "dense")
         self._apply_tier()
         self._apply_theme_classes()
+        # Timers belong HERE, exactly once, and the guard is load-bearing: the
+        # v1.3.3 defect was these two lines living in on_idle instead, which
+        # Textual fires after every message batch, so the board stacked a new
+        # live pair per cycle and rebuilt itself faster with every second it
+        # stayed open (measured 8 timers at boot -> 162 at 40 s).
+        if getattr(self, "_poll_timer", None) is None:
+            self._poll_timer = self.set_interval(2.0, self.poll)
+        if getattr(self, "_anim_timer", None) is None:
+            self._anim_timer = self.set_interval(0.25, self.tick_anim)
+            if not self.motion:
+                self._anim_timer.pause()
+        self.poll()
 
     def _ensure_tier(self):
         """Re-decide the tier and repaint ONLY on a change. Idempotent and cheap.
@@ -776,20 +802,29 @@ class MissionControl(App):
         return True
 
     def on_idle(self, event):
-        """First idle lands after the initial layout pass: converge the tier."""
+        """Idle lands after the initial layout pass: converge the tier.
+
+        This handler must stay free of timers and of polling. Textual fires Idle
+        after EVERY batch of messages, not once, and creating the poll/anim
+        timers here is what made the board accumulate live timers without bound
+        (v1.3.3: 8 timers at boot -> 162 after 40 s idle, row rebuild 227 ->
+        1353 rows/sec). Reassigning self._poll_timer drops the handle but never
+        cancels the running timer.
+
+        What is left is idempotent by construction: _ensure_tier returns early
+        when the tier has not changed, and the border titles run once behind a
+        flag instead of every cycle.
+        """
         event.stop()
         self._ensure_tier()
-        for wid, title in (("#stats", "POOL"), ("#tablebox", "ROUTES"),
-                           ("#selbox", "SELECTED"), ("#evbox", "EVENTS")):
-            try:
-                self.query_one(wid).border_title = title
-            except Exception:
-                pass
-        self._poll_timer = self.set_interval(2.0, self.poll)
-        self._anim_timer = self.set_interval(0.25, self.tick_anim)
-        if not self.motion:
-            self._anim_timer.pause()
-        self.poll()
+        if not getattr(self, "_titles_done", False):
+            self._titles_done = True
+            for wid, title in (("#stats", "POOL"), ("#tablebox", "ROUTES"),
+                               ("#selbox", "SELECTED"), ("#evbox", "EVENTS")):
+                try:
+                    self.query_one(wid).border_title = title
+                except Exception:
+                    pass
 
     def _apply_theme_classes(self):
         for i, t in enumerate(THEMES):
@@ -1213,11 +1248,16 @@ class MissionControl(App):
             pass
 
     # ---------- help ----------
-    def toggle_help(self):
+    def toggle_help(self, key=None):
         """Open the key reference as a modal overlay. No in-app flag is needed:
         while a ModalScreen is on top it owns key events, so this handler is not
-        reached until the modal has popped itself."""
-        self.app.push_screen(HelpScreen())
+        reached until the modal has popped itself.
+
+        The opening key is handed to the modal so it can recognise its own echo
+        and nothing else."""
+        hs = HelpScreen()
+        hs._open_key = key
+        self.app.push_screen(hs)
 
     # ---------- compose ----------
     def compose(self) -> ComposeResult:
@@ -1400,7 +1440,7 @@ class MissionControl(App):
             self.update_events()
         elif k in ("?", "question_mark") or ch == "?":
             event.stop()
-            self.toggle_help()
+            self.toggle_help(key=k)
         elif k == "q":
             event.stop()
             self.exit()

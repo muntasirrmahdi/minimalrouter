@@ -163,6 +163,9 @@ tokens, `f` re-fetch every catalog
 (learns context windows), `a` add a row in-board, `d d` delete (second press within 4s
 confirms), `e` disable/enable marked rows (parked rows stay on the board, routing skips
 them), `p`/`P` theme next/prev, `v` density, `m` motion on/off, `?` help, `q` quit
+(stops the server). Board trouble? Run `minimalrouter doctor` outside it: it
+diagnoses the install, never spends a token, and `--fix` applies the safe
+repairs.
 (stops the server). The curses fallback keeps: Up/Down, `t`, `a`, `d`, `r`, `q`, Esc.
 
 ## API

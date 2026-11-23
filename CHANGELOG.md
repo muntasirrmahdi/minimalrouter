@@ -12,6 +12,48 @@ OpenAI-compatible request/response shape, the endpoint, or the install command);
 for backward-compatible features (new providers, classes, dashboard capability, CLI verbs);
 **PATCH** for fixes only.
 
+## [1.3.3] — 2026-11-23
+
+### Fixed
+
+- **The board got slower the longer it stayed open.** `on_idle` created the poll
+  and animation timers, and Textual fires `Idle` after *every* batch of messages,
+  not once. Each cycle stacked another live pair: reassigning `self._poll_timer`
+  drops the handle but never cancels the running timer. Measured against the live
+  engine on a 140x42 board: **8 timers at boot, 28 at +5 s, 48 at +10 s, 86 at
+  +20 s, 162 at +40 s**, with the row rebuild rate climbing **227 -> 456 -> 751
+  -> 1353 rows/sec** and no plateau. `on_mount` created no timers at all, so the
+  board also did not begin polling until the first idle landed.
+
+  One defect, three symptoms that looked unrelated: the progressive slowdown
+  while touching nothing, the lag on the first keypress (dozens of timers are
+  already stacked by then), and `?` feeling slow. Timers are created exactly once
+  in `on_mount`, guarded so a second call cannot stack a second pair; `on_idle`
+  keeps only the idempotent tier convergence and a once-flagged border-title
+  pass, and no longer polls.
+
+  A permanent gate replaces the guesswork: `TestTimersAreCreatedOnce` samples the
+  live timer registry and the poll count at two points in an idle run and
+  requires both to be FLAT, plus a static assertion that `set_interval` and
+  `self.poll()` appear nowhere inside `on_idle` and exactly twice inside
+  `on_mount`. A board must not degrade with uptime.
+
+- **`doctor` was invisible from the board.** The self-diagnostic command shipped
+  in 1.3.0 as a shell verb and nothing in the terminal UI said it existed, so the
+  instrument built to diagnose an install could not be found by the person using
+  the install. It is named in the help overlay, in `usage()`, and in the README
+  as the first move when the board misbehaves.
+
+- **`doctor` now satisfies the two rules its governing spec states.** The skill's
+  self-diagnostic section and `references/self-diagnostic-command.md` were written
+  while this command was being built, and a gap audit against that catalogue found
+  one divergence left: an OK finding carried remedy text, which breaks the
+  invariant that a remedy line means "act here". The from-checkout launcher
+  guidance moved into the detail and the invariant is asserted in both
+  directions — so it cannot be satisfied by stripping every remedy from the tool.
+  All 28 catalogue rows were re-checked against the implementation and every one
+  is present.
+
 ## [1.3.2] — 2026-11-22
 
 ### Fixed

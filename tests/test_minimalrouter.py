@@ -1522,6 +1522,51 @@ class TestDoctor(unittest.TestCase):
                                        "registry", "cannot serve", "recursion")),
                 "FAIL with no request-breaking subject: %r" % c)
 
+    def test_ok_rows_carry_no_remedy_text(self):
+        """The spec's negative invariant, asserted both ways.
+
+        A remedy line means ACT HERE. If OK findings carry one, the report
+        loses the distinction between informational and actionable. The
+        positive half matters as much: stripping every remedy from the tool
+        would satisfy the negative half while destroying the answer.
+        """
+        code, data = self.run_doctor()
+        for c in self.findings(data, "OK"):
+            self.assertEqual(c["fix"].strip(), "",
+                             "%s: an OK finding must not carry remedy text, "
+                             "got %r" % (c["name"], c["fix"]))
+        # STATIC half, and it is load-bearing. The runtime half only sees the
+        # branches the current environment reaches — e.g. the from-checkout
+        # launcher row runs only when the engine sits in a git checkout, so a
+        # sabotage copy outside one passed vacuously. This scans the SOURCE, so
+        # the invariant holds regardless of where the file lives.
+        import ast as _ast
+        src = Path(ENGINE).read_text()
+        tree = _ast.parse(src)
+        offenders = []
+        for node in _ast.walk(tree):
+            if not (isinstance(node, _ast.Call)
+                    and getattr(node.func, "id", "") == "add"):
+                continue
+            if len(node.args) < 4:
+                continue
+            if not (isinstance(node.args[0], _ast.Constant)
+                    and node.args[0].value == "OK"):
+                continue
+            fix = node.args[3]
+            if isinstance(fix, _ast.Constant) and fix.value:
+                offenders.append((node.lineno, str(fix.value)[:60]))
+        self.assertEqual(offenders, [],
+                         "OK findings carrying remedy text at %s — a remedy "
+                         "line means ACT HERE" % offenders)
+        # positive control: a real failure still carries its remedy
+        self.healthy_install(rows=[
+            {"name": "loop", "base": "http://127.0.0.1:%d/v1" % mr.PORT,
+             "model": "m", "key": "k"}])
+        code2, data2 = self.run_doctor()
+        self.assertTrue(any(c["fix"].strip() for c in data2["checks"]),
+                        "a FAIL must still carry its remedy")
+
     def test_every_finding_carries_a_fix_line(self):
         """A diagnosis without a next step is a status report, not a doctor."""
         self.healthy_install(rows=[
