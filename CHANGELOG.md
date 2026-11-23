@@ -12,6 +12,45 @@ OpenAI-compatible request/response shape, the endpoint, or the install command);
 for backward-compatible features (new providers, classes, dashboard capability, CLI verbs);
 **PATCH** for fixes only.
 
+## [1.4.0] — 2026-11-23
+
+### Added
+
+- **Copy keys for the values the board clips.** A member asked in the BAI group
+  how the long model ids are copied, because they all render as dots. The cause
+  is layout: the MODEL cell is `clip(model, w["MODEL"])` and the SELECTED panel
+  clips at 36 characters, so `openrouter/anthropic/claude-sonnet-5-5-thinking`
+  shows as `openrouter/anthropic/claude-…`. Enabling mouse drag-selection alone
+  would not fix it, because Textual's `get_selected_text()` returns the
+  RENDERED string — selecting a long id copies the ellipsis, which is a string
+  that does not work when pasted. So `y` copies the cursor row's **untruncated**
+  model id from the data, `Y` the row name, `u` the base URL, and the toast
+  prints the whole value so it is obvious whether the dots or the id landed on
+  the clipboard. Drag-selection is switched on as well, for the rows that do fit.
+
+  Clipboard goes through Textual's own `App.copy_to_clipboard()`, which emits
+  OSC 52, so it works over SSH and not only in a local terminal. An empty field
+  reports itself and leaves the clipboard untouched rather than copying nothing
+  and claiming success.
+
+  Drag-selection itself needed no enabling, and the first draft of this release
+  was wrong about that: `Widget.ALLOW_SELECT` is already `True` in Textual 8.2.8
+  and `allow_select` is a read-only property, so passing it to the constructor
+  raises `TypeError` and assigning it to the screen silently no-ops. It was
+  caught by the suite, not by inspection. The reason it cannot solve the
+  complaint is measured, not assumed: `get_selected_text()` returns the rendered
+  board text with the ellipsis intact, which is exactly the broken string the
+  keys exist to avoid.
+
+### Verification
+
+The gate proves the defect is real before proving the fix: it asserts the id is
+longer than the column, that the rendered cell carries an ellipsis, and that the
+whole id is absent from the screen — so the key is not solving a problem that
+does not exist. Also covered: cursor-following (copies the row under the cursor,
+not row 0), no collision with the existing `space`/`T`/`e`/`d` marks, and no
+crash on an empty pool.
+
 ## [1.3.3] — 2026-11-23
 
 ### Fixed

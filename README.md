@@ -159,14 +159,18 @@ format, which this router does not serve yet (404). The shim is on the roadmap.
 Mission Control keys: Up/Down move the cursor (or scroll EVENTS when `Tab` has
 focused it), `space` marks rows, `t` tests the marked rows (the cursor row when
 nothing is marked), `T` tests every enabled row, `r`/`R` refresh one / all OAuth
-tokens, `f` re-fetch every catalog
-(learns context windows), `a` add a row in-board, `d d` delete (second press within 4s
-confirms), `e` disable/enable marked rows (parked rows stay on the board, routing skips
-them), `p`/`P` theme next/prev, `v` density, `m` motion on/off, `?` help, `q` quit
-(stops the server). Board trouble? Run `minimalrouter doctor` outside it: it
-diagnoses the install, never spends a token, and `--fix` applies the safe
-repairs.
-(stops the server). The curses fallback keeps: Up/Down, `t`, `a`, `d`, `r`, `q`, Esc.
+tokens, `f` re-fetches every catalog (learns context windows), `a` adds a row
+in-board, `d d` deletes (second press within 4s confirms), `e` disables/enables
+marked rows (parked rows stay on the board, routing skips them), `y` copies the
+selected row's MODEL id untruncated (`Y` the row name, `u` the base URL) — the
+table clips long ids to fit the column, and drag-selecting one would copy the
+ellipsis, which pastes as a broken value, `p`/`P` theme next/prev, `v` density,
+`m` motion on/off, `?` help, `q` quit (stops the server).
+
+The curses fallback keeps: Up/Down, `t`, `a`, `d`, `r`, `q`, Esc.
+
+Board trouble? Run `minimalrouter doctor` outside the board: it diagnoses the
+install, never spends a token, and `--fix` applies the safe repairs.
 
 ## API
 

@@ -76,7 +76,7 @@ except ImportError:  # platform without curses -> main() degrades to serve
 # CHANGELOG and the git tag all derive from this one line. MAJOR.MINOR.PATCH per
 # semver.org: MAJOR on a breaking client contract, MINOR on backward-compatible
 # features, PATCH on fixes.
-__version__ = "1.3.3"
+__version__ = "1.4.0"
 
 HOME = os.path.expanduser("~")
 MR_HOME = os.path.join(HOME, ".minimalrouter")
@@ -2499,6 +2499,8 @@ Mission Control keys:
   r        refresh row token R      refresh ALL OAuth tokens
   f        re-fetch catalogs (learns model ids + context windows)
   a        add a row         d      delete marked/cursor row (press twice = confirm)
+  y        copy MODEL id     Y      copy row name      u  copy base URL
+           (untruncated — the table clips long ids to fit the column)
   e        disable/enable marked/cursor row (routing skips disabled rows)
   p / P    theme next/prev   v      density     m  motion (animation) on/off
   Tab      focus the EVENTS panel (up/down scroll it, g/G jump)

@@ -797,6 +797,235 @@ class TestPixelFaceNeverClips(unittest.TestCase):
 
 
 @unittest.skipUnless(HAVE_TEXTUAL, "textual not installed")
+class TestCopyUntruncatedValues(unittest.TestCase):
+    """v1.4.0: the MODEL cell is clipped for layout, so drag-selecting a long
+    model id copies `openrouter/anthropic/claude-…` — a string that does not
+    work when pasted. AKASH raised exactly this in the BAI group on 23 Nov
+    ("boro gula to shob dot dekhai"). The y / Y / u keys copy the DATA, not the
+    screen, and the assertion proves the clipping is real so the fix is not
+    solving a problem that does not exist.
+    """
+
+    LONG = "openrouter/anthropic/claude-sonnet-5-5-thinking-extended"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.d = _load()
+        cls._tmp = tempfile.TemporaryDirectory()
+        cls._old = (cls.d.MR_HOME, cls.d.PREF_PATH, cls.d.LOG_PATH)
+        cls.d.MR_HOME = cls._tmp.name
+        cls.d.PREF_PATH = os.path.join(cls._tmp.name, "dashboard.json")
+        cls.d.LOG_PATH = os.path.join(cls._tmp.name, "minimalrouter.log")
+
+    @classmethod
+    def tearDownClass(cls):
+        (cls.d.MR_HOME, cls.d.PREF_PATH, cls.d.LOG_PATH) = cls._old
+        cls._tmp.cleanup()
+
+    def _row(self, **over):
+        r = {"name": "kilo-auto/free", "model": self.LONG,
+             "base": "https://openrouter.ai/api/v1", "class": "api",
+             "provider": "openrouter.ai", "oauth_provider": "",
+             "disabled": False, "cw": 200000, "key_src": "env:K", "ok_pct": 100,
+             "state": {"status": "ok", "ms": 900, "hist": [900], "tps": 20.0,
+                       "fail_streak": 0, "recent": [1], "at": 0}}
+        r.update(over)
+        return r
+
+    def _boot(self, rows, size=(140, 42)):
+        """Mount the board, install the rows, and settle. Returns the pilot."""
+        d = self.d
+        with open(d.PREF_PATH, "w") as f:
+            json.dump({"theme": "midnight", "dense": False, "motion": True}, f)
+        app = d.MissionControl(port=8799)
+
+        async def go(body):
+            async with app.run_test(size=size) as pilot:
+                for _ in range(40):
+                    await pilot.pause(0.1)
+                    if app._tier_now() == getattr(app, "_tier_key", None):
+                        break
+                app.online = True
+                app.rows = [dict(r) for r in rows]
+                app.nmodels = len(rows)
+                app.stats = {"rows": len(rows), "serving": len(rows), "down": 0,
+                             "unknown": 0, "req_min": 0, "tok_s": 0,
+                             "err_pct": 0, "uptime": 60}
+                app.probe = {"done": len(rows), "total": len(rows),
+                             "active": False}
+                app.sel = 0
+                app.marked = set()
+                app.testing = {}
+                app.toast = ""
+                app.ensure_slots(len(app.rows))
+                for i in range(len(app.row_statics)):
+                    app.row_statics["slot%d" % i].display = i < len(app.rows)
+                app.repaint_rows()
+                app.update_selected()
+                await pilot.pause(0.4)
+                out = await body(app, pilot)
+                await pilot.press("q")
+                await pilot.pause(0.2)
+            return out
+        return app, go
+
+    def test_y_copies_the_whole_untruncated_model_id(self):
+        app, go = self._boot([self._row()])
+
+        async def body(a, pilot):
+            await pilot.press("y")
+            await pilot.pause(0.25)
+            return (a.app.clipboard, a.toast)
+
+        clip, toast = asyncio.run(go(body))
+        self.assertEqual(clip, self.LONG,
+                         "y must copy the FULL id, not the clipped rendering")
+        self.assertIn(self.LONG, toast,
+                      "the toast must show the whole value, or the user cannot "
+                      "tell whether the dots were copied")
+        self.assertIn("MODEL", toast)
+
+    def test_selection_is_already_enabled_and_returns_rendered_text(self):
+        """Locks the measured Textual fact that makes the keys necessary.
+
+        If someone later 'adds' drag-select support by passing allow_select to
+        the Static ctor, the suite breaks with TypeError — this test records why
+        that is not the fix: selection is ON by default, and what it returns is
+        the rendered string, dots and all.
+        """
+        from textual.widget import Widget
+        self.assertTrue(Widget.ALLOW_SELECT,
+                        "Textual enables selection by default; there is nothing "
+                        "to switch on")
+        self.assertIsNone(getattr(Widget.allow_select, "fset", None),
+                          "allow_select is read-only, so assigning it is a "
+                          "silent no-op and passing it to a ctor raises")
+
+        app, go = self._boot([self._row()], size=(120, 40))
+
+        async def body(a, pilot):
+            a.screen.text_select_all()
+            await pilot.pause(0.25)
+            return a.screen.get_selected_text()
+
+        sel = asyncio.run(go(body))
+        self.assertTrue(sel, "selection returned nothing at all")
+        self.assertNotIn(self.LONG, sel,
+                         "selected text can never contain the whole id — it is "
+                         "the rendered cell, which is why the keys read the data")
+        self.assertIn("…", sel, "the ellipsis is what a member would paste")
+
+    def test_caps_Y_copies_the_row_name_and_u_the_base_url(self):
+        app, go = self._boot([self._row()])
+
+        async def body(a, pilot):
+            await pilot.press("Y")
+            await pilot.pause(0.2)
+            name = a.app.clipboard
+            await pilot.press("u")
+            await pilot.pause(0.2)
+            base = a.app.clipboard
+            return name, base
+
+        name, base = asyncio.run(go(body))
+        self.assertEqual(name, "kilo-auto/free")
+        self.assertEqual(base, "https://openrouter.ai/api/v1")
+
+    def test_the_column_really_clips_so_the_fix_is_not_solving_air(self):
+        """Proves the defect AKASH described is real on the shipped render: the
+        id is longer than the column AND the rendered cell carries an ellipsis
+        AND the whole id is absent from the screen."""
+        app, go = self._boot([self._row()], size=(120, 40))
+
+        async def body(a, pilot):
+            rendered = a.query_one("#slot0").render().plain
+            cols, w = a.col_plan()
+            return rendered, w
+
+        rendered, w = asyncio.run(go(body))
+        self.assertGreater(len(self.LONG), w["MODEL"],
+                           "the id must be longer than the column for the clip "
+                           "to happen at all")
+        self.assertIn("…", rendered,
+                      "the MODEL cell must still clip — that is the complaint")
+        self.assertNotIn(self.LONG, rendered,
+                         "the whole id must NOT be on screen, which is exactly "
+                         "why a select-only copy would hand back a broken string")
+
+    def test_empty_field_says_so_instead_of_copying_nothing(self):
+        app, go = self._boot([self._row(model="")])
+
+        async def body(a, pilot):
+            a.app.copy_to_clipboard("SENTINEL")     # pre-fill the clipboard
+            await pilot.press("y")
+            await pilot.pause(0.2)
+            return a.toast, a.app.clipboard
+
+        toast, clip = asyncio.run(go(body))
+        self.assertIn("empty", toast,
+                      "an empty id must be reported, not silently skipped")
+        self.assertEqual(clip, "SENTINEL",
+                         "nothing must be written to the clipboard when the "
+                         "field is empty — a stale copy looks like success")
+
+    def test_copy_keys_on_an_empty_pool_do_not_crash(self):
+        app, go = self._boot([])
+
+        async def body(a, pilot):
+            err = None
+            try:
+                for k in ("y", "Y", "u"):
+                    await pilot.press(k)
+                    await pilot.pause(0.1)
+            except Exception as e:
+                err = repr(e)
+            return err
+
+        err = asyncio.run(go(body))
+        self.assertIsNone(err,
+                          "copy keys with no rows must not raise: %s" % err)
+
+    def test_copy_respects_the_cursor_position(self):
+        """Copying must follow the selected row, not always row 0."""
+        rows = [self._row(name="first", model="model/one"),
+                self._row(name="second", model=self.LONG)]
+        app, go = self._boot(rows)
+
+        async def body(a, pilot):
+            await pilot.press("down")
+            await pilot.pause(0.2)
+            await pilot.press("y")
+            await pilot.pause(0.2)
+            return a.app.clipboard, a.sel
+
+        clip, sel = asyncio.run(go(body))
+        self.assertEqual(sel, 1, "the cursor must have moved")
+        self.assertEqual(clip, self.LONG,
+                         "y must copy the row under the cursor, not the first "
+                         "row in the pool")
+
+    def test_marked_batch_actions_are_untouched_by_the_new_keys(self):
+        """Regression guard: the new keys must not collide with space/T/e/d."""
+        rows = [self._row(), self._row(name="second", model="m2")]
+        app, go = self._boot(rows)
+
+        async def body(a, pilot):
+            await pilot.press("space")
+            await pilot.pause(0.15)
+            marked = set(a.marked)
+            await pilot.press("y")
+            await pilot.pause(0.15)
+            still = set(a.marked)
+            clip = a.app.clipboard
+            return marked, still, clip
+
+        marked, still, clip = asyncio.run(go(body))
+        self.assertEqual(marked, {"kilo-auto/free"}, "space must still mark")
+        self.assertEqual(still, marked, "y must not disturb the marks")
+        self.assertEqual(clip, self.LONG)
+
+
+@unittest.skipUnless(HAVE_TEXTUAL, "textual not installed")
 class TestTimersAreCreatedOnce(unittest.TestCase):
     """v1.3.3: on_idle created the poll + anim timers and Textual fires Idle
     after EVERY message batch, so the board stacked a new live pair per cycle.

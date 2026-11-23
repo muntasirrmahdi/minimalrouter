@@ -536,6 +536,8 @@ class HelpScreen(ModalScreen):
             ("r / R", "refresh row OAuth token / refresh ALL"),
             ("f", "re-fetch every catalog (learns context windows)"),
             ("a", "add a row (base URL + key + model, tested before save)"),
+            ("y / Y / u", "copy MODEL id / row name / base URL," 
+                        "  untruncated (the table clips long ids to fit)"),
             ("d d", "delete marked/cursor row - press twice within 4s"),
             ("e", "disable/enable marked rows (parked rows never serve)"),
             ("p / P", "theme next / previous"),
@@ -764,6 +766,12 @@ class MissionControl(App):
             self.screen.set_class(tier == k, "tier-" + k)
 
     def on_mount(self):
+        # NOTE: mouse drag-selection needs no enabling here. Textual's
+        # Widget.ALLOW_SELECT is True by default in 8.2.8 and allow_select is a
+        # read-only property, so an assignment silently no-ops and a ctor kwarg
+        # raises. Measured: get_selected_text() returns the RENDERED text,
+        # ellipsis and block characters included — which is precisely why the
+        # y / Y / u keys copy the DATA and not the screen.
         self.screen.set_class(self.dense, "dense")
         self._apply_tier()
         self._apply_theme_classes()
@@ -1304,7 +1312,8 @@ class MissionControl(App):
             # legend to 3-4 rows is what stole the route table's height.
             keys = [("t", "test"), ("T", "all"), ("spc", "mark"), ("r", "token"),
                     ("R", "all"), ("f", "cat"), ("e", "off"), ("d", "del"),
-                    ("a", "add"), ("p", "theme"), ("v", "dens"), ("m", "motion"),
+                    ("a", "add"), ("y", "copy"), ("p", "theme"),
+                    ("v", "dens"), ("m", "motion"),
                     ("?", "help"), ("q", "quit")]
             for i, (k, lab) in enumerate(keys):
                 if i:
@@ -1438,12 +1447,59 @@ class MissionControl(App):
             self.render_wordmark()
             self._set("#mast", self.termbar_text())
             self.update_events()
+        elif k == "y":
+            event.stop()
+            self.copy_field("model")
+        elif k == "Y":
+            event.stop()
+            self.copy_field("name")
+        elif k == "u":
+            event.stop()
+            self.copy_field("base")
         elif k in ("?", "question_mark") or ch == "?":
             event.stop()
             self.toggle_help(key=k)
         elif k == "q":
             event.stop()
             self.exit()
+
+    # ---------- copy ----------
+    def copy_field(self, which):
+        """Copy an UNTRUNCATED field of the cursor row to the clipboard.
+
+        The MODEL cell is clipped for layout, so a long id renders as
+        `openrouter/anthropic/claude-…`. Mouse drag-selection is already
+        available (Textual enables it by default) but it cannot help here:
+        get_selected_text() returns the RENDERED string, dots included, so a
+        selected long id pastes as a broken value. That is the complaint AKASH
+        raised in the BAI group on 23 Nov, and it is why these keys read the
+        DATA instead of the screen.
+        """
+        if not self.rows:
+            self.toast = "no row to copy"
+            self.update_events()
+            return
+        r = self.rows[min(self.sel, len(self.rows) - 1)]
+        fields = {
+            "model": (str(r.get("model") or ""), "MODEL"),
+            "name": (str(r.get("name") or ""), "ROW"),
+            "base": (str(r.get("base") or ""), "BASE URL"),
+        }
+        val, label = fields[which]
+        if not val:
+            self.toast = "%s is empty on this row" % label
+            self.update_events()
+            return
+        try:
+            self.app.copy_to_clipboard(val)
+        except Exception as e:
+            self.toast = "clipboard unavailable: %s" % str(e)[:40]
+            self.update_events()
+            return
+        # the toast carries the WHOLE value, so it is obvious whether the dots
+        # or the id landed on the clipboard
+        self.toast = "copied %s: %s" % (label, val)
+        self.update_events()
 
     def _add_done(self, msg):
         self.toast = msg
