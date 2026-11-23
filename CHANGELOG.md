@@ -298,7 +298,7 @@ crash on an empty pool.
   the 1.2.2 module: 33 composition failures, zero AttributeError, so the gate
   bites for the right reason.
 
-## [1.2.2] — 2026-11-22## [1.2.2] — 2026-11-22
+## [1.2.2] — 2026-11-22
 
 ### Fixed
 
