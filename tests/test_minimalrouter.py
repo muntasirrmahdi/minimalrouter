@@ -2004,9 +2004,31 @@ class TestPoolLearnsEndToEnd(unittest.TestCase):
             except Exception:
                 time.sleep(0.25)
         else:
-            srv.terminate()
+            self._stop(srv)
             self.fail("router subprocess did not come up")
         return srv, base, tmp
+
+    def _stop(self, srv):
+        """Terminate AND reap the router subprocess.
+
+        A bare terminate() leaves the child running while the Popen object is
+        garbage-collected, which is exactly the
+        `ResourceWarning: subprocess N is still running` the first suite run
+        printed three times. Leaked children keep holding their ports, so a
+        repeated suite run accumulates zombies and can squat on a free_port()
+        winner — a flake that looks like a race and is really our own hygiene.
+        """
+        if srv is None:
+            return
+        try:
+            srv.terminate()
+            srv.wait(timeout=10)
+        except Exception:
+            try:
+                srv.kill()
+                srv.wait(timeout=5)
+            except Exception:
+                pass
 
     def _chat(self, base, model="m", timeout=25):
         rq = urllib.request.Request(
@@ -2064,8 +2086,7 @@ class TestPoolLearnsEndToEnd(unittest.TestCase):
                 "same dead end on every request, which is the 'hammer one free "
                 "tier N ways' surface 1.5.0 exists to close.")
         finally:
-            if srv:
-                srv.terminate()
+            self._stop(srv)
             fx.stop()
 
     def test_the_allowance_meter_survives_the_proxy_into_api_state(self):
@@ -2090,8 +2111,7 @@ class TestPoolLearnsEndToEnd(unittest.TestCase):
             self.assertEqual(q.get("retry-after"), 43200,
                              "the 429's reset clock is the useful half of the meter")
         finally:
-            if srv:
-                srv.terminate()
+            self._stop(srv)
             fx.stop()
 
     def test_a_hanging_upstream_fails_at_the_row_timeout_not_the_global(self):
@@ -2113,6 +2133,5 @@ class TestPoolLearnsEndToEnd(unittest.TestCase):
                             "(elapsed %.1fs)" % elapsed)
             self.assertIn("hang", str(body))
         finally:
-            if srv:
-                srv.terminate()
+            self._stop(srv)
             fx.stop()
