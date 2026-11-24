@@ -76,7 +76,7 @@ except ImportError:  # platform without curses -> main() degrades to serve
 # CHANGELOG and the git tag all derive from this one line. MAJOR.MINOR.PATCH per
 # semver.org: MAJOR on a breaking client contract, MINOR on backward-compatible
 # features, PATCH on fixes.
-__version__ = "1.4.0"
+__version__ = "1.5.0"
 
 HOME = os.path.expanduser("~")
 MR_HOME = os.path.join(HOME, ".minimalrouter")
@@ -522,12 +522,23 @@ def ep(base, path):
     return b + path
 
 
-def upstream(base, key, path, payload=None, timeout=TIMEOUT, row=None):
+def upstream(base, key, path, payload=None, timeout=None, row=None):
     # Per-profile behavior only; no provider is known by name.
     if _is_self_base(base):
         raise ValueError("self-referential base %s (this router listens on %s:%d)"
                          % (base, HOST, PORT))
     row = row or {}
+    # ONE resolution point. `timeout=None` means the caller is generic (the client
+    # path), so the row's own value applies and TIMEOUT is the fallback. An
+    # EXPLICIT value means the caller made a deliberate choice for this call path
+    # — the probe passes PROBE_TIMEOUT, a tighter boot budget — and a row may
+    # shorten that but never blow it out. A row may carry its own `timeout` in
+    # seconds because an upstream that is slow to FAIL (one that hangs instead of
+    # returning 429 when its session limit is hit) turns the global value into a
+    # per-row multiplier across the chain: four gated rows at 90s is 360s of
+    # silence before the caller sees a 502. Measured on 100milionseek.top, 2026-11-24.
+    if timeout is None:
+        timeout = row.get("timeout") or TIMEOUT
     provider = row.get("oauth_provider", "")
     api_mode = row.get("api_mode", "chat_completions")
     if api_mode == "responses" and path == "/v1/chat/completions":
@@ -550,7 +561,9 @@ def upstream(base, key, path, payload=None, timeout=TIMEOUT, row=None):
 def oauth_chat(row, payload, timeout=TIMEOUT):
     """Translate an OpenAI Chat request to a Responses-style upstream.
 
-    Used only when a profile declares "api_mode": "responses".
+    Used only when a profile declares "api_mode": "responses". The timeout arrives
+    ALREADY resolved by upstream() — there is one resolution point, so this path
+    cannot disagree with the client path.
     """
     base = row["base"].rstrip("/")
     token = row.get("key", "")
@@ -924,17 +937,27 @@ def chat_from_zcode(row, payload):
 
 
 def probe(base, key, model, row=None):
-    """Marker probe. Returns (ok, ms, error, content, completion_tokens).
+    """Marker probe. Returns (ok, ms, error, content, completion_tokens, quota).
 
     tokens is 0 when the upstream reports no usage (streamed or silent lanes) —
-    the honest floor, never an estimate."""
+    the honest floor, never an estimate.
+
+    The boot budget is PROBE_TIMEOUT, and a row's own `timeout` may only SHORTEN
+    it: a slow row must not stretch a 25-row boot probe past the window the
+    operator configured, and the probe's job is liveness, not serving.
+    """
     t0 = time.time()
+    row = row or {}
+    budget = min(PROBE_TIMEOUT, row.get("timeout") or PROBE_TIMEOUT)
     payload = {"model": model, "max_tokens": 200,
                "messages": [{"role": "user",
                              "content": "Reply with exactly: OK"}]}
     try:
         resp = upstream(base, key, "/v1/chat/completions", payload,
-                        timeout=PROBE_TIMEOUT, row=row or {})
+                        timeout=budget, row=row)
+        # getattr, not a bare attribute: a response object without .headers must
+        # degrade to "no meter", never crash the probe.
+        q = quota_from_headers(getattr(resp, "headers", None))
         body = json.loads(resp.read() or b"{}")
         ms = (time.time() - t0) * 1000
         if isinstance(body, dict) and "choices" not in body \
@@ -943,7 +966,7 @@ def probe(base, key, model, row=None):
                 "role": "assistant", "content": responses_text(body)}}],
                 "usage": body.get("usage", {})}
         if not isinstance(body, dict) or "choices" not in body:
-            return False, ms, "unexpected body", "", 0
+            return False, ms, "unexpected body", "", 0, q
         try:
             msg = body["choices"][0].get("message", {}) or {}
             content = msg.get("content") or ""
@@ -952,12 +975,13 @@ def probe(base, key, model, row=None):
         tokens = int((body.get("usage", {}) or {}).get("completion_tokens") or 0)
         if not content.strip():
             if tokens:
-                return True, ms, "", "(reasoning only, no visible text)", tokens
-            return False, ms, "empty content", "", 0
-        return True, ms, "", content.strip()[:80], tokens
+                return True, ms, "", "(reasoning only, no visible text)", tokens, q
+            return False, ms, "empty content", "", 0, q
+        return True, ms, "", content.strip()[:80], tokens, q
     except Exception as e:
         return False, (time.time() - t0) * 1000, "%s: %s" % (
-            type(e).__name__, e), "", 0
+            type(e).__name__, e), "", 0, quota_from_headers(
+                getattr(e, "headers", None))
 
 
 def fetch_models(base, key):
@@ -1004,6 +1028,34 @@ def BY_MODEL(rows):
         for a in [r["model"]] + r.get("aliases", []):
             bm.setdefault(a, []).append(r)
     return bm
+
+
+# The upstream has TOLD us these rows cannot serve right now. `stale` and
+# `error` are deliberately absent: those are uncertain, and an untried row is
+# worth more than a deferred one.
+DEFER_CLASSES = ("cooldown", "empty", "gated", "dead")
+
+
+def order_chain(chain, state=None, now=None):
+    """Request-time chain order: rows the upstream has not gated go first.
+
+    Until v1.5.0 the chain was walked in plain row order. The failover loop
+    learns WITHIN a request (a row that throws is abandoned and the next one
+    tried), but nothing carried that knowledge ACROSS requests, so a row that
+    had just returned 429 stayed at the head and absorbed the next concurrent
+    request too — the pool re-derived the same dead end on every call.
+
+    This is a stable partition, never a filter. If every row is gated the order
+    is unchanged and the caller still tries all of them: a daily-allowance pool
+    that is exhausted must wait for the reset, not answer 502.
+    """
+    state = ROW_STATE if state is None else state
+    now = now if now is not None else time.time()
+    healthy, deferred = [], []
+    for r in chain:
+        cls = classify_status(state.get(r["name"], {}), now)
+        (deferred if cls in DEFER_CLASSES else healthy).append(r)
+    return healthy + deferred
 
 
 def row_class(row):
@@ -1108,13 +1160,44 @@ def spark_chars(hist, width=5):
                    for v in vals)
 
 
-def record_state(name, status, ms, at=None, error="", tokens=0):
+QUOTA_HDR_PREFIX = "x-quota-"
+QUOTA_HDR_EXTRA = ("x-qos", "retry-after", "ratelimit-remaining")
+
+
+def quota_from_headers(headers):
+    """Pick an upstream's allowance meter out of its response headers (pure).
+
+    Some upstreams expose remaining allowance ONLY as response headers and ship no
+    usage API at all. The router forwards the BODY and dropped the HEADERS, so a
+    pool of such accounts could not see how much of today's allowance was left —
+    the one number the pool exists to manage. Body-only forwarding also hid the
+    429 `retry-after`, which is the reset clock.
+    """
+    out = {}
+    try:
+        items = list(headers.items())
+    except AttributeError:
+        return out
+    for k, v in items:
+        lk = str(k).lower()
+        if lk.startswith(QUOTA_HDR_PREFIX) or lk in QUOTA_HDR_EXTRA:
+            try:
+                out[lk] = int(v)
+            except (TypeError, ValueError):
+                out[lk] = str(v)[:64]
+    return out
+
+
+def record_state(name, status, ms, at=None, error="", tokens=0, quota=None):
     """Single write path for per-row live state.
 
     hist is a JSON-safe list (NOT a deque) so /api/state can serialize it.
     fail_streak: consecutive failures (DEAD at >= FAIL_STREAK_DEAD).
     recent: last RECENT_MAX outcomes (1/0) for OK%.
     tps: EMA of completion-tokens/sec, only when the upstream reported usage.
+    quota: the allowance meter this response carried. It describes the LAST
+    response, so a call that carried none clears it rather than showing a
+    neighbour's stale number.
     """
     prev = ROW_STATE.get(name, {})
     hist = list(prev.get("hist", []))
@@ -1137,7 +1220,7 @@ def record_state(name, status, ms, at=None, error="", tokens=0):
                        "at": at if at is not None else time.time(),
                        "error": error, "hist": hist,
                        "fail_streak": streak, "recent": recent,
-                       "tps": round(tps, 1)}
+                       "tps": round(tps, 1), "quota": dict(quota or {})}
 
 
 def note_req(ok, tokens=0, ms=0):
@@ -1197,10 +1280,10 @@ def probe_row(r):
     """Probe one configured row with its own credential; records state + log.
     Reported usage seeds the per-row TPS EMA — the board's TPS column is live
     from the boot probe, not only after real client traffic."""
-    ok, ms, err, content, tokens = probe(r["base"], r.get("key", ""), r["model"],
-                                         row=r)
+    ok, ms, err, content, tokens, quota = probe(r["base"], r.get("key", ""), r["model"],
+                                                row=r)
     record_state(r["name"], "ok" if ok else "fail", ms,
-                 error="" if ok else str(err)[:200], tokens=tokens)
+                 error="" if ok else str(err)[:200], tokens=tokens, quota=quota)
     log("%s %s via %s %.1fs%s" % ("OK " if ok else "FAIL", r["model"], r["name"],
                                   ms / 1000.0,
                                   "" if ok else ": %s" % str(err)[:120]))
@@ -1384,10 +1467,11 @@ class Handler(BaseHTTPRequestHandler):
                     break
             if not key and match:  # dashboard row test -> configured key
                 key = match["key"]
-            ok, ms, err, content, tokens = probe(base, key, model, row=match)
+            ok, ms, err, content, tokens, quota = probe(base, key, model, row=match)
             if match:  # keep the table's STATE / LATENCY / LAST live
                 record_state(match["name"], "ok" if ok else "fail", ms,
-                             error="" if ok else str(err)[:200], tokens=tokens)
+                             error="" if ok else str(err)[:200], tokens=tokens,
+                             quota=quota)
             log("TEST %s %s -> %s" % (base, model, "ok" if ok else err))
             return self._send(200 if ok else 400,
                               {"ok": ok, "ms": ms, "error": err,
@@ -1420,7 +1504,10 @@ class Handler(BaseHTTPRequestHandler):
             # Class is derived from the row shape (key present or not); a caller
             # cannot pass `class` to claim a different auth path.
             new_row = {"name": name, "base": base, "model": model, "key": key}
-            ok, ms, err, content, tokens = probe(base, key, model)
+            # probe with the row's own shape, so a row declaring api_mode or a
+            # chat_path is tested the way it will actually be used, and its
+            # allowance meter is captured on the way in.
+            ok, ms, err, content, tokens, quota = probe(base, key, model, row=new_row)
             if not ok:
                 return self._send(400, {"ok": False,
                                         "error": "test failed: %s" % err})
@@ -1431,7 +1518,7 @@ class Handler(BaseHTTPRequestHandler):
                 new_row["name"] = name
                 rows.append(new_row)
                 write_rows(rows)
-            record_state(name, "ok", ms, tokens=tokens)
+            record_state(name, "ok", ms, tokens=tokens, quota=quota)
             log("ADD %s (%s / %s) %s ok %.0fms" % (
                 name, base, model, row_class(new_row), ms))
             return self._send(200, {"ok": True, "name": name})
@@ -1496,7 +1583,7 @@ class Handler(BaseHTTPRequestHandler):
             bm = BY_MODEL(enabled_rows())
             model = body.get("model", "")
             stream = bool(body.get("stream", False))
-            chain = bm.get(model)
+            chain = order_chain(bm.get(model)) if bm.get(model) else None
             if not chain:
                 return self._send(404, {
                     "error": "model '%s' not in pool" % model,
@@ -1627,7 +1714,9 @@ class Handler(BaseHTTPRequestHandler):
                             log("stream client disconnected mid-row %s"
                                 % row["name"])
                         sms = (time.time() - t0) * 1000
-                        record_state(row["name"], "ok", sms)
+                        record_state(row["name"], "ok", sms,
+                                     quota=quota_from_headers(
+                                         getattr(resp, "headers", None)))
                         note_req(True, 0, sms)  # streamed usage not parsed — floor
                         log("OK  %s via %s stream %.1fs"
                             % (model, row["name"], time.time() - t0))
@@ -1640,7 +1729,8 @@ class Handler(BaseHTTPRequestHandler):
                                 "completion_tokens") or 0)
                         except Exception:
                             pass
-                        record_state(row["name"], "ok", nms, tokens=nct)
+                        record_state(row["name"], "ok", nms, tokens=nct,
+                                     quota=quota_from_headers(getattr(resp, "headers", None)))
                         note_req(True, nct, nms)
                         self._send(200, raw=data)
                         log("OK  %s via %s %.1fs"
@@ -1648,7 +1738,9 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 except Exception as e:
                     detail = str(e)
+                    fh = None
                     if isinstance(e, urllib.error.HTTPError):
+                        fh = e.headers
                         try:
                             snippet = e.read(300).decode("utf-8", "replace").strip()
                             if snippet:
@@ -1657,7 +1749,11 @@ class Handler(BaseHTTPRequestHandler):
                             pass
                     last_err = "%s: %s" % (row["name"], detail)
                     fms = (time.time() - t0) * 1000
-                    record_state(row["name"], "fail", fms, error=detail[:200])
+                    # A 429 carries the allowance meter too: without this the
+                    # exhausted row's remaining-tokens and reset clock vanish
+                    # exactly when they matter most.
+                    record_state(row["name"], "fail", fms, error=detail[:200],
+                                 quota=quota_from_headers(fh))
                     note_req(False, 0, fms)
                     log("FAIL %s via %s: %s (%.1fs) -> next"
                         % (model, row["name"], detail, time.time() - t0))

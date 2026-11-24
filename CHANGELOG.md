@@ -12,6 +12,56 @@ OpenAI-compatible request/response shape, the endpoint, or the install command);
 for backward-compatible features (new providers, classes, dashboard capability, CLI verbs);
 **PATCH** for fixes only.
 
+## [1.5.0] — 2026-11-24
+
+### Added
+
+- **The pool now remembers what the last request taught it.** A four-account
+  upstream measured on 2026-11-24 exposed the defect: `enabled_rows()` filtered
+  only on `disabled` and the chain was walked in plain row order, so failover
+  worked *within* a request — a row that threw was abandoned and the next tried —
+  but nothing crossed over. The account that had just returned 429 stayed at the
+  head of the chain and absorbed the next concurrent request too, so every
+  request re-derived the same dead end. `order_chain()` is a stable partition at
+  request time: rows the upstream has *declared* unusable (`cooldown` 429,
+  `empty` 402, `gated` 403, `dead` streak) move behind the rest. It is a
+  partition, never a filter — when every row is gated the order is unchanged and
+  the caller still tries all of them, because a daily-allowance pool that is
+  spent must wait for its reset, not answer 502. `stale` and `error` deliberately
+  do not defer: those are uncertain, and an untried row is worth more than a
+  deferred one.
+- **A row can set its own `timeout`.** `TIMEOUT` was a single global, and for an
+  upstream that is slow to *fail* — one that hangs instead of returning 429 when
+  its session limit is hit — a global timeout is a per-row multiplier: four gated
+  rows at 90 s is 360 s of silence before the caller learns anything. The row
+  field wins over the global; rows without it keep the global default. The
+  Responses-dialect path honours it too, so the fix covers both call paths.
+- **An upstream's allowance meter survives the proxy.** Some upstreams expose
+  remaining allowance *only* as response headers and ship no usage API at all, so
+  a pool of such accounts could not see how much of today's quota was left — the
+  one number the pool exists to manage. `x-quota-*`, `x-qos` and `retry-after` are
+  read off the upstream response (success *and* 429, since the reset clock is the
+  useful half of a rate-limit answer) and carried in row state, visible at
+  `/api/state`. Non-numeric values stay strings; a header that is not a meter is
+  never copied, so a `Set-Cookie` cannot leak into state. The value describes the
+  LAST response: a call carrying none clears it rather than showing a stale
+  number from a previous call.
+
+### Notes
+
+- No dashboard column was added for the meter. `provider` and `key_src` already
+  crowd the row, and the geometry gate exists because a panel that reflows
+  silently hides routes; that is a layout decision for the owner, not a
+  side-effect of a state change.
+- **This release is a subset of what the roadmap names 1.5.0.** Still open there:
+  per-account pacing, jitter, and single-flight locks on the generic refresher
+  (only omnirush holds one). The public commitments do not claim those yet.
+- Verified: 211 unit tests OK (66 dashboard skips, textual absent locally; CI
+  runs them with it present), `ruff check --select F` clean on engine, dashboard
+  and tests. The 14 new tests fail 14/14 against the pre-fix v1.4.0 engine
+  (`MR_TEST_ENGINE=`), including the end-to-end one, which reproduces the defect
+  as `['a','b'] != ['b']` — request 2 restruck the spent account.
+
 ## [1.4.0] — 2026-11-23
 
 ### Added

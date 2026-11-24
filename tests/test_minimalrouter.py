@@ -7,6 +7,7 @@ Sabotage check (a regression test must fail pre-fix):
 Regression tests carry the defect id they bite (D1-D4, full audit 2026-11-19).
 """
 import importlib.util
+import email.message
 import json
 import os
 import socket
@@ -689,9 +690,10 @@ class TestProbeTokens(unittest.TestCase):
         _saved = dict(mr.ROW_STATE)
         mr.ROW_STATE.clear()
         try:
-            ok, ms, err, content, tokens = mr.probe("https://x/v1", "k", "m")
+            ok, ms, err, content, tokens, q = mr.probe("https://x/v1", "k", "m")
             self.assertTrue(ok)
             self.assertEqual(tokens, 42)
+            self.assertEqual(q, {}, "a response with no .headers degrades to no meter")
             mr.probe_row({"name": "tr", "base": "https://x/v1",
                           "model": "m", "key": "k"})
             # the fake call's ms is ~0 so the EMA value is not meaningful —
@@ -713,9 +715,10 @@ class TestProbeTokens(unittest.TestCase):
         old = mr.upstream
         mr.upstream = lambda *a, **k: FakeResp()
         try:
-            ok, ms, err, content, tokens = mr.probe("https://x/v1", "k", "m")
+            ok, ms, err, content, tokens, q = mr.probe("https://x/v1", "k", "m")
             self.assertTrue(ok)
             self.assertEqual(tokens, 0)  # honest floor, never an estimate
+            self.assertEqual(q, {})
         finally:
             mr.upstream = old
 
@@ -1620,3 +1623,496 @@ class TestDoctor(unittest.TestCase):
         self.assertTrue(data["checks"], "the real install produced no findings")
         for c in data["checks"]:
             self.assertIn(c["level"], ("OK", "WARN", "FAIL"))
+
+
+class TestPoolLearnsAcrossRequests(unittest.TestCase):
+    """v1.5.0: the pool must carry what it learned from the last request.
+
+    Defect measured on 100milionseek.top, 2026-11-24: four accounts behind one
+    router, `enabled_rows()` filtering only on `disabled` and the chain walked in
+    plain row order. Failover worked WITHIN a request, so a request survived a
+    429 — but nothing crossed over, so the next request re-struck the same
+    exhausted account first. The pool re-derived the same dead end on every call.
+    """
+
+    # ---- pure: order_chain ----
+
+    def _st(self, err, streak=1, status="fail", at=None):
+        return {"status": status, "error": err, "fail_streak": streak,
+                "at": at if at is not None else time.time()}
+
+    def test_a_cooldown_row_moves_behind_a_healthy_row(self):
+        now = time.time()
+        chain = [{"name": "a", "model": "m"}, {"name": "b", "model": "m"}]
+        state = {"a": self._st("HTTP Error 429: rate limited"),
+                 "b": self._st("", status="ok")}
+        out = [r["name"] for r in mr.order_chain(chain, state, now)]
+        self.assertEqual(out, ["b", "a"],
+                         "the row the upstream just 429'd must not take the next request")
+
+    def test_deferral_covers_every_state_the_upstream_declared(self):
+        """429 cooldown, 402 empty, 403 gated and a dead streak are all answers
+        the upstream GAVE us. Each must defer, and each must defer for the same
+        reason: classify_status already knows them."""
+        now = time.time()
+        chain = [{"name": n, "model": "m"} for n in
+                 ("cool", "empty", "gated", "dead", "good")]
+        state = {"cool": self._st("HTTP Error 429"),
+                 "empty": self._st("HTTP Error 402"),
+                 "gated": self._st("HTTP Error 403"),
+                 "dead": self._st("HTTP Error 500", streak=mr.FAIL_STREAK_DEAD),
+                 "good": self._st("", status="ok")}
+        out = [r["name"] for r in mr.order_chain(chain, state, now)]
+        self.assertEqual(out[0], "good")
+        self.assertEqual(set(out[1:]), {"cool", "empty", "gated", "dead"})
+
+    def test_an_uncertain_row_stays_in_line_and_an_untried_row_gets_tried(self):
+        """`error` and `stale` are not deferrals: the row might still serve, and a
+        never-probed row reads `unknown` at boot. Deferring those would starve a
+        pool whose state has simply not been learned yet."""
+        now = time.time()
+        chain = [{"name": "err", "model": "m"}, {"name": "stale", "model": "m"},
+                 {"name": "untried", "model": "m"}, {"name": "cool", "model": "m"}]
+        state = {"err": self._st("HTTP Error 500"),
+                 "stale": self._st("", status="ok", at=now - mr.STALE_AFTER - 1),
+                 "cool": self._st("HTTP Error 429")}
+        out = [r["name"] for r in mr.order_chain(chain, state, now)]
+        self.assertEqual(out[:3], ["err", "stale", "untried"],
+                         "only upstream-declared states may defer")
+        self.assertEqual(out[3], "cool")
+
+    def test_partition_never_filter_a_wholly_exhausted_pool_keeps_its_order(self):
+        """The load-bearing property. A daily-allowance pool where every account
+        is spent must still be TRIED, because waiting for the reset is the answer
+        and 502-without-trying is not. So this is a stable partition, not a filter."""
+        now = time.time()
+        chain = [{"name": "a", "model": "m"}, {"name": "b", "model": "m"},
+                 {"name": "c", "model": "m"}]
+        state = {n: self._st("HTTP Error 429") for n in ("a", "b", "c")}
+        out = [r["name"] for r in mr.order_chain(chain, state, now)]
+        self.assertEqual(out, ["a", "b", "c"],
+                         "all-deferred must preserve order and drop nothing")
+        self.assertEqual(len(out), len(chain))
+
+    def test_relative_order_is_stable_within_each_group(self):
+        now = time.time()
+        chain = [{"name": n, "model": "m"} for n in ("a", "b", "c", "d", "e")]
+        state = {"b": self._st("HTTP Error 429"), "d": self._st("HTTP Error 429"),
+                 "a": self._st("", status="ok"),
+                 "c": self._st("", status="ok"),
+                 "e": self._st("", status="ok")}
+        out = [r["name"] for r in mr.order_chain(chain, state, now)]
+        self.assertEqual(out, ["a", "c", "e", "b", "d"],
+                         "row order inside each group is the operator's configured order")
+
+    # ---- pure: quota_from_headers ----
+
+    def test_quota_headers_are_picked_ints_and_nothing_else(self):
+        hdrs = {"X-Quota-Limit": "120000000", "x-quota-used": "18159",
+                "X-Quota-Remaining": "119981841", "X-Qos": "full",
+                "Retry-After": "30512", "Content-Type": "application/json",
+                "Set-Cookie": "session=abc"}
+        out = mr.quota_from_headers(hdrs)
+        self.assertEqual(out["x-quota-limit"], 120000000)
+        self.assertEqual(out["x-quota-used"], 18159)
+        self.assertEqual(out["x-quota-remaining"], 119981841)
+        self.assertEqual(out["retry-after"], 30512)
+        self.assertEqual(out["x-qos"], "full", "a non-numeric meter stays a string")
+        self.assertNotIn("content-type", out)
+        self.assertNotIn("set-cookie", out,
+                         "a credential-bearing header must never land in row state")
+
+    def test_absent_or_broken_headers_yield_nothing_not_a_crash(self):
+        self.assertEqual(mr.quota_from_headers(None), {})
+        self.assertEqual(mr.quota_from_headers({}), {})
+        self.assertEqual(mr.quota_from_headers("not-a-header-object"), {})
+
+    # ---- record_state carries the meter, and never shows a stale one ----
+
+    def test_record_state_stores_quota_and_a_later_call_without_one_clears_it(self):
+        name = "quota-row"
+        mr.ROW_STATE.pop(name, None)
+        try:
+            mr.record_state(name, "ok", 100, quota={"x-quota-remaining": 5})
+            self.assertEqual(mr.ROW_STATE[name]["quota"], {"x-quota-remaining": 5})
+            mr.record_state(name, "ok", 100)
+            self.assertEqual(mr.ROW_STATE[name]["quota"], {},
+                             "quota describes the LAST response; a carried-over "
+                             "number from a previous call would be a lie on the board")
+        finally:
+            mr.ROW_STATE.pop(name, None)
+
+    def test_a_row_without_a_meter_gets_an_empty_quota_not_a_missing_key(self):
+        """Every row carries the key, so /api/state consumers never branch on
+        absence — an upstream with no meter reads {} , which is an answer."""
+        name = "no-meter-row"
+        mr.ROW_STATE.pop(name, None)
+        try:
+            mr.record_state(name, "ok", 50)
+            self.assertIn("quota", mr.ROW_STATE[name])
+            self.assertEqual(mr.ROW_STATE[name]["quota"], {})
+        finally:
+            mr.ROW_STATE.pop(name, None)
+
+    # ---- per-row timeout ----
+
+    def test_a_generic_call_uses_the_row_timeout(self):
+        """TIMEOUT is a default, not a ceiling. Measured: an upstream that HANGS
+        instead of returning 429 at its session limit turns 90s into a PER-ROW
+        multiplier — four gated rows is 360s before the caller sees anything."""
+        seen = {}
+
+        class FakeResp(object):
+            status = 200
+            headers = {}
+
+            def read(self):
+                return b'{"ok": true}'
+
+        def fake_urlopen(req, timeout=None):
+            seen["timeout"] = timeout
+            return FakeResp()
+
+        real = mr.urllib.request.urlopen
+        try:
+            mr.urllib.request.urlopen = fake_urlopen
+            # the client path: no timeout argument, so the row decides
+            mr.upstream("https://example.test/v1", "k", "/v1/chat/completions",
+                        payload={"model": "m"}, row={"name": "slow", "timeout": 20})
+            self.assertEqual(seen["timeout"], 20,
+                             "the row's own timeout must govern a generic call")
+            mr.upstream("https://example.test/v1", "k", "/v1/chat/completions",
+                        payload={"model": "m"}, row={"name": "plain"})
+            self.assertEqual(seen["timeout"], mr.TIMEOUT,
+                             "a row with no timeout keeps the global default")
+        finally:
+            mr.urllib.request.urlopen = real
+
+    def test_an_explicit_call_budget_beats_the_row_so_boot_cannot_be_blown_out(self):
+        """The property I got wrong on the first pass. probe() passes PROBE_TIMEOUT
+        deliberately; if the row always won, a row declaring timeout 600 would
+        stretch every boot probe to 600s and stall the whole pool. An explicit
+        caller value is a decision for that call path, so it wins."""
+        seen = {}
+
+        class FakeResp(object):
+            status = 200
+            headers = {}
+
+            def read(self):
+                return b'{"ok": true}'
+
+        def fake_urlopen(req, timeout=None):
+            seen["timeout"] = timeout
+            return FakeResp()
+
+        real = mr.urllib.request.urlopen
+        try:
+            mr.urllib.request.urlopen = fake_urlopen
+            mr.upstream("https://example.test/v1", "k", "/v1/chat/completions",
+                        payload={"model": "m"}, timeout=mr.PROBE_TIMEOUT,
+                        row={"name": "greedy", "timeout": 600})
+            self.assertEqual(seen["timeout"], mr.PROBE_TIMEOUT,
+                             "a row may not lengthen a caller's explicit budget")
+        finally:
+            mr.urllib.request.urlopen = real
+
+    def test_a_row_may_shorten_its_probe_budget(self):
+        """The other direction is legitimate: a fast-failing row can tighten the
+        probe so a dead upstream is abandoned quickly."""
+        seen = {}
+
+        class FakeResp(object):
+            status = 200
+            headers = {}
+
+            def read(self):
+                return b'{"choices":[{"message":{"content":"OK"}}]}'
+
+        def fake_urlopen(req, timeout=None):
+            seen["timeout"] = timeout
+            return FakeResp()
+
+        real = mr.urllib.request.urlopen
+        try:
+            mr.urllib.request.urlopen = fake_urlopen
+            mr.probe("https://example.test/v1", "k", "m",
+                     row={"name": "tight", "timeout": 7})
+            self.assertEqual(seen["timeout"], 7,
+                             "min(PROBE_TIMEOUT, row) — a row may only shorten")
+            mr.probe("https://example.test/v1", "k", "m",
+                     row={"name": "loose", "timeout": 600})
+            self.assertEqual(seen["timeout"], mr.PROBE_TIMEOUT)
+        finally:
+            mr.urllib.request.urlopen = real
+
+    def test_the_probe_path_records_the_allowance_meter_it_sees(self):
+        """The gap I found on the live install: quota was wired into the client
+        path only, so every row read quota={} on the board until real traffic
+        arrived — and for a pool managed by remaining allowance, the boot probe is
+        the meter the operator actually looks at."""
+        class FakeResp(object):
+            status = 200
+
+            def __init__(self):
+                self.headers = {"x-quota-remaining": "119981841",
+                                "x-quota-limit": "120000000", "x-qos": "full",
+                                "Content-Type": "application/json"}
+
+            def read(self):
+                return json.dumps({"choices": [{"message": {"content": "OK"}}],
+                                   "usage": {"completion_tokens": 1}}).encode()
+
+        real = mr.urllib.request.urlopen
+        try:
+            mr.urllib.request.urlopen = lambda req, timeout=None: FakeResp()
+            ok, ms, err, content, tokens, q = mr.probe(
+                "https://example.test/v1", "k", "m", row={"name": "metered"})
+            self.assertTrue(ok)
+            self.assertEqual(q["x-quota-remaining"], 119981841)
+            self.assertEqual(q["x-qos"], "full")
+        finally:
+            mr.urllib.request.urlopen = real
+
+    def test_a_failed_probe_returns_its_meter_instead_of_losing_it(self):
+        """A 429 is the response where remaining=0 and the reset clock matter most."""
+        real = mr.urllib.request.urlopen
+
+        def boom(req, timeout=None):
+            # a real email.message.Message, the type urllib actually delivers, so
+            # this proves the parser on the live header shape and not on a dict
+            h = email.message.Message()
+            h["x-quota-remaining"] = "0"
+            h["retry-after"] = "43200"
+            raise urllib.error.HTTPError(
+                "https://example.test/v1/chat/completions", 429, "rate limited", h, None)
+
+        try:
+            mr.urllib.request.urlopen = boom
+            ok, ms, err, content, tokens, q = mr.probe(
+                "https://example.test/v1", "k", "m", row={"name": "spent"})
+            self.assertFalse(ok)
+            self.assertEqual(q["x-quota-remaining"], 0)
+            self.assertEqual(q["retry-after"], 43200)
+        finally:
+            mr.urllib.request.urlopen = real
+
+
+class _SpentFreshFixture(object):
+    """Two accounts, one model: 'a' is spent for the day (429 + meter at 0),
+    'b' is fresh (200 + meter at 999). Records every key it is asked by, in order,
+    so a test can see WHICH account a request actually struck."""
+
+    def __init__(self):
+        self.seen = []
+        self.server = None
+        self.port = None
+
+    def start(self):
+        outer = self
+
+        class H(BaseHTTPRequestHandler):
+            def do_POST(self):
+                n = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(n)
+                try:
+                    payload = json.loads(raw or b"{}")
+                except Exception:
+                    payload = {}
+                auth = str(self.headers.get("Authorization", ""))
+                key = "a" if auth.endswith("a") else ("hang" if auth.endswith("h") else "b")
+                if self.path.endswith("/chat/completions"):
+                    outer.seen.append(key)
+                if key == "hang":
+                    time.sleep(12)          # slower than the row's own timeout
+                    body = json.dumps({"error": {"message": "too slow"}}).encode()
+                    self.send_response(504)
+                elif key == "a":
+                    body = json.dumps({"error": {"message": "today's allowance is gone",
+                                                 "type": "rate_limit_error",
+                                                 "code": "daily_quota_exceeded"}}).encode()
+                    self.send_response(429)
+                    self.send_header("x-quota-remaining", "0")
+                    self.send_header("x-quota-limit", "100000000")
+                    self.send_header("retry-after", "43200")
+                else:
+                    body = json.dumps({"id": "chatcmpl-f", "object": "chat.completion",
+                                       "model": payload.get("model", "m"),
+                                       "choices": [{"index": 0, "finish_reason": "stop",
+                                                    "message": {"role": "assistant",
+                                                                "content": "FRESH"}}],
+                                       "usage": {"prompt_tokens": 5, "completion_tokens": 1,
+                                                 "total_tokens": 6}}).encode()
+                    self.send_response(200)
+                    self.send_header("x-quota-remaining", "999")
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self):
+                if self.path.endswith("/models"):
+                    body = json.dumps({"object": "list", "data": [{"id": "m"}]}).encode()
+                    self.send_response(200)
+                else:
+                    body = b"{}"
+                    self.send_response(404)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, fmt, *args):
+                pass
+
+        self.server = HTTPServer(("127.0.0.1", 0), H)
+        self.port = self.server.server_address[1]
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        return self
+
+    def stop(self):
+        try:
+            self.server.shutdown()
+            self.server.server_close()
+        except Exception:
+            pass
+
+
+class TestPoolLearnsEndToEnd(unittest.TestCase):
+    """The defect only shows with a real router process: request 1 fails over,
+    request 2 must NOT re-strike the account request 1 just learned is spent."""
+
+    def _boot(self, rows, port=None):
+        tmp = tempfile.mkdtemp()
+        os.makedirs(os.path.join(tmp, ".minimalrouter"), exist_ok=True)
+        with open(os.path.join(tmp, ".minimalrouter-setup"), "w") as f:
+            f.write("")
+        with open(os.path.join(tmp, ".minimalrouter", "rows.json"), "w") as f:
+            json.dump(rows, f)
+        rport = port or free_port()
+        env = dict(os.environ, HOME=tmp, MINIMALROUTER_PORT=str(rport),
+                   MINIMALROUTER_PROBE_INTERVAL="0")   # no mid-test re-probe noise
+        srv = subprocess.Popen([sys.executable, str(ENGINE), "serve"],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               env=env)
+        base = "http://127.0.0.1:%d" % rport
+        for _ in range(60):
+            try:
+                with urllib.request.urlopen(base + "/health", timeout=2) as r:
+                    if r.status == 200:
+                        break
+            except Exception:
+                time.sleep(0.25)
+        else:
+            srv.terminate()
+            self.fail("router subprocess did not come up")
+        return srv, base, tmp
+
+    def _chat(self, base, model="m", timeout=25):
+        rq = urllib.request.Request(
+            base + "/v1/chat/completions",
+            data=json.dumps({"model": model,
+                             "messages": [{"role": "user", "content": "hi"}],
+                             "max_tokens": 10}).encode(),
+            method="POST", headers={"Content-Type": "application/json"})
+        t0 = time.time()
+        try:
+            with urllib.request.urlopen(rq, timeout=timeout) as r:
+                return r.status, json.loads(r.read().decode()), time.time() - t0
+        except urllib.error.HTTPError as e:
+            return e.code, e.read().decode("utf-8", "replace")[:300], time.time() - t0
+
+    def _state(self, base):
+        with urllib.request.urlopen(base + "/api/state", timeout=10) as r:
+            return json.loads(r.read().decode())
+
+    def test_the_second_request_does_not_restrike_the_spent_account(self):
+        fx = _SpentFreshFixture().start()
+        srv = None
+        try:
+            base_url = "http://127.0.0.1:%d/v1" % fx.port
+            srv, base, _ = self._boot([
+                # the SPENT account is configured first: that is exactly the
+                # pre-fix trap, and row order must not decide who gets hammered.
+                {"name": "spent", "base": base_url, "model": "m", "key": "a"},
+                {"name": "fresh", "base": base_url, "model": "m", "key": "b"},
+            ])
+            # let the boot probe land so state exists before the first client call
+            for _ in range(40):
+                st = self._state(base)
+                if all(r["state"].get("status") for r in st["rows"]):
+                    break
+                time.sleep(0.25)
+            mark = len(fx.seen)
+
+            code1, body1, _ = self._chat(base)
+            self.assertEqual(code1, 200, "request 1 must still succeed via failover")
+            self.assertEqual(body1["choices"][0]["message"]["content"], "FRESH")
+            strike1 = fx.seen[mark:]
+            self.assertEqual(strike1, ["a", "b"],
+                             "request 1 strikes the configured order, then fails over")
+
+            mark2 = len(fx.seen)
+            code2, body2, _ = self._chat(base)
+            self.assertEqual(code2, 200)
+            self.assertEqual(body2["choices"][0]["message"]["content"], "FRESH")
+            strike2 = fx.seen[mark2:]
+            self.assertEqual(
+                strike2, ["b"],
+                "request 2 must go straight to the account that can serve. "
+                "Pre-v1.5.0 this is ['a','b'] again — the pool re-derives the "
+                "same dead end on every request, which is the 'hammer one free "
+                "tier N ways' surface 1.5.0 exists to close.")
+        finally:
+            if srv:
+                srv.terminate()
+            fx.stop()
+
+    def test_the_allowance_meter_survives_the_proxy_into_api_state(self):
+        """x-quota-* is some upstreams' ONLY meter. The router forwards the body
+        and dropped the headers, so a pool of such accounts was blind to remaining
+        tokens — the one number the pool exists to manage."""
+        fx = _SpentFreshFixture().start()
+        srv = None
+        try:
+            base_url = "http://127.0.0.1:%d/v1" % fx.port
+            srv, base, _ = self._boot([
+                {"name": "spent", "base": base_url, "model": "m", "key": "a"},
+                {"name": "fresh", "base": base_url, "model": "m", "key": "b"},
+            ])
+            self._chat(base)
+            st = self._state(base)
+            by = {r["name"]: r for r in st["rows"]}
+            self.assertEqual(by["fresh"]["state"]["quota"].get("x-quota-remaining"), 999,
+                             "the serving row must show what is left")
+            q = by["spent"]["state"]["quota"]
+            self.assertEqual(q.get("x-quota-remaining"), 0)
+            self.assertEqual(q.get("retry-after"), 43200,
+                             "the 429's reset clock is the useful half of the meter")
+        finally:
+            if srv:
+                srv.terminate()
+            fx.stop()
+
+    def test_a_hanging_upstream_fails_at_the_row_timeout_not_the_global(self):
+        """The exposure this closes: an upstream that hangs instead of returning
+        429 makes the global 90s a PER-ROW multiplier. Four such rows is 360s of
+        silence before the caller learns anything."""
+        fx = _SpentFreshFixture().start()
+        srv = None
+        try:
+            base_url = "http://127.0.0.1:%d/v1" % fx.port
+            srv, base, _ = self._boot([
+                {"name": "hang", "base": base_url, "model": "m", "key": "h",
+                 "timeout": 3},
+            ])
+            code, body, elapsed = self._chat(base, timeout=20)
+            self.assertEqual(code, 502, "a dead chain still answers 502")
+            self.assertLess(elapsed, 12,
+                            "must fail near the row's 3s, not the global 90s "
+                            "(elapsed %.1fs)" % elapsed)
+            self.assertIn("hang", str(body))
+        finally:
+            if srv:
+                srv.terminate()
+            fx.stop()
