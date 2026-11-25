@@ -12,6 +12,47 @@ OpenAI-compatible request/response shape, the endpoint, or the install command);
 for backward-compatible features (new providers, classes, dashboard capability, CLI verbs);
 **PATCH** for fixes only.
 
+## [1.6.0] — 2026-11-26
+
+### Added
+
+- **Add a row from a base URL and a key alone.** `/api/add` no longer requires a
+  model id: with none given, the base's own `/v1/models` is the candidate set and
+  the set is saved behind ONE real completion — the test-before-save gate still
+  decides, the verified id leads the chain, and the rest of the fetched ids ride in
+  unprobed until the background probe reports each one. An explicit model id or a
+  row name keeps the single-row behaviour. Auto-adds stop at `AUTO_ADD_CAP` (25) so
+  one paste cannot flood the boot probe; the reply reports `advertised` vs `saved`.
+- **A Responses-only gateway is detected, not configured.** Some upstreams disable
+  `/v1/chat/completions` and serve only `/v1/responses`. `probe_auto()` reads the
+  chat endpoint's own answer (400/404/405) as a PROTOCOL fact — never a provider
+  name — retries the same model through the Responses transport, and when that is
+  the attempt that passes, the saved row carries `api_mode: responses` so the
+  client path uses the same transport from then on. When both fail, the error
+  reported is the Responses-side verdict (`403 client_not_allowed`, `401`, quota),
+  because that is the actionable one; the chat refusal is only the reason we moved.
+- **A row can carry its own `user_agent`.** Client-gated gateways accept only
+  recognised coding-client identities: the same request answers `403
+  client_not_allowed` with a browser UA and 200 with a coding-client UA. Rows and
+  `/api/add` accept `user_agent`, and the dashboard's add modal gained an optional
+  UA field. The default stays the browser UA, unchanged for existing rows.
+- **`minimalrouter update`.** Self-update from the public repo (`main`, the same
+  ref `install.sh` uses). Prints installed vs published, parses the download's
+  `__version__` and AST-checks it BEFORE replacing anything, backs the old files up
+  beside the new ones, writes atomically (tmp + os.replace), and touches CODE ONLY
+  — `rows.json`, OAuth profiles, tokens, `provider-registry.json` and board
+  preferences are never rewritten. `--check` reports without writing; `--force`
+  re-installs the published file over a same-or-newer local copy.
+
+### Fixed
+
+- **A `key_env` row's resolved secret is never persisted.** `read_rows()` injects
+  the key from `~/.hermes/.env` so the rest of the engine sees a key like any other
+  row — and `write_rows()` then wrote that resolved value back, copying every
+  env-held secret into `rows.json` on the first disable toggle or reorder.
+  `write_rows()` now drops `key` from rows that carry `key_env`; the env reference
+  survives, the plaintext never lands.
+
 ## [1.5.0] — 2026-11-24
 
 ### Added

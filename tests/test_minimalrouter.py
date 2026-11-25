@@ -2135,3 +2135,383 @@ class TestPoolLearnsEndToEnd(unittest.TestCase):
         finally:
             self._stop(srv)
             fx.stop()
+
+
+# v1.6.0 — auto-fetch add, responses auto-detect, row User-Agent
+class TestProbeAutoV160(unittest.TestCase):
+    """probe_auto retries through the Responses transport when the chat endpoint
+    itself is absent, and reports the RESPONSES-side failure when both fail."""
+
+    def _row(self, **kw):
+        r = {"base": "https://x/v1", "model": "m", "key": "K"}
+        r.update(kw)
+        return r
+
+    def test_retries_responses_on_protocol_miss(self):
+        calls = []
+
+        def fake_probe(base, key, model, row=None):
+            mode = (row or {}).get("api_mode", "chat_completions")
+            calls.append(mode)
+            if mode == "chat_completions":
+                return (False, 5.0, "HTTPError: HTTP Error 404: Not Found",
+                        "", 0, {})
+            return (True, 7.0, "", "OK", 1, {})
+
+        old = mr.probe
+        mr.probe = fake_probe
+        try:
+            res, row = mr.probe_auto("https://x/v1", "K", "m", self._row())
+        finally:
+            mr.probe = old
+        self.assertTrue(res[0])
+        self.assertEqual(row.get("api_mode"), "responses")
+        self.assertEqual(calls, ["chat_completions", "responses"])
+
+    def test_no_retry_on_auth_failure(self):
+        calls = []
+
+        def fake_probe(base, key, model, row=None):
+            calls.append((row or {}).get("api_mode", "chat_completions"))
+            return (False, 5.0, "HTTPError: HTTP Error 401: Unauthorized",
+                    "", 0, {})
+
+        old = mr.probe
+        mr.probe = fake_probe
+        try:
+            res, row = mr.probe_auto("https://x/v1", "K", "m", self._row())
+        finally:
+            mr.probe = old
+        self.assertFalse(res[0])
+        self.assertNotEqual(row.get("api_mode"), "responses")
+        self.assertEqual(calls, ["chat_completions"],
+                         "a 401 is an auth verdict, not a protocol shape")
+
+    def test_dual_failure_surfaces_responses_error(self):
+        def fake_probe(base, key, model, row=None):
+            if (row or {}).get("api_mode") == "responses":
+                return (False, 5.0, "HTTPError: HTTP Error 403: Forbidden",
+                        "", 0, {})
+            return (False, 5.0, "HTTPError: HTTP Error 400: Bad Request",
+                    "", 0, {})
+
+        old = mr.probe
+        mr.probe = fake_probe
+        try:
+            res, _row = mr.probe_auto("https://x/v1", "K", "m", self._row())
+        finally:
+            mr.probe = old
+        self.assertFalse(res[0])
+        self.assertIn("403", res[2],
+                      "the working endpoint's verdict is the actionable one")
+
+    def test_explicit_responses_mode_skips_chat(self):
+        calls = []
+
+        def fake_probe(base, key, model, row=None):
+            calls.append((row or {}).get("api_mode", "chat_completions"))
+            return (True, 5.0, "", "OK", 1, {})
+
+        old = mr.probe
+        mr.probe = fake_probe
+        try:
+            res, row = mr.probe_auto("https://x/v1", "K", "m",
+                                     self._row(api_mode="responses"))
+        finally:
+            mr.probe = old
+        self.assertTrue(res[0])
+        self.assertEqual(calls, ["responses"])
+
+
+class TestWriteRowsKeepsSecretsV160(unittest.TestCase):
+    def test_key_env_row_never_persists_resolved_key(self):
+        tmp = tempfile.TemporaryDirectory()
+        old = mr.ROWS_PATH
+        mr.ROWS_PATH = os.path.join(tmp.name, "rows.json")
+        try:
+            rows = [{"name": "env-row", "base": "https://x/v1", "model": "m",
+                     "key_env": "SOME_KEY", "key": "sk-resolved-plaintext"}]
+            mr.write_rows(rows)
+            with open(mr.ROWS_PATH) as f:
+                disk = json.load(f)
+            self.assertNotIn("key", disk[0],
+                             "read_rows injects the key; writing it back copies "
+                             "the secret into rows.json")
+            self.assertEqual(disk[0]["key_env"], "SOME_KEY")
+        finally:
+            mr.ROWS_PATH = old
+            tmp.cleanup()
+
+    def test_inline_key_row_still_persists(self):
+        tmp = tempfile.TemporaryDirectory()
+        old = mr.ROWS_PATH
+        mr.ROWS_PATH = os.path.join(tmp.name, "rows.json")
+        try:
+            rows = [{"name": "plain", "base": "https://x/v1", "model": "m",
+                     "key": "sk-inline"}]
+            mr.write_rows(rows)
+            with open(mr.ROWS_PATH) as f:
+                disk = json.load(f)
+            self.assertEqual(disk[0]["key"], "sk-inline")
+        finally:
+            mr.ROWS_PATH = old
+            tmp.cleanup()
+
+
+class TestAddAutoFetchV160(unittest.TestCase):
+    """POST /api/add with no model: fetch /v1/models, save the set behind ONE
+    real completion. Driven through the real handler over a temp rows file."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        rows = os.path.join(self.tmp.name, "rows.json")
+        with open(rows, "w") as f:
+            json.dump([], f)
+        self._saved = (mr.ROWS_PATH, mr.OAUTH_PROFILES_PATH, mr.OAUTH_PATH)
+        mr.ROWS_PATH = rows
+        mr.OAUTH_PROFILES_PATH = os.path.join(self.tmp.name, "none.json")
+        mr.OAUTH_PATH = os.path.join(self.tmp.name, "none2.json")
+        self._saved_state = dict(mr.ROW_STATE)
+        mr.ROW_STATE.clear()
+        self.srv = HTTPServer(("127.0.0.1", 0), mr.Handler)
+        self.port = self.srv.server_address[1]
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+
+    def tearDown(self):
+        self.srv.shutdown()
+        self.srv.server_close()
+        (mr.ROWS_PATH, mr.OAUTH_PROFILES_PATH, mr.OAUTH_PATH) = self._saved
+        mr.ROW_STATE.clear()
+        mr.ROW_STATE.update(self._saved_state)
+        self.tmp.cleanup()
+
+    def _post(self, path, obj):
+        rq = urllib.request.Request(
+            "http://127.0.0.1:%d%s" % (self.port, path),
+            data=json.dumps(obj).encode(), method="POST",
+            headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(rq, timeout=15) as r:
+                return json.loads(r.read() or b"{}")
+        except urllib.error.HTTPError as e:
+            return json.loads(e.read() or b"{}")
+
+    def test_no_model_fetches_and_saves_the_set(self):
+        def fake_fetch(base, key):
+            return ["m-a", "m-b", "m-c"]
+
+        def fake_probe_auto(base, key, model, row=None):
+            if model == "m-a":
+                return (False, 5.0, "HTTPError: HTTP Error 401: Unauthorized",
+                        "", 0, {}), dict(row or {})
+            return (True, 9.0, "", "OK", 3, {}), dict(row or {},
+                                                      api_mode="responses")
+
+        of, op = mr.fetch_models, mr.probe_auto
+        mr.fetch_models, mr.probe_auto = fake_fetch, fake_probe_auto
+        try:
+            res = self._post("/api/add", {"base": "https://x/v1", "key": "K"})
+        finally:
+            mr.fetch_models, mr.probe_auto = of, op
+        self.assertTrue(res.get("ok"), res)
+        self.assertEqual(res.get("verified"), "m-b")
+        self.assertEqual(res.get("saved"), 3)
+        self.assertEqual(res.get("api_mode"), "responses")
+        with open(mr.ROWS_PATH) as f:
+            disk = json.load(f)
+        self.assertEqual([r["model"] for r in disk], ["m-b", "m-a", "m-c"],
+                         "the verified id leads; every fetched id is saved")
+        self.assertTrue(all(r.get("api_mode") == "responses" for r in disk),
+                        "the row that PASSED defines the protocol for the set")
+        self.assertEqual(disk[0]["name"], res.get("name"))
+
+    def test_named_add_saves_only_the_verified_model(self):
+        of, op = mr.fetch_models, mr.probe_auto
+        mr.fetch_models = lambda base, key: ["m-a", "m-b"]
+        mr.probe_auto = lambda base, key, model, row=None: (
+            (True, 9.0, "", "OK", 3, {}), dict(row or {}))
+        try:
+            res = self._post("/api/add", {"base": "https://x/v1", "key": "K",
+                                          "name": "one-row"})
+        finally:
+            mr.fetch_models, mr.probe_auto = of, op
+        self.assertTrue(res.get("ok"), res)
+        with open(mr.ROWS_PATH) as f:
+            disk = json.load(f)
+        self.assertEqual(len(disk), 1)
+        self.assertEqual(disk[0]["name"], "one-row")
+
+    def test_fetch_empty_is_a_clean_400(self):
+        of, op = mr.fetch_models, mr.probe_auto
+        mr.fetch_models = lambda base, key: []
+        mr.probe_auto = lambda *a, **k: self.fail("probed with no candidates")
+        try:
+            res = self._post("/api/add", {"base": "https://x/v1", "key": "K"})
+        finally:
+            mr.fetch_models, mr.probe_auto = of, op
+        self.assertIn("error", res)
+        with open(mr.ROWS_PATH) as f:
+            self.assertEqual(json.load(f), [])
+
+    def test_failing_set_writes_nothing(self):
+        of, op = mr.fetch_models, mr.probe_auto
+        mr.fetch_models = lambda base, key: ["m-a", "m-b"]
+        mr.probe_auto = lambda base, key, model, row=None: (
+            (False, 5.0, "HTTPError: HTTP Error 401: Unauthorized", "", 0, {}),
+            dict(row or {}))
+        try:
+            res = self._post("/api/add", {"base": "https://x/v1", "key": "K"})
+        finally:
+            mr.fetch_models, mr.probe_auto = of, op
+        self.assertIn("test failed", str(res.get("error")))
+        with open(mr.ROWS_PATH) as f:
+            self.assertEqual(json.load(f), [],
+                             "test-before-save: a failing paste never lands")
+
+    def test_base_required(self):
+        res = self._post("/api/add", {"key": "K"})
+        self.assertIn("error", res)
+
+    def test_bad_api_mode_rejected(self):
+        res = self._post("/api/add", {"base": "https://x/v1", "model": "m",
+                                      "api_mode": "anthropic"})
+        self.assertIn("api_mode", str(res.get("error")))
+
+    def test_cap_limits_an_auto_add(self):
+        ids = ["m-%02d" % i for i in range(mr.AUTO_ADD_CAP + 7)]
+        of, op = mr.fetch_models, mr.probe_auto
+        mr.fetch_models = lambda base, key: list(ids)
+        mr.probe_auto = lambda base, key, model, row=None: (
+            (True, 9.0, "", "OK", 3, {}), dict(row or {}))
+        try:
+            res = self._post("/api/add", {"base": "https://x/v1", "key": "K"})
+        finally:
+            mr.fetch_models, mr.probe_auto = of, op
+        self.assertTrue(res.get("ok"), res)
+        self.assertEqual(res.get("advertised"), len(ids))
+        self.assertEqual(res.get("saved"), mr.AUTO_ADD_CAP)
+        with open(mr.ROWS_PATH) as f:
+            self.assertEqual(len(json.load(f)), mr.AUTO_ADD_CAP)
+
+
+class TestUpdateCommandV160(unittest.TestCase):
+    """`minimalrouter update` — version-parsed, AST-checked, atomic, code-only."""
+
+    GOOD = ('#!/usr/bin/env python3\n"""fake engine"""\n'
+            '__version__ = "%s"\n\ndef main():\n    return 0\n')
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self._saved = (mr.MR_HOME, mr.UPDATE_RAW, mr._update_get)
+        mr.MR_HOME = self.tmp.name
+        mr.UPDATE_RAW = "https://example.invalid/main"
+        for name in ("minimalrouter.py", "minimalrouter_dashboard.py",
+                     "rows.json", "oauth.json"):
+            with open(os.path.join(self.tmp.name, name), "w") as f:
+                f.write('{"keep": true}' if name.endswith(".json")
+                        else "OLD %s" % name)
+
+    def tearDown(self):
+        mr.MR_HOME, mr.UPDATE_RAW, mr._update_get = self._saved
+        self.tmp.cleanup()
+
+    def _run(self, files, check_only=False, force=False):
+        files = {k: (v.encode() if isinstance(v, str) else v)
+                 for k, v in files.items()}
+        mr._update_get = lambda path, timeout=30: files[path]
+        import io
+        from contextlib import redirect_stdout
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = mr.cmd_update(check_only=check_only, force=force)
+        return rc, buf.getvalue()
+
+    def test_check_reports_without_writing(self):
+        files = {"minimalrouter.py": self.GOOD % "9.9.9",
+                 "minimalrouter_dashboard.py": b"# dash"}
+        rc, out = self._run(files, check_only=True)
+        self.assertEqual(rc, 0)
+        self.assertIn("update available: %s -> 9.9.9" % mr.__version__, out)
+        with open(os.path.join(mr.MR_HOME, "minimalrouter.py")) as f:
+            self.assertTrue(f.read().startswith("OLD"),
+                            "--check must never write")
+
+    def test_update_replaces_code_and_leaves_data(self):
+        files = {"minimalrouter.py": (self.GOOD % "9.9.9").encode(),
+                 "minimalrouter_dashboard.py": b"# new dash\n"}
+        before = {}
+        for name in ("rows.json", "oauth.json"):
+            with open(os.path.join(mr.MR_HOME, name)) as f:
+                before[name] = f.read()
+        rc, out = self._run(files)
+        self.assertEqual(rc, 0, out)
+        with open(os.path.join(mr.MR_HOME, "minimalrouter.py")) as f:
+            self.assertIn('__version__ = "9.9.9"', f.read())
+        with open(os.path.join(mr.MR_HOME, "minimalrouter_dashboard.py")) as f:
+            self.assertEqual(f.read(), "# new dash\n")
+        for name, text in before.items():
+            with open(os.path.join(mr.MR_HOME, name)) as f:
+                self.assertEqual(f.read(), text,
+                                 "update must never touch user data files")
+        backups = [n for n in os.listdir(mr.MR_HOME) if ".bak-" in n]
+        self.assertEqual(len(backups), 2, backups)
+
+    def test_truncated_download_writes_nothing(self):
+        files = {"minimalrouter.py": b"<html>404</html>",
+                 "minimalrouter_dashboard.py": b"# dash"}
+        rc, out = self._run(files)
+        self.assertEqual(rc, 1)
+        self.assertIn("no __version__", out)
+        with open(os.path.join(mr.MR_HOME, "minimalrouter.py")) as f:
+            self.assertTrue(f.read().startswith("OLD"))
+
+    def test_unparseable_download_writes_nothing(self):
+        files = {"minimalrouter.py": b'__version__ = "9.9.9"\ndef broken(:\n',
+                 "minimalrouter_dashboard.py": b"# dash"}
+        rc, out = self._run(files)
+        self.assertEqual(rc, 1)
+        self.assertIn("does not parse", out)
+        with open(os.path.join(mr.MR_HOME, "minimalrouter.py")) as f:
+            self.assertTrue(f.read().startswith("OLD"))
+
+    def test_same_version_is_a_noop(self):
+        files = {"minimalrouter.py": (self.GOOD % mr.__version__).encode(),
+                 "minimalrouter_dashboard.py": b"# dash"}
+        rc, out = self._run(files)
+        self.assertEqual(rc, 0)
+        self.assertIn("already up to date", out)
+        with open(os.path.join(mr.MR_HOME, "minimalrouter.py")) as f:
+            self.assertTrue(f.read().startswith("OLD"))
+
+    def test_force_reinstalls_same_version(self):
+        files = {"minimalrouter.py": (self.GOOD % mr.__version__).encode(),
+                 "minimalrouter_dashboard.py": b"# dash"}
+        rc, out = self._run(files, force=True)
+        self.assertEqual(rc, 0, out)
+        with open(os.path.join(mr.MR_HOME, "minimalrouter.py")) as f:
+            self.assertIn('__version__ = "%s"' % mr.__version__, f.read())
+
+    def test_dashboard_failure_keeps_local_copy(self):
+        class Boom(Exception):
+            pass
+
+        def getter(path, timeout=30):
+            if path == "minimalrouter_dashboard.py":
+                raise Boom("offline")
+            return (self.GOOD % "9.9.9").encode()
+
+        mr._update_get = getter
+        import io
+        from contextlib import redirect_stdout
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = mr.cmd_update()
+        self.assertEqual(rc, 0)
+        self.assertIn("dashboard not refreshed", buf.getvalue())
+        with open(os.path.join(mr.MR_HOME, "minimalrouter_dashboard.py")) as f:
+            self.assertTrue(f.read().startswith("OLD"))
+
+    def test_parse_version_never_guesses(self):
+        self.assertEqual(mr.parse_version('__version__ = "1.2.3"'), (1, 2, 3))
+        self.assertIsNone(mr.parse_version("no version here"))
+        self.assertIsNone(mr.parse_version('__version__ = "1.2"' ))

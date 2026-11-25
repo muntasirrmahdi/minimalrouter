@@ -66,6 +66,7 @@ minimalrouter oauth add    # connect a provider account (device flow)
 minimalrouter oauth list   # profiles, class, connection state
 minimalrouter refresh      # force OAuth token refresh (all, or one id)
 minimalrouter stop         # stop the running instance by verified PID
+minimalrouter update       # update the installed code to the newest release
 minimalrouter -h           # usage (-v for version)
 ```
 
@@ -78,8 +79,12 @@ Add your first provider from the dashboard:
 1. Press `a`
 2. Paste the base URL, for example `https://api.groq.com/openai/v1`
 3. Paste your API key (leave blank for a keyless endpoint), press Enter
-4. The model list is fetched from the provider: type to filter, Enter to pick
-5. The row is tested; it is saved only if the test passes
+4. Model id is optional: leave it empty and every id the provider's `/v1/models`
+   advertises is fetched and added — typing an id (or a row name) adds just that one.
+   A gateway that serves only `/v1/responses` is detected and saved with
+   `api_mode: responses`; a client-gated gateway needs its accepted identity in the
+   optional user-agent field
+5. The row is tested first; nothing is saved unless a real completion passes
 
 Or connect an account instead of a key: `minimalrouter oauth add`, type the tool's
 name (known tools pre-fill from the registry), approve in the browser, and the
@@ -154,6 +159,8 @@ format, which this router does not serve yet (404). The shim is on the roadmap.
 | `minimalrouter oauth list` / `oauth rm <id>` | inspect / remove profiles |
 | `minimalrouter doctor` | self-diagnose the install: launcher, venv, rows, OAuth expiry, registry, ports, perms — never spends a token |
 | `minimalrouter doctor --fix` | apply the safe reversible repairs (stale pidfile, `chmod 600`) |
+| `minimalrouter update` | update the installed code to the newest release (`main`, the same ref the installer uses). Code only — rows, OAuth profiles, tokens, registry and board preferences are never touched. Version-parsed and AST-checked before anything is replaced, old files backed up, atomic writes |
+| `minimalrouter update --check` | report installed vs published without writing; `--force` re-installs the published file |
 | `minimalrouter -h` / `-v` | usage / version |
 
 Mission Control keys: Up/Down move the cursor (or scroll EVENTS when `Tab` has
@@ -185,7 +192,7 @@ API key from your own machine. Provider logins are separate (OAuth profiles).
 | GET | `/api/state` | rows + per-row state (provider, cw, tps, ok%, disabled) + pool stats (req/min, tok/s, err%, uptime) + probe progress + version (what the dashboard reads) |
 | POST | `/api/test` | `{base, key, model}` probe, does not save |
 | POST | `/api/fetch_models` | `{base, key}` returns the provider's model ids |
-| POST | `/api/add` | `{base, key, model, name?}` tests, then saves |
+| POST | `/api/add` | `{base, key, model?, name?, api_mode?, user_agent?}` tests, then saves. No model = fetch `/v1/models` and add the set (capped at 25 ids); one candidate must pass a real completion first |
 | POST | `/api/remove` | `{name}` |
 | POST | `/api/disable` | `{name, disabled?}` park/restore a row — routing skips parked rows |
 | POST | `/api/refetch` | re-read every enabled base's `/v1/models` (learns context windows) |

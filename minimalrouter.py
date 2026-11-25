@@ -19,6 +19,7 @@ Usage:
   minimalrouter oauth list   profiles and their connection state
   minimalrouter oauth <id>   device-code sign-in for that profile
   minimalrouter oauth rm <id>  delete a profile and its stored token
+  minimalrouter update       update the installed code to the newest release
 
 Home:   ~/.minimalrouter/
           minimalrouter.py            this file
@@ -26,7 +27,8 @@ Home:   ~/.minimalrouter/
           oauth-providers.json        OAuth provider profiles (user-authored)
           oauth.json                  OAuth tokens, chmod 600
           minimalrouter.log           request log
-Rows:   [{name, base, model, key_env|key, aliases?, disabled?, context_length?}]
+Rows:   [{name, base, model, key_env|key, aliases?, disabled?, context_length?,
+          api_mode?, user_agent?, timeout?, chat_path?}]
 Keys:   key_env rows resolve from ~/.hermes/.env at runtime.
 
 OAuth profiles are generic: authorize_url, token_url, optional refresh_url,
@@ -42,7 +44,9 @@ HTTP API:
   GET  /api/oauth/status      per-profile connected state
   POST /api/test              {base, key, model} -> probe result (no save)
   POST /api/fetch_models      {base, key} -> upstream model ids (+ learns context windows)
-  POST /api/add               {base, key, model, name?} -> test, then save
+  POST /api/add               {base, key, model?, name?, api_mode?, user_agent?}
+                              -> fetch /v1/models when model is empty,
+                                 test, then save
   POST /api/remove            {name} -> drop row
   POST /api/disable           {name, disabled?} -> park/restore a row (routing skips it)
   POST /api/refetch           re-read every enabled base's /v1/models (learns CW)
@@ -57,6 +61,7 @@ import ast
 import json
 import os
 import re
+import shutil
 import socket
 import sys
 import time
@@ -76,7 +81,7 @@ except ImportError:  # platform without curses -> main() degrades to serve
 # CHANGELOG and the git tag all derive from this one line. MAJOR.MINOR.PATCH per
 # semver.org: MAJOR on a breaking client contract, MINOR on backward-compatible
 # features, PATCH on fixes.
-__version__ = "1.5.0"
+__version__ = "1.6.0"
 
 HOME = os.path.expanduser("~")
 MR_HOME = os.path.join(HOME, ".minimalrouter")
@@ -88,8 +93,14 @@ HOST = "127.0.0.1"
 PORT = int(os.environ.get("MINIMALROUTER_PORT", "8790"))
 TIMEOUT = 90
 PROBE_TIMEOUT = 30
+# An auto-fetch add (no model id given) saves at most this many ids from the
+# base's own /v1/models, so one paste cannot flood the boot probe; the reply
+# reports how many the upstream advertised versus how many were saved.
+AUTO_ADD_CAP = 25
 UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/120.0 Safari/537.36")
+# `minimalrouter update` tracks the same ref install.sh installs from.
+UPDATE_RAW = "https://raw.githubusercontent.com/muntasirrmahdi/minimalrouter/main"
 ROW_LOCK = Lock()
 ROW_STATE = {}
 # Three connection classes. Class is always DERIVED from row shape, never from a label.
@@ -487,6 +498,11 @@ def enabled_rows():
 def write_rows(rows):
     os.makedirs(MR_HOME, exist_ok=True)
     tmp = ROWS_PATH + ".tmp"
+    # A key_env row's key is INJECTED by read_rows() from ~/.hermes/.env, so a
+    # read-modify-write (disable toggle, reorder, add) would otherwise copy every
+    # resolved secret into rows.json. Persist the env reference, never the value.
+    rows = [{k: v for k, v in r.items() if k != "key"} if r.get("key_env") else r
+            for r in rows]
     with open(tmp, "w") as f:
         json.dump(rows, f, indent=1)
         f.write("\n")
@@ -553,7 +569,8 @@ def upstream(base, key, path, payload=None, timeout=None, row=None):
     if data is not None:
         req.add_header("Content-Type", "application/json")
     if key:
-        for hk, hv in oauth_headers(provider, key, row.get("org_id", "")).items():
+        for hk, hv in oauth_headers(provider, key, row.get("org_id", ""),
+                                    row.get("user_agent", "")).items():
             req.add_header(hk, hv)
     return urllib.request.urlopen(req, timeout=timeout)
 
@@ -583,7 +600,8 @@ def oauth_chat(row, payload, timeout=TIMEOUT):
                                  data=json.dumps(body).encode(), method="POST")
     req.add_header("Content-Type", "application/json")
     for hk, hv in oauth_headers(row.get("oauth_provider", ""), token,
-                                row.get("org_id", "")).items():
+                                row.get("org_id", ""),
+                                row.get("user_agent", "")).items():
         req.add_header(hk, hv)
     return urllib.request.urlopen(req, timeout=timeout)
 
@@ -982,6 +1000,42 @@ def probe(base, key, model, row=None):
         return False, (time.time() - t0) * 1000, "%s: %s" % (
             type(e).__name__, e), "", 0, quota_from_headers(
                 getattr(e, "headers", None))
+
+
+# The chat endpoint itself is absent or refused on the FIRST call: a shape
+# answer (400/404/405), not an auth or quota verdict.
+PROTOCOL_MISS = (400, 404, 405)
+
+
+def probe_auto(base, key, model, row=None):
+    """Probe a candidate, then retry once through the Responses transport.
+
+    Some gateways disable /v1/chat/completions and serve only /v1/responses.
+    That is a PROTOCOL fact read off the chat endpoint's own answer, never a
+    provider name: when the retry is the one that passes, the row handed back
+    carries api_mode=responses and the caller persists THAT row, so the client
+    path uses the same transport from then on.
+
+    Returns ((ok, ms, error, content, tokens, quota), row_used).
+    """
+    row = dict(row or {})
+    if row.get("api_mode") == "responses":
+        return probe(base, key, model, row=row), row
+    res = probe(base, key, model, row=row)
+    if res[0]:
+        return res, row
+    m = re.search(r"HTTP Error (\d{3})", str(res[2]))
+    if m and int(m.group(1)) in PROTOCOL_MISS:
+        alt = dict(row, api_mode="responses")
+        res2 = probe(base, key, model, row=alt)
+        if res2[0]:
+            return res2, alt
+        # Both transports failed: report the RESPONSES attempt. The chat
+        # endpoint's own refusal ("disabled") is the reason we moved, not the
+        # reason the add failed — the actionable verdict (auth, client gate,
+        # quota) is the one the working endpoint gave.
+        return res2, row
+    return res, row
 
 
 def fetch_models(base, key):
@@ -1467,7 +1521,8 @@ class Handler(BaseHTTPRequestHandler):
                     break
             if not key and match:  # dashboard row test -> configured key
                 key = match["key"]
-            ok, ms, err, content, tokens, quota = probe(base, key, model, row=match)
+            (ok, ms, err, content, tokens, quota), _row = probe_auto(
+                base, key, model, match)
             if match:  # keep the table's STATE / LATENCY / LAST live
                 record_state(match["name"], "ok" if ok else "fail", ms,
                              error="" if ok else str(err)[:200], tokens=tokens,
@@ -1494,34 +1549,82 @@ class Handler(BaseHTTPRequestHandler):
             key = body.get("key", "").strip()
             model = body.get("model", "").strip()
             name = body.get("name", "").strip()
-            if not (base and model):
-                return self._send(400, {"error": "base + model required"})
-            if not name:
-                host = base.split("//")[-1].split("/")[0][:24]
-                slug = "".join(c if c.isalnum() else "-" for c in model
-                               )[:40].strip("-")
-                name, i = "%s-%s" % (host, slug), 2
-            # Class is derived from the row shape (key present or not); a caller
-            # cannot pass `class` to claim a different auth path.
-            new_row = {"name": name, "base": base, "model": model, "key": key}
-            # probe with the row's own shape, so a row declaring api_mode or a
-            # chat_path is tested the way it will actually be used, and its
-            # allowance meter is captured on the way in.
-            ok, ms, err, content, tokens, quota = probe(base, key, model, row=new_row)
-            if not ok:
+            api_mode = body.get("api_mode", "").strip()
+            user_agent = body.get("user_agent", "").strip()
+            if not base:
+                return self._send(400, {"error": "base required"})
+            if api_mode and api_mode not in ("chat_completions", "responses"):
+                return self._send(400, {
+                    "error": "api_mode must be chat_completions or responses"})
+            # Row-template fields the caller can set; class is still DERIVED from
+            # the row shape (key present or not), so `class` cannot be claimed.
+            tpl = {"base": base, "key": key}
+            if api_mode:
+                tpl["api_mode"] = api_mode
+            if user_agent:
+                tpl["user_agent"] = user_agent
+            # A model id is OPTIONAL: with none given, the base's own /v1/models
+            # is the candidate set, so base URL + key alone can fill the pool.
+            # One candidate must pass a REAL completion before anything is
+            # written (the test-before-save gate); the rest of the fetched ids
+            # then ride in unprobed and the background probe loop reports each
+            # one's truth on its next pass.
+            if model:
+                candidates = [model]
+            else:
+                try:
+                    candidates = fetch_models(base, key)
+                except Exception as e:
+                    return self._send(400, {"error": "model fetch failed: "
+                                            "%s: %s" % (type(e).__name__, e)})
+                if not candidates:
+                    return self._send(400, {
+                        "error": "no models returned by /v1/models; pass a model id"})
+            total = len(candidates)
+            candidates = candidates[:1] if name else candidates[:AUTO_ADD_CAP]
+            verified, used, err = "", tpl, "no candidate tested"
+            ok = ms = tokens = quota = None
+            for m in candidates[:5]:
+                (ok, ms, err, content, tokens, quota), used = probe_auto(
+                    base, key, m, tpl)
+                if ok:
+                    verified = m
+                    break
+            if not verified:
                 return self._send(400, {"ok": False,
                                         "error": "test failed: %s" % err})
+            # The verified id leads; with no explicit row name the rest of the
+            # fetched set is saved too, so every advertised id is routable.
+            to_save = [verified] if name else (
+                [verified] + [m for m in candidates if m != verified])
+            added = []
             with ROW_LOCK:
                 rows = read_rows()  # file rows only: never persist OAuth rows
-                while any(r["name"] == name for r in rows):
-                    name, i = "%s-%d" % (name, i), i + 1
-                new_row["name"] = name
-                rows.append(new_row)
+                for m in to_save:
+                    new_row = dict(used, model=m)
+                    rname = name
+                    if not rname:
+                        host = base.split("//")[-1].split("/")[0][:24]
+                        slug = "".join(c if c.isalnum() else "-"
+                                       for c in m)[:40].strip("-")
+                        rname, i = "%s-%s" % (host, slug), 2
+                    while any(r["name"] == rname for r in rows):
+                        rname, i = "%s-%d" % (rname, i), i + 1
+                    new_row["name"] = rname
+                    rows.append(new_row)
+                    added.append(rname)
                 write_rows(rows)
-            record_state(name, "ok", ms, tokens=tokens, quota=quota)
-            log("ADD %s (%s / %s) %s ok %.0fms" % (
-                name, base, model, row_class(new_row), ms))
-            return self._send(200, {"ok": True, "name": name})
+                saved_class = row_class(dict(used, model=to_save[-1]))
+            record_state(added[0], "ok", ms, tokens=tokens, quota=quota)
+            log("ADD %s (%s / %s / %s) %s ok %.0fms%s" % (
+                added[0], base, to_save[0],
+                used.get("api_mode", "chat_completions"), saved_class, ms,
+                "" if len(added) == 1 else " +%d more" % (len(added) - 1)))
+            return self._send(200, {
+                "ok": True, "name": added[0], "added": added,
+                "verified": to_save[0],
+                "advertised": total, "saved": len(added),
+                "api_mode": used.get("api_mode", "chat_completions")})
 
         if p == "/api/remove":
             name = body.get("name", "")
@@ -1827,9 +1930,9 @@ def _age(ts):
     return "%dh" % (d // 3600)
 
 
-def oauth_headers(provider, token, org_id=""):
+def oauth_headers(provider, token, org_id="", user_agent=""):
     spec = read_oauth_profiles().get(provider, {})
-    h = {"Authorization": "Bearer " + token, "User-Agent": UA}
+    h = {"Authorization": "Bearer " + token, "User-Agent": user_agent or UA}
     for k, v in (spec.get("headers") or {}).items():
         h[k] = str(v).replace("{token}", token)
     if org_id:
@@ -2570,6 +2673,8 @@ Usage:
   minimalrouter stop         stop the running server/dashboard by verified PID
   minimalrouter doctor       self-diagnose this install (never spends a token)
   minimalrouter doctor --fix apply the safe reversible repairs
+  minimalrouter update       update the installed code to the newest release
+  minimalrouter update --check   report only; --force reinstalls same version
   minimalrouter -h|--help    show this help
   minimalrouter -v           show version
 
@@ -2603,6 +2708,7 @@ Mission Control keys:
   ?        key reference.  Board trouble? Start outside it:
            minimalrouter doctor     (diagnoses the install, spends nothing)
            minimalrouter doctor --fix   (applies the safe repairs)
+           minimalrouter update        (newest release; --check only reports)
   ?        help overlay      q      quit (stops the server)
 
 Curses fallback keys:
@@ -2610,8 +2716,12 @@ Curses fallback keys:
   d        delete row     r  refresh          q  quit (stops the server)
   Esc      cancel a prompt
 
-Add a row: run `minimalrouter`, press a, paste base URL + API key,
-pick a model from the fetched list; the row is saved only if the test passes.
+Add a row: run `minimalrouter`, press a, paste base URL + API key. Leave the
+model empty and the base's own /v1/models is fetched and added (up to 25 ids);
+a model id limits the add to that one. Nothing is saved unless one candidate
+passes a real completion. A gateway that serves only /v1/responses is detected
+and saved with api_mode=responses; a client-gated one needs its accepted
+User-Agent in the optional UA field.
 
 Add an OAuth provider: `minimalrouter oauth add`, then `minimalrouter oauth <id>`.
 
@@ -3239,6 +3349,108 @@ def doctor(fix=False, as_json=False):
         print("Safe reversible repairs run with: minimalrouter doctor --fix")
     return 1 if n_fail else 0
 
+def _update_get(path, timeout=30):
+    """Fetch one file from UPDATE_RAW. Returns bytes; raises on any failure."""
+    url = "%s/%s" % (UPDATE_RAW.rstrip("/"), path)
+    req = urllib.request.Request(url)
+    req.add_header("User-Agent", "MinimalRouter/" + __version__)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read()
+
+
+def parse_version(text):
+    """(major, minor, patch) from a source string, or None. Never guessed."""
+    m = re.search(r'^__version__\s*=\s*"([0-9]+)\.([0-9]+)\.([0-9]+)"',
+                  text, re.M)
+    return tuple(int(x) for x in m.groups()) if m else None
+
+
+def cmd_update(check_only=False, force=False):
+    """Replace the INSTALLED code files with the newest release from the repo.
+
+    Code only. rows.json, oauth.json, the OAuth profiles, provider-registry and
+    the dashboard preferences are the user's data and are never touched. The
+    download is version-parsed and AST-checked BEFORE anything is replaced, the
+    old files are backed up beside the new ones, and every write is atomic
+    (tmp + os.replace), so a failed update leaves the working install intact.
+    """
+    here = os.path.realpath(os.path.join(MR_HOME, "minimalrouter.py"))
+    if os.path.realpath(os.path.abspath(__file__)) != here:
+        print("note: updating the INSTALLED copy at %s" % here)
+    print("installed: %s   checking %s ..." % (__version__, UPDATE_RAW))
+    try:
+        engine = _update_get("minimalrouter.py").decode("utf-8", "replace")
+    except Exception as e:
+        print("update failed: cannot reach %s (%s: %s)"
+              % (UPDATE_RAW, type(e).__name__, e))
+        return 1
+    remote = parse_version(engine)
+    if not remote:
+        print("update failed: the download carries no __version__ line "
+              "(truncated, or not the engine) — nothing was written")
+        return 1
+    rtxt = "%d.%d.%d" % remote
+    local = parse_version('__version__ = "%s"' % __version__)
+    if remote <= local and not force:
+        if remote < local:
+            print("installed %s is newer than the published %s — nothing to do "
+                  "(use --force to replace it with the published file)."
+                  % (__version__, rtxt))
+        else:
+            print("already up to date (%s is the newest)." % __version__)
+        return 0
+    print("latest:    %s" % rtxt)
+    try:
+        ast.parse(engine)
+    except SyntaxError as e:
+        print("update failed: the downloaded engine does not parse (%s) — "
+              "nothing was written" % e)
+        return 1
+    if check_only:
+        print("update available: %s -> %s. Run `minimalrouter update`."
+              % (__version__, rtxt))
+        return 0
+    payloads = {"minimalrouter.py": engine.encode("utf-8")}
+    try:  # the dashboard is optional: a failed fetch keeps the local copy
+        dash = _update_get("minimalrouter_dashboard.py")
+        ast.parse(dash.decode("utf-8", "replace"))
+        payloads["minimalrouter_dashboard.py"] = dash
+    except Exception as e:
+        print("note: dashboard not refreshed (%s: %s) — keeping the local copy"
+              % (type(e).__name__, e))
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    for name, data in payloads.items():
+        dst = os.path.join(MR_HOME, name)
+        if os.path.exists(dst):
+            try:
+                shutil.copy2(dst, "%s.bak-%s-%s" % (dst, __version__, stamp))
+            except OSError:
+                pass
+        tmp = dst + ".tmp-update"
+        with open(tmp, "wb") as f:
+            f.write(data)
+        if os.path.exists(dst):
+            try:
+                os.chmod(tmp, os.stat(dst).st_mode & 0o777)
+            except OSError:
+                pass
+        os.replace(tmp, dst)
+        print("  wrote %s" % dst)
+    asset = os.path.join(MR_HOME, "bridges", "zcode-identity.json")
+    if not os.path.exists(asset):
+        try:
+            os.makedirs(os.path.dirname(asset), exist_ok=True)
+            with open(asset, "wb") as f:
+                f.write(_update_get("bridges/zcode-identity.json"))
+            print("  restored %s" % asset)
+        except Exception as e:
+            print("note: bridge asset not restored (%s)" % e)
+    log("UPDATE %s -> %s" % (__version__, rtxt))
+    print("updated %s -> %s. Restart the router: minimalrouter stop && "
+          "minimalrouter" % (__version__, rtxt))
+    return 0
+
+
 def main():
     os.makedirs(MR_HOME, exist_ok=True)
     if not os.path.exists(ROWS_PATH):
@@ -3482,6 +3694,9 @@ def main():
     if args and args[0].lower() == "doctor":
         return doctor(fix=("--fix" in args[1:] or "-f" in args[1:]),
                       as_json="--json" in args[1:])
+    if args and args[0].lower() == "update":
+        return cmd_update(check_only=("--check" in args[1:]),
+                          force=("--force" in args[1:]))
     mode = args[0] if args else "tui"
     if mode not in ("tui", "serve"):
         print("minimalrouter: unknown command %r\n" % mode)

@@ -452,7 +452,10 @@ class AddScreen(ModalScreen):
             yield Static(Text("ADD ROW  (Esc cancels)", style="bold"), id="adddesc")
             yield Input(placeholder="base URL  (https://…/v1)", id="in-base")
             yield Input(placeholder="API key  (empty = keyless row)", id="in-key")
-            yield Input(placeholder="model id", id="in-model")
+            yield Input(placeholder="model id  (empty = fetch /v1/models, add all)",
+                        id="in-model")
+            yield Input(placeholder="user agent  (optional: client-gated gateways)",
+                        id="in-ua")
             yield Input(placeholder="row name  (optional)", id="in-name")
 
     def on_mount(self):
@@ -463,7 +466,7 @@ class AddScreen(ModalScreen):
 
     def on_input_submitted(self, event):
         event.stop()
-        order = ["in-base", "in-key", "in-model", "in-name"]
+        order = ["in-base", "in-key", "in-model", "in-ua", "in-name"]
         cur = event.input.id
         if cur in order[:-1]:
             try:
@@ -475,20 +478,27 @@ class AddScreen(ModalScreen):
             base = self.query_one("#in-base", Input).value.strip()
             key = self.query_one("#in-key", Input).value.strip()
             model = self.query_one("#in-model", Input).value.strip()
+            ua = self.query_one("#in-ua", Input).value.strip()
             name = self.query_one("#in-name", Input).value.strip()
         except Exception:
-            base = key = model = name = ""
-        if not base or not model:
-            self.done_cb("add: base URL + model are required")
+            base = key = model = ua = name = ""
+        if not base:
+            self.done_cb("add: a base URL is required")
             self.app.pop_screen()
             return
         self.app.pop_screen()
 
         def run():
-            res = self.api("POST", "/api/add",
-                           {"base": base, "key": key, "model": model, "name": name})
-            msg = ("added %s" % res.get("name", "")) if res.get("ok") \
-                else ("add failed: %s" % str(res.get("error", ""))[:80])
+            payload = {"base": base, "key": key, "model": model, "name": name}
+            if ua:
+                payload["user_agent"] = ua
+            res = self.api("POST", "/api/add", payload)
+            if res.get("ok"):
+                n = len(res.get("added") or [res.get("name", "")])
+                msg = ("added %s" % res.get("name", "")) if n <= 1 else (
+                    "added %d rows (%s verified)" % (n, res.get("name", "")))
+            else:
+                msg = "add failed: %s" % str(res.get("error", ""))[:80]
             # Widget-touching callback must run on the app's event loop thread.
             self.app.call_from_thread(self.done_cb, msg)
         threading.Thread(target=run, daemon=True).start()
@@ -535,7 +545,7 @@ class HelpScreen(ModalScreen):
             ("t / T", "test marked rows (cursor row if none) / EVERY enabled row"),
             ("r / R", "refresh row OAuth token / refresh ALL"),
             ("f", "re-fetch every catalog (learns context windows)"),
-            ("a", "add a row (base URL + key + model, tested before save)"),
+            ("a", "add a row (base URL + key; model empty = fetch every id)"),
             ("y / Y / u", "copy MODEL id / row name / base URL," 
                         "  untruncated (the table clips long ids to fit)"),
             ("d d", "delete marked/cursor row - press twice within 4s"),
