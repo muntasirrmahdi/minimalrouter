@@ -12,6 +12,22 @@ OpenAI-compatible request/response shape, the endpoint, or the install command);
 for backward-compatible features (new providers, classes, dashboard capability, CLI verbs);
 **PATCH** for fixes only.
 
+## [1.9.4] — 2026-11-26
+
+### Changed
+
+- **Catalog learning is parallel and bounded.** `learn_catalogs()` now fetches
+  distinct bases with the same 4-worker pool used by the probe, and one failing
+  base is logged without stopping the rest. Measured 10 bases × 0.2 s:
+  2.01 s → 0.6-0.8 s; a forced failure still learns the other 9.
+- **The log rotates at 5 MB.** `MINIMALROUTER_LOG_MAX_BYTES` (default 5 MB;
+  0 disables) renames the log to `.1` before the next append, so a 24/7 router
+  cannot grow its log without bound. The dashboard's offset tracker already
+  reseeds on rotation.
+- Usage text now documents `MINIMALROUTER_MAX_WORKERS` and
+  `MINIMALROUTER_LOG_MAX_BYTES` beside the existing row-concurrency and
+  pre-rotation knobs.
+
 ## [1.9.3] — 2026-11-26
 
 ### Fixed

@@ -3225,7 +3225,7 @@ class TestPatchClassV193194(unittest.TestCase):
         self.saved = {a: getattr(mr, a) for a in
                       ("MR_HOME", "ROWS_PATH", "OAUTH_PATH", "OAUTH_PROFILES_PATH",
                        "LOG_PATH", "PID_PATH", "PORT", "HOME", "ENV",
-                       "ROW_STATE", "REQLOG")}
+                       "LOG_MAX_BYTES", "ROW_STATE", "REQLOG")}
         mr.MR_HOME = self.home
         mr.ROWS_PATH = os.path.join(self.home, "rows.json")
         mr.OAUTH_PATH = os.path.join(self.home, "oauth.json")
@@ -3234,6 +3234,7 @@ class TestPatchClassV193194(unittest.TestCase):
         mr.PID_PATH = os.path.join(self.home, "minimalrouter.pid")
         mr.HOME = self.tmp
         mr.ENV = {}
+        mr.LOG_MAX_BYTES = 5 * 1024 * 1024
         mr.ROW_STATE = {}
         mr.REQLOG = []
         self._servers = []
@@ -3366,3 +3367,49 @@ class TestPatchClassV193194(unittest.TestCase):
                              "request-scoped OAuth snapshot regressed: %s" % counts)
         finally:
             mr.read_rows, mr.read_oauth, mr.read_oauth_profiles = old
+
+    def test_catalog_learning_is_parallel_and_survives_one_failure(self):
+        calls = []
+        lock = threading.Lock()
+
+        fail_base = "https://base0.invalid/v1"
+
+        def fake_fetch(base, key):
+            with lock:
+                calls.append(base)
+            time.sleep(0.2)
+            if base == fail_base:
+                raise RuntimeError("one bad base")
+            return ["m1"]
+
+        old = mr.fetch_models
+        mr.fetch_models = fake_fetch
+        try:
+            rows = [{"name": "b%d" % i,
+                     "base": "https://base%d.invalid/v1" % i,
+                     "model": "m", "key": "k"} for i in range(10)]
+            json.dump(rows, open(mr.ROWS_PATH, "w"))
+            json.dump({}, open(mr.OAUTH_PROFILES_PATH, "w"))
+            json.dump({}, open(mr.OAUTH_PATH, "w"))
+            mr.RUNTIME_CW.clear()
+            t0 = time.perf_counter()
+            n_bases, n_ids = mr.learn_catalogs()
+            elapsed = time.perf_counter() - t0
+            self.assertEqual(n_bases, 10)
+            self.assertEqual(n_ids, 9, "one failing base must not stop the other 9")
+            self.assertEqual(len(calls), 10)
+            self.assertLess(elapsed, 1.5,
+                            "10 x 0.2s catalog fetches were not parallel (%.1fs)"
+                            % elapsed)
+        finally:
+            mr.fetch_models = old
+
+    def test_log_rotates_at_the_size_cap(self):
+        mr.LOG_MAX_BYTES = 120
+        for _ in range(3):
+            mr.log("x" * 60)
+        self.assertTrue(os.path.exists(mr.LOG_PATH + ".1"),
+                        "the log crossed its cap without rotating")
+        self.assertLess(os.path.getsize(mr.LOG_PATH), 120)
+
+

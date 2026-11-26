@@ -86,7 +86,7 @@ except ImportError:  # platform without curses -> main() degrades to serve
 # CHANGELOG and the git tag all derive from this one line. MAJOR.MINOR.PATCH per
 # semver.org: MAJOR on a breaking client contract, MINOR on backward-compatible
 # features, PATCH on fixes.
-__version__ = "1.9.3"
+__version__ = "1.9.4"
 
 HOME = os.path.expanduser("~")
 MR_HOME = os.path.join(HOME, ".minimalrouter")
@@ -132,6 +132,9 @@ PROBE_WORKERS = 4
 # request threads is far more than a localhost router needs, and a 5 MB log
 # cap keeps a 24/7 install from growing without bound.
 MAX_WORKERS = int(os.environ.get("MINIMALROUTER_MAX_WORKERS", "64"))
+LOG_MAX_BYTES = int(os.environ.get("MINIMALROUTER_LOG_MAX_BYTES",
+                                  str(5 * 1024 * 1024)))
+LOG_LOCK = Lock()
 
 # v1.8.0 runtime discipline. These are the knobs the pool needs so a burst of
 # concurrent clients cannot hammer one free tier N ways at once, and so a 429
@@ -397,11 +400,19 @@ def discover_device_endpoints(base_url, log_fn=print):
 
 
 def log(msg):
-    try:
-        with open(LOG_PATH, "a") as f:
-            f.write("[%s] %s\n" % (time.strftime("%F %T"), msg))
-    except OSError:
-        pass
+    line = "[%s] %s\n" % (time.strftime("%F %T"), msg)
+    with LOG_LOCK:
+        try:
+            if LOG_MAX_BYTES > 0:
+                try:
+                    if os.path.getsize(LOG_PATH) >= LOG_MAX_BYTES:
+                        os.replace(LOG_PATH, LOG_PATH + ".1")
+                except OSError:
+                    pass
+            with open(LOG_PATH, "a") as f:
+                f.write(line)
+        except OSError:
+            pass
 
 
 def read_oauth():
@@ -1566,12 +1577,18 @@ def learn_catalogs():
         b = r["base"].rstrip("/")
         if b not in bases:
             bases[b] = r.get("key", "")
-    n_ids = 0
-    for b, k in bases.items():
+    items = list(bases.items())
+
+    def one(bk):
+        b, k = bk
         try:
-            n_ids += len(fetch_models(b, k))
+            return len(fetch_models(b, k))
         except Exception as e:
             log("CATALOG %s failed: %s" % (b, e))
+            return 0
+
+    with ThreadPoolExecutor(max_workers=min(PROBE_WORKERS, len(items) or 1)) as ex:
+        n_ids = sum(ex.map(one, items))
     log("CATALOG learn %d bases, %d ids, %d context windows known"
         % (len(bases), n_ids, len(RUNTIME_CW)))
     return len(bases), n_ids
@@ -3199,6 +3216,8 @@ Endpoint: http://127.0.0.1:%d/v1     (env MINIMALROUTER_PORT overrides the port)
 Env:   MINIMALROUTER_PROBE_INTERVAL=seconds (default 600; 0 = boot probe only)
        MINIMALROUTER_PRE_ROTATE_INTERVAL=seconds (default 300; 0 disables)
        MINIMALROUTER_ROW_CONCURRENCY=n (default 1; 0 = unlimited)
+       MINIMALROUTER_MAX_WORKERS=n (default 64; 0 = unlimited)
+       MINIMALROUTER_LOG_MAX_BYTES=n (default 5 MB; 0 disables rotation)
 No server authentication. Localhost only. Three connection classes, one engine path:
   API     - a key or key_env in rows.json (dashboard: press a, paste URL + key).
   OAUTH   - a device-flow profile: `oauth add` then `oauth <id>`.
