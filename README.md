@@ -17,6 +17,7 @@ of every row in your terminal.
 | **One endpoint** | Every client that speaks the OpenAI format uses one base URL: `http://127.0.0.1:8790/v1`. No server auth, no lock-in, nothing to install by hand. |
 | **Three connection classes** | API key, OAuth device flow, or keyless — one engine path. The class is derived from the row's actual shape, never from a label. |
 | **Ordered fallback** | Rows sharing a model id form a chain. 401/402/403/429/5xx/timeout moves to the next row automatically, and the failure envelope carries the upstream's own error message. |
+| **Rate-limit discipline** | A 429 row records its `Retry-After` clock (both header forms) and re-enters the chain when it expires, instead of staying deferred forever. A bare 429 runs a jittered `0.5 * 2^n` curve capped at 8 s. Per-row concurrency defaults to 1 (0 = unlimited), and generic OAuth refresh is single-flight so a burst cannot replay a rotating token. |
 | **A real terminal dashboard** | Mission Control board out of the box: centered btop-class frame, block-pixel wordmark, 8 pixel-digit stat tiles (rows / models / serving / down / req-per-min / tokens-per-s / error % / uptime) that reconcile: serving + down + unprobed == rows, so no row is ever invisible, a dense table with provider, class, context window, latency, TPS, OK% and a live status vocabulary (OK/COOLDOWN/STALE/DEAD/GATED/EMPTY), multi-row marks with batch test/delete/park, a selected-row panel with TPS+CW gauges, a scrollable event tail, 14 themes (incl. Nous and Claude) + density + motion toggles. The board picks a layout tier from the live terminal height (wordmark and the detail panels scale down on short screens instead of clipping), pins every panel so the route table can never be starved, and `?` opens the full key reference as an overlay; the installer bundles it (Textual, in a dedicated venv), and if that setup isn't possible the core falls back to a stdlib curses board. |
 | **One-word provider connects** | A name-to-endpoint registry makes a known tool a single word: `oauth add`, type the name, approve in the browser. Unknown tools stay addable by pasting a base URL once. |
 | **Native translators** | Providers that need a transformed request (Responses-only gateways, Anthropic-Messages plan lanes) route through sibling transports in the same file — endpoints and identity assets are data, not code. |
@@ -283,11 +284,6 @@ rm -rf ~/.minimalrouter
 
 - Anthropic `/v1/messages` shim so Claude Code can use the pool
 - a systemd user unit for always-on use
-- OAuth token PRE-ROTATION in the background (tokens today refresh on demand
-  at request time; `r`/`R`/`minimalrouter refresh` force it now — row HEALTH
-  re-probing on a scheduler shipped in 1.2.0)
-- weights or latency-based chain ordering
-- a config flag for per-row concurrency limits
 
 ## Contributing
 

@@ -12,6 +12,36 @@ OpenAI-compatible request/response shape, the endpoint, or the install command);
 for backward-compatible features (new providers, classes, dashboard capability, CLI verbs);
 **PATCH** for fixes only.
 
+## [1.8.0] — 2026-11-26
+
+### Added
+
+- **Cooldown expiry.** A 429 row now records the upstream's `Retry-After` clock
+  (`retry_at`, `retry_source`) and `classify_status()` returns `cooldown` only
+  while that clock is live. The row re-enters the chain when it expires instead
+  of staying deferred until some later success. Both `Retry-After` forms are
+  parsed: integer seconds and the HTTP-date form.
+- **Backoff with jitter.** A bare 429/5xx uses a portable `0.5 * 2^n` curve
+  capped at 8 s plus 0-0.75 s jitter. A short server hint (0 < value <= 60 s) is
+  obeyed plus jitter; a longer hint is ignored and the curve runs, so a hostile
+  or buggy header cannot bench a row for a year.
+- **Per-row in-flight cap.** `concurrency` on a row (or
+  `MINIMALROUTER_ROW_CONCURRENCY`, default 1) serialises that row. A saturated
+  row is queued up to `MINIMALROUTER_ROW_SLOT_TIMEOUT` (default 30 s); `0` means
+  unlimited. This is the concurrency limit the README roadmap carried.
+- **Generic single-flight OAuth refresh.** `oauth_access_token()` and
+  `oauth_refresh()` now share a per-profile lock and double-check the token
+  inside it, so eight concurrent 401s produce exactly one vendor refresh rather
+  than a replay that revokes a rotating-token session. Omnirush keeps its own
+  rotating-token lock.
+- **OAuth token pre-rotation.** A background loop refreshes any profile whose
+  token expires inside `MINIMALROUTER_PRE_ROTATE_SKEW` (default 300 s) every
+  `MINIMALROUTER_PRE_ROTATE_INTERVAL` (default 300 s; `0` disables). Profiles
+  with no expiry (plan JWTs) are skipped.
+- **Weights/latency chain ordering.** Within the healthy group, rows with an
+  explicit `weight` lead (higher first), then lower measured latency, with file
+  order as the stable tie-break. The partition is still never a filter.
+
 ## [1.7.0] — 2026-11-26
 
 ### Added

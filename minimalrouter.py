@@ -62,6 +62,7 @@ MINIMALROUTER_PROBE_INTERVAL seconds (default 600; 0 = boot probe only).
 import ast
 import json
 import os
+import random
 import re
 import shutil
 import socket
@@ -70,8 +71,9 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from email.utils import parsedate_to_datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from threading import Lock, Thread
+from threading import Lock, Semaphore, Thread
 from concurrent.futures import ThreadPoolExecutor
 
 try:  # single guarded import: every UI helper resolves curses from here
@@ -83,7 +85,7 @@ except ImportError:  # platform without curses -> main() degrades to serve
 # CHANGELOG and the git tag all derive from this one line. MAJOR.MINOR.PATCH per
 # semver.org: MAJOR on a breaking client contract, MINOR on backward-compatible
 # features, PATCH on fixes.
-__version__ = "1.7.0"
+__version__ = "1.8.0"
 
 HOME = os.path.expanduser("~")
 MR_HOME = os.path.join(HOME, ".minimalrouter")
@@ -123,6 +125,20 @@ PROBE_INTERVAL = max(0, int(os.environ.get("MINIMALROUTER_PROBE_INTERVAL", "600"
 PROBE_LOCK = Lock()
 PROBE_PROGRESS = {"done": 0, "total": 0, "active": False}
 PROBE_WORKERS = 4
+
+# v1.8.0 runtime discipline. These are the knobs the pool needs so a burst of
+# concurrent clients cannot hammer one free tier N ways at once, and so a 429
+# row re-enters the chain when its advertised clock expires instead of staying
+# deferred forever.
+MAX_RETRY_WAIT = 60.0          # never bench a row for a year on one header
+DEFAULT_ROW_CONCURRENCY = int(os.environ.get("MINIMALROUTER_ROW_CONCURRENCY", "1"))
+ROW_SLOT_TIMEOUT = float(os.environ.get("MINIMALROUTER_ROW_SLOT_TIMEOUT", "30"))
+PRE_ROTATE_INTERVAL = int(os.environ.get("MINIMALROUTER_PRE_ROTATE_INTERVAL", "300"))
+PRE_ROTATE_SKEW = int(os.environ.get("MINIMALROUTER_PRE_ROTATE_SKEW", "300"))
+ROW_SEMAPHORES = {}
+ROW_SEMAPHORES_GUARD = Lock()
+OAUTH_REFRESH_LOCKS = {}
+OAUTH_LOCKS_GUARD = Lock()
 
 # Context windows (tokens). Curated seeds hold ONLY officially documented models;
 # everything else is learned at runtime from upstream /models (RUNTIME_CW) or
@@ -412,44 +428,23 @@ def read_rows():
 
 
 def oauth_access_token(provider):
-    """Return an access token and rotate it when a profile supplies refresh_url."""
+    """Return an access token and rotate it when a profile supplies refresh_url.
+
+    The generic path is single-flight: two concurrent 401s on the same profile
+    must produce exactly one vendor refresh, not a replay that revokes the
+    session. The omnirush translator keeps its own rotating-token lock.
+    """
     auth = read_oauth()
     rec = auth.get(provider) or {}
     token = rec.get("access_token", "")
     expires = float(rec.get("expires_at", 0) or 0)
-    if not token or (expires and expires > time.time() + 60) or (not expires and token):
+    if token and (not expires or expires > time.time() + 60):
         return token
     spec = read_oauth_profiles().get(provider, {})
-    refresh_url = spec.get("refresh_url")
-    refresh_token = rec.get("refresh_token", "")
-    if not refresh_url or not refresh_token:
-        return token
-    body = {k: str(v).replace("{refresh_token}", refresh_token)
-            for k, v in (spec.get("refresh_body") or
-                          {"refresh_token": "{refresh_token}"}).items()}
-    try:
-        req = urllib.request.Request(refresh_url, data=json.dumps(body).encode(),
-                                     method="POST")
-        req.add_header("Content-Type", "application/json")
-        req.add_header("Accept", "application/json")
-        req.add_header("User-Agent", UA)
-        for k, v in (spec.get("refresh_headers") or {}).items():
-            req.add_header(k, str(v).replace("{refresh_token}", refresh_token))
-        d = json.loads(urllib.request.urlopen(req, timeout=30).read() or b"{}")
-        new_token = d.get("access_token") or d.get("token")
-        if not new_token:
-            return token
-        rec = dict(rec)
-        rec["access_token"] = new_token
-        if d.get("refresh_token"):
-            rec["refresh_token"] = d["refresh_token"]
-        rec["expires_at"] = time.time() + float(d.get("expires_in", 3600))
-        auth[provider] = rec
-        write_oauth(auth)
-        return new_token
-    except Exception as e:
-        log("OAUTH-REFRESH %s failed: %s" % (provider, e))
-        return token
+    if spec.get("api_mode") == "omnirush":
+        return omnirush_access_token(provider)
+    ok, msg, new_token = _oauth_refresh_generic(provider, force=False)
+    return new_token or token
 
 
 def token_live(rec):
@@ -538,6 +533,132 @@ def ep(base, path):
     if b.endswith("/v1"):
         b = b[:-3]
     return b + path
+
+
+def parse_retry_after(value):
+    """Read a Retry-After header in either legal form (seconds or HTTP-date).
+
+    Returns non-negative seconds, or None when the header is absent/garbage.
+    A value the server did not send is not a fact we invent.
+    """
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    try:
+        return max(0, int(float(s)))
+    except (TypeError, ValueError):
+        pass
+    try:
+        dt = parsedate_to_datetime(s)
+        if dt is None:
+            return None
+        return max(0, int(dt.timestamp() - time.time()))
+    except Exception:
+        return None
+
+
+def backoff_delay(fail_streak, retry_after=None):
+    """litellm's portable curve, stdlib only.
+
+    If the server gave a hint and it is short (<= 60 s), obey it plus jitter.
+    Past 60 s the hint is ignored and the router runs its own curve: a hostile
+    or buggy header must not bench a row for a year.
+    """
+    n = max(1, int(fail_streak or 1))
+    if retry_after is not None and 0 < retry_after <= MAX_RETRY_WAIT:
+        base = float(retry_after)
+    else:
+        base = min(8.0, 0.5 * (2 ** (n - 1)))
+    jitter = random.uniform(0.0, 0.75)
+    return round(base + jitter, 3)
+
+
+def _row_capacity(row):
+    """Per-row in-flight cap. 0 means unlimited (opt out)."""
+    v = row.get("concurrency")
+    if v is None:
+        v = DEFAULT_ROW_CONCURRENCY
+    try:
+        return max(0, int(v))
+    except (TypeError, ValueError):
+        return 1
+
+
+def _row_semaphore(row):
+    cap = _row_capacity(row)
+    if cap <= 0:
+        return None
+    name = row.get("name")
+    if not name:
+        return None
+    with ROW_SEMAPHORES_GUARD:
+        key = (name, cap)
+        sem = ROW_SEMAPHORES.get(key)
+        if sem is None:
+            for k in [k for k in ROW_SEMAPHORES if k[0] == name]:
+                ROW_SEMAPHORES.pop(k, None)
+            sem = Semaphore(cap)
+            ROW_SEMAPHORES[key] = sem
+        return sem
+
+
+def _oauth_lock(provider):
+    with OAUTH_LOCKS_GUARD:
+        return OAUTH_REFRESH_LOCKS.setdefault(provider, Lock())
+
+
+def _oauth_refresh_generic(provider, timeout=30, force=False):
+    """Single-flight generic refresh. Returns (ok, message, token).
+
+    The lock is per profile. Two concurrent 401s on the same rotating-token
+    profile must produce exactly ONE refresh at the vendor, not a replay that
+    revokes the session. The double-check inside the lock is what makes it
+    single-flight rather than merely serialised.
+    """
+    with _oauth_lock(provider):
+        auth = read_oauth()
+        rec = auth.get(provider) or {}
+        spec = read_oauth_profiles().get(provider) or {}
+        tok = rec.get("access_token", "")
+        rt = rec.get("refresh_token", "")
+        exp = float(rec.get("expires_at", 0) or 0)
+        if not rt:
+            return False, ("%s: no refresh token — re-login with: minimalrouter oauth %s"
+                           % (provider, provider)), tok
+        if not force and tok and (not exp or exp > time.time() + 60):
+            return True, "still valid", tok
+        url = spec.get("refresh_url")
+        if not url:
+            return False, ("%s: no refresh_url — re-login with: minimalrouter oauth %s"
+                           % (provider, provider)), tok
+        body = {k: str(v).replace("{refresh_token}", rt)
+                for k, v in (spec.get("refresh_body") or
+                              {"refresh_token": "{refresh_token}"}).items()}
+        try:
+            req = urllib.request.Request(url, data=json.dumps(body).encode(),
+                                         method="POST")
+            req.add_header("Content-Type", "application/json")
+            req.add_header("Accept", "application/json")
+            req.add_header("User-Agent", UA)
+            for k, v in (spec.get("refresh_headers") or {}).items():
+                req.add_header(k, str(v).replace("{refresh_token}", rt))
+            d = json.loads(urllib.request.urlopen(req, timeout=timeout).read() or b"{}")
+        except Exception as e:
+            log("OAUTH-REFRESH %s failed: %s" % (provider, e))
+            return False, "refresh request failed: %s" % e, tok
+        new = d.get("access_token") or d.get("token")
+        if not new:
+            return False, "no token in refresh response: %s" % str(d)[:120], tok
+        rec = dict(rec)
+        rec["access_token"] = new
+        if d.get("refresh_token"):
+            rec["refresh_token"] = d["refresh_token"]
+        rec["expires_at"] = time.time() + float(d.get("expires_in", 3600))
+        auth[provider] = rec
+        write_oauth(auth)
+        return True, "refreshed (new expiry in %s s)" % int(float(d.get("expires_in", 3600))), new
 
 
 def upstream(base, key, path, payload=None, timeout=None, row=None):
@@ -1111,7 +1232,27 @@ def order_chain(chain, state=None, now=None):
     for r in chain:
         cls = classify_status(state.get(r["name"], {}), now)
         (deferred if cls in DEFER_CLASSES else healthy).append(r)
+    # Within the healthy group: explicit weight first (higher leads), then the
+    # row that answered fastest. The sort is stable, so rows with no weight and
+    # no latency keep their file order. This never turns the partition into a
+    # filter: deferred rows stay at the tail and the caller still tries them.
+    healthy.sort(key=lambda r: _chain_sort_key(r, state, now))
     return healthy + deferred
+
+
+def _chain_sort_key(row, state, now=None):
+    """Sort key for the healthy group: weight desc, latency asc, file order last."""
+    try:
+        w = float(row.get("weight") or 0)
+    except (TypeError, ValueError):
+        w = 0.0
+    st = (state or {}).get(row.get("name"), {})
+    ms = st.get("ms")
+    try:
+        lat = float(ms) if ms is not None else float("inf")
+    except (TypeError, ValueError):
+        lat = float("inf")
+    return (-w, lat)
 
 
 def row_class(row):
@@ -1197,8 +1338,12 @@ def classify_status(state, now=None):
         return "empty"
     if int((state or {}).get("fail_streak", 0) or 0) >= FAIL_STREAK_DEAD:
         return "dead"
-    if code == "429":
+    ra = float((state or {}).get("retry_at") or 0)
+    if ra and now < ra:
         return "cooldown"
+    # A 429 with no clock is not a permanent bench. The router writes a retry_at
+    # with every failure; a state that carries none is legacy or synthetic, and
+    # an untried row is worth more than a deferred one.
     return "error"
 
 
@@ -1244,7 +1389,8 @@ def quota_from_headers(headers):
     return out
 
 
-def record_state(name, status, ms, at=None, error="", tokens=0, quota=None):
+def record_state(name, status, ms, at=None, error="", tokens=0, quota=None,
+                 retry_at=0, retry_source=""):
     """Single write path for per-row live state.
 
     hist is a JSON-safe list (NOT a deque) so /api/state can serialize it.
@@ -1254,6 +1400,10 @@ def record_state(name, status, ms, at=None, error="", tokens=0, quota=None):
     quota: the allowance meter this response carried. It describes the LAST
     response, so a call that carried none clears it rather than showing a
     neighbour's stale number.
+    retry_at: the wall-clock second this row may be touched again. A 429 with no
+    retry_at is a row that stays deferred forever; the clock is what re-admits it.
+    retry_source: "retry-after" when the server named the interval, "backoff"
+    when the router ran its own curve.
     """
     prev = ROW_STATE.get(name, {})
     hist = list(prev.get("hist", []))
@@ -1276,7 +1426,9 @@ def record_state(name, status, ms, at=None, error="", tokens=0, quota=None):
                        "at": at if at is not None else time.time(),
                        "error": error, "hist": hist,
                        "fail_streak": streak, "recent": recent,
-                       "tps": round(tps, 1), "quota": dict(quota or {})}
+                       "tps": round(tps, 1), "quota": dict(quota or {}),
+                       "retry_at": float(retry_at or 0),
+                       "retry_source": str(retry_source or "")}
 
 
 def note_req(ok, tokens=0, ms=0):
@@ -1409,6 +1561,36 @@ def _probe_loop():
     while PROBE_INTERVAL > 0:
         time.sleep(PROBE_INTERVAL)
         probe_all("cycle")
+
+
+def _prerotate_once():
+    """Refresh every profile whose token dies inside the skew window.
+
+    On-demand refresh still happens at request time; this only removes the
+    surprise. A profile with no refresh token (session-token or plan-JWT) is
+    skipped — there is nothing to rotate.
+    """
+    auth = read_oauth()
+    profiles = read_oauth_profiles()
+    for pid in sorted(profiles):
+        rec = auth.get(pid) or {}
+        if not rec.get("refresh_token"):
+            continue
+        exp = float(rec.get("expires_at", 0) or 0)
+        if not exp or exp - time.time() > PRE_ROTATE_SKEW:
+            continue
+        ok, msg = oauth_refresh(pid)
+        log("PRE-ROTATE %s %s" % (pid, msg if ok else "failed: " + msg))
+
+
+def _prerotate_loop():
+    time.sleep(5)
+    while PRE_ROTATE_INTERVAL > 0:
+        try:
+            _prerotate_once()
+        except Exception as e:
+            log("PRE-ROTATE cycle failed: %s" % e)
+        time.sleep(PRE_ROTATE_INTERVAL)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1695,173 +1877,197 @@ class Handler(BaseHTTPRequestHandler):
                     "available": sorted(bm)})
             last_err = None
             for row in chain:
-                t0 = time.time()
+                st = ROW_STATE.get(row["name"], {})
+                ra = float(st.get("retry_at") or 0)
+                wait = ra - time.time()
+                if wait > 0:
+                    time.sleep(min(wait, MAX_RETRY_WAIT))
+                sem = _row_semaphore(row)
+                if sem is not None and not sem.acquire(timeout=ROW_SLOT_TIMEOUT):
+                    last_err = "%s: row slot busy" % row["name"]
+                    log("BUSY %s via %s -> next" % (model, row["name"]))
+                    continue
                 try:
-                    if row.get("api_mode") == "omnirush":
-                        oc = chat_from_omnirush(row, dict(body, stream=False))
-                        chat = oc["text"]
-                        oms = (time.time() - t0) * 1000
-                        oct = int(((oc.get("usage") or {}).get("completion_tokens")) or 0)
-                        record_state(row["name"], "ok", oms, tokens=oct)
-                        note_req(True, oct, oms)
+                    t0 = time.time()
+                    try:
+                        if row.get("api_mode") == "omnirush":
+                            oc = chat_from_omnirush(row, dict(body, stream=False))
+                            chat = oc["text"]
+                            oms = (time.time() - t0) * 1000
+                            oct = int(((oc.get("usage") or {}).get("completion_tokens")) or 0)
+                            record_state(row["name"], "ok", oms, tokens=oct)
+                            note_req(True, oct, oms)
+                            if stream:
+                                chunk = {"id": "chatcmpl-omnirush",
+                                         "object": "chat.completion.chunk",
+                                         "created": int(time.time()),
+                                         "model": model,
+                                         "choices": [{"index": 0,
+                                                      "delta": {"role": "assistant",
+                                                                "content": chat},
+                                                      "finish_reason": "stop"}]}
+                                self.send_response(200)
+                                self.send_header("Content-Type", "text/event-stream")
+                                self.send_header("Transfer-Encoding", "chunked")
+                                self.end_headers()
+                                self._chunk(("data: %s\n\n" % json.dumps(chunk)).encode())
+                                self._chunk(b"data: [DONE]\n\n")
+                                self._chunk(b"")
+                            else:
+                                self._send(200, {
+                                    "id": "chatcmpl-omnirush",
+                                    "object": "chat.completion",
+                                    "created": int(time.time()),
+                                    "model": model,
+                                    "choices": [{"index": 0, "finish_reason": "stop",
+                                                 "message": {"role": "assistant",
+                                                             "content": chat}}]})
+                            log("OK  %s via %s (omnirush mode) %.1fs"
+                                % (model, row["name"], time.time() - t0))
+                            return
+                        if row.get("api_mode") == "zcode":
+                            zc = chat_from_zcode(row, dict(body, stream=False))
+                            chat = zc["text"]
+                            zms = (time.time() - t0) * 1000
+                            # zcode's bridge reports no usage — tokens 0 is the honest floor.
+                            record_state(row["name"], "ok", zms)
+                            note_req(True, 0, zms)
+                            if stream:
+                                chunk = {"id": "chatcmpl-zcode",
+                                         "object": "chat.completion.chunk",
+                                         "created": int(time.time()),
+                                         "model": model,
+                                         "choices": [{"index": 0,
+                                                      "delta": {"role": "assistant",
+                                                                "content": chat},
+                                                      "finish_reason": "stop"}]}
+                                self.send_response(200)
+                                self.send_header("Content-Type", "text/event-stream")
+                                self.send_header("Transfer-Encoding", "chunked")
+                                self.end_headers()
+                                self._chunk(("data: %s\n\n" % json.dumps(chunk)).encode())
+                                self._chunk(b"data: [DONE]\n\n")
+                                self._chunk(b"")
+                            else:
+                                self._send(200, {
+                                    "id": "chatcmpl-zcode",
+                                    "object": "chat.completion",
+                                    "created": int(time.time()),
+                                    "model": model,
+                                    "choices": [{"index": 0, "finish_reason": "stop",
+                                                 "message": {"role": "assistant",
+                                                             "content": chat}}]})
+                            log("OK  %s via %s (zcode mode) %.1fs"
+                                % (model, row["name"], time.time() - t0))
+                            return
+                        if row.get("api_mode") == "responses":
+                            chat = chat_from_responses(row, body)
+                            rms = (time.time() - t0) * 1000
+                            record_state(row["name"], "ok", rms)
+                            note_req(True, 0, rms)
+                            if stream:
+                                chunk = {"id": "chatcmpl-responses",
+                                         "object": "chat.completion.chunk",
+                                         "created": int(time.time()),
+                                         "model": model,
+                                         "choices": [{"index": 0,
+                                                      "delta": {"role": "assistant",
+                                                                "content": chat},
+                                                      "finish_reason": "stop"}]}
+                                self.send_response(200)
+                                self.send_header("Content-Type", "text/event-stream")
+                                self.send_header("Transfer-Encoding", "chunked")
+                                self.end_headers()
+                                self._chunk(("data: %s\n\n" % json.dumps(chunk)).encode())
+                                self._chunk(b"data: [DONE]\n\n")
+                                self._chunk(b"")
+                            else:
+                                self._send(200, {
+                                    "id": "chatcmpl-responses",
+                                    "object": "chat.completion",
+                                    "created": int(time.time()),
+                                    "model": model,
+                                    "choices": [{"index": 0, "finish_reason": "stop",
+                                                 "message": {"role": "assistant",
+                                                             "content": chat}}]})
+                            log("OK  %s via %s (responses mode) %.1fs"
+                                % (model, row["name"], time.time() - t0))
+                            return
+                        resp = upstream(row["base"], row["key"],
+                                        "/v1/chat/completions", body, row=row)
                         if stream:
-                            chunk = {"id": "chatcmpl-omnirush",
-                                     "object": "chat.completion.chunk",
-                                     "created": int(time.time()),
-                                     "model": model,
-                                     "choices": [{"index": 0,
-                                                  "delta": {"role": "assistant",
-                                                            "content": chat},
-                                                  "finish_reason": "stop"}]}
                             self.send_response(200)
-                            self.send_header("Content-Type", "text/event-stream")
+                            self.send_header("Content-Type",
+                                             "text/event-stream")
                             self.send_header("Transfer-Encoding", "chunked")
                             self.end_headers()
-                            self._chunk(("data: %s\n\n" % json.dumps(chunk)).encode())
-                            self._chunk(b"data: [DONE]\n\n")
-                            self._chunk(b"")
+                            try:
+                                while True:
+                                    ch = resp.read(4096)
+                                    if not ch:
+                                        break
+                                    self._chunk(ch)
+                                self._chunk(b"")
+                            except (BrokenPipeError, ConnectionResetError):
+                                log("stream client disconnected mid-row %s"
+                                    % row["name"])
+                            sms = (time.time() - t0) * 1000
+                            record_state(row["name"], "ok", sms,
+                                         quota=quota_from_headers(
+                                             getattr(resp, "headers", None)))
+                            note_req(True, 0, sms)  # streamed usage not parsed — floor
+                            log("OK  %s via %s stream %.1fs"
+                                % (model, row["name"], time.time() - t0))
                         else:
-                            self._send(200, {
-                                "id": "chatcmpl-omnirush",
-                                "object": "chat.completion",
-                                "created": int(time.time()),
-                                "model": model,
-                                "choices": [{"index": 0, "finish_reason": "stop",
-                                             "message": {"role": "assistant",
-                                                         "content": chat}}]})
-                        log("OK  %s via %s (omnirush mode) %.1fs"
-                            % (model, row["name"], time.time() - t0))
+                            data = resp.read()
+                            nms = (time.time() - t0) * 1000
+                            nct = 0
+                            try:
+                                nct = int((json.loads(data).get("usage", {}) or {}).get(
+                                    "completion_tokens") or 0)
+                            except Exception:
+                                pass
+                            record_state(row["name"], "ok", nms, tokens=nct,
+                                         quota=quota_from_headers(getattr(resp, "headers", None)))
+                            note_req(True, nct, nms)
+                            self._send(200, raw=data)
+                            log("OK  %s via %s %.1fs"
+                                % (model, row["name"], time.time() - t0))
                         return
-                    if row.get("api_mode") == "zcode":
-                        zc = chat_from_zcode(row, dict(body, stream=False))
-                        chat = zc["text"]
-                        zms = (time.time() - t0) * 1000
-                        # zcode's bridge reports no usage — tokens 0 is the honest floor.
-                        record_state(row["name"], "ok", zms)
-                        note_req(True, 0, zms)
-                        if stream:
-                            chunk = {"id": "chatcmpl-zcode",
-                                     "object": "chat.completion.chunk",
-                                     "created": int(time.time()),
-                                     "model": model,
-                                     "choices": [{"index": 0,
-                                                  "delta": {"role": "assistant",
-                                                            "content": chat},
-                                                  "finish_reason": "stop"}]}
-                            self.send_response(200)
-                            self.send_header("Content-Type", "text/event-stream")
-                            self.send_header("Transfer-Encoding", "chunked")
-                            self.end_headers()
-                            self._chunk(("data: %s\n\n" % json.dumps(chunk)).encode())
-                            self._chunk(b"data: [DONE]\n\n")
-                            self._chunk(b"")
-                        else:
-                            self._send(200, {
-                                "id": "chatcmpl-zcode",
-                                "object": "chat.completion",
-                                "created": int(time.time()),
-                                "model": model,
-                                "choices": [{"index": 0, "finish_reason": "stop",
-                                             "message": {"role": "assistant",
-                                                         "content": chat}}]})
-                        log("OK  %s via %s (zcode mode) %.1fs"
-                            % (model, row["name"], time.time() - t0))
-                        return
-                    if row.get("api_mode") == "responses":
-                        chat = chat_from_responses(row, body)
-                        rms = (time.time() - t0) * 1000
-                        record_state(row["name"], "ok", rms)
-                        note_req(True, 0, rms)
-                        if stream:
-                            chunk = {"id": "chatcmpl-responses",
-                                     "object": "chat.completion.chunk",
-                                     "created": int(time.time()),
-                                     "model": model,
-                                     "choices": [{"index": 0,
-                                                  "delta": {"role": "assistant",
-                                                            "content": chat},
-                                                  "finish_reason": "stop"}]}
-                            self.send_response(200)
-                            self.send_header("Content-Type", "text/event-stream")
-                            self.send_header("Transfer-Encoding", "chunked")
-                            self.end_headers()
-                            self._chunk(("data: %s\n\n" % json.dumps(chunk)).encode())
-                            self._chunk(b"data: [DONE]\n\n")
-                            self._chunk(b"")
-                        else:
-                            self._send(200, {
-                                "id": "chatcmpl-responses",
-                                "object": "chat.completion",
-                                "created": int(time.time()),
-                                "model": model,
-                                "choices": [{"index": 0, "finish_reason": "stop",
-                                             "message": {"role": "assistant",
-                                                         "content": chat}}]})
-                        log("OK  %s via %s (responses mode) %.1fs"
-                            % (model, row["name"], time.time() - t0))
-                        return
-                    resp = upstream(row["base"], row["key"],
-                                    "/v1/chat/completions", body, row=row)
-                    if stream:
-                        self.send_response(200)
-                        self.send_header("Content-Type",
-                                         "text/event-stream")
-                        self.send_header("Transfer-Encoding", "chunked")
-                        self.end_headers()
-                        try:
-                            while True:
-                                ch = resp.read(4096)
-                                if not ch:
-                                    break
-                                self._chunk(ch)
-                            self._chunk(b"")
-                        except (BrokenPipeError, ConnectionResetError):
-                            log("stream client disconnected mid-row %s"
-                                % row["name"])
-                        sms = (time.time() - t0) * 1000
-                        record_state(row["name"], "ok", sms,
-                                     quota=quota_from_headers(
-                                         getattr(resp, "headers", None)))
-                        note_req(True, 0, sms)  # streamed usage not parsed — floor
-                        log("OK  %s via %s stream %.1fs"
-                            % (model, row["name"], time.time() - t0))
-                    else:
-                        data = resp.read()
-                        nms = (time.time() - t0) * 1000
-                        nct = 0
-                        try:
-                            nct = int((json.loads(data).get("usage", {}) or {}).get(
-                                "completion_tokens") or 0)
-                        except Exception:
-                            pass
-                        record_state(row["name"], "ok", nms, tokens=nct,
-                                     quota=quota_from_headers(getattr(resp, "headers", None)))
-                        note_req(True, nct, nms)
-                        self._send(200, raw=data)
-                        log("OK  %s via %s %.1fs"
-                            % (model, row["name"], time.time() - t0))
-                    return
-                except Exception as e:
-                    detail = str(e)
-                    fh = None
-                    if isinstance(e, urllib.error.HTTPError):
-                        fh = e.headers
-                        try:
-                            snippet = e.read(300).decode("utf-8", "replace").strip()
-                            if snippet:
-                                detail += " | " + snippet[:200]
-                        except Exception:
-                            pass
-                    last_err = "%s: %s" % (row["name"], detail)
-                    fms = (time.time() - t0) * 1000
-                    # A 429 carries the allowance meter too: without this the
-                    # exhausted row's remaining-tokens and reset clock vanish
-                    # exactly when they matter most.
-                    record_state(row["name"], "fail", fms, error=detail[:200],
-                                 quota=quota_from_headers(fh))
-                    note_req(False, 0, fms)
-                    log("FAIL %s via %s: %s (%.1fs) -> next"
-                        % (model, row["name"], detail, time.time() - t0))
+                    except Exception as e:
+                        detail = str(e)
+                        fh = None
+                        if isinstance(e, urllib.error.HTTPError):
+                            fh = e.headers
+                            try:
+                                snippet = e.read(300).decode("utf-8", "replace").strip()
+                                if snippet:
+                                    detail += " | " + snippet[:200]
+                            except Exception:
+                                pass
+                        last_err = "%s: %s" % (row["name"], detail)
+                        fms = (time.time() - t0) * 1000
+                        # A 429 carries the allowance meter too: without this the
+                        # exhausted row's remaining-tokens and reset clock vanish
+                        # exactly when they matter most. The retry clock is the
+                        # other half: without retry_at the row stays deferred
+                        # forever, even after the vendor's own interval passed.
+                        prev = ROW_STATE.get(row["name"], {})
+                        streak = int(prev.get("fail_streak", 0) or 0) + 1
+                        ra_hdr = fh.get("Retry-After") if fh is not None else None
+                        ra_secs = parse_retry_after(ra_hdr)
+                        delay = backoff_delay(streak, ra_secs)
+                        record_state(row["name"], "fail", fms, error=detail[:200],
+                                     quota=quota_from_headers(fh),
+                                     retry_at=time.time() + delay,
+                                     retry_source=("retry-after" if ra_secs is not None
+                                                   else "backoff"))
+                        note_req(False, 0, fms)
+                        log("FAIL %s via %s: %s (%.1fs) -> next"
+                            % (model, row["name"], detail, time.time() - t0))
+                finally:
+                    if sem is not None:
+                        sem.release()
             return self._send(502, {"error": "all rows failed for '%s'"
                                            % model, "last": last_err})
 
@@ -2461,50 +2667,19 @@ def oauth_refresh(provider, timeout=30):
 
     Handles three shapes: generic header/body refresh, Nous' header-carried secret,
     and omnirush's dedicated control-plane refresh with rotating token + gateway_url.
-    Never prints the token.
+    The generic path runs under the per-profile lock so a forced refresh and an
+    on-demand refresh cannot both reach the vendor. Never prints the token.
     """
     profiles = read_oauth_profiles()
     if provider not in profiles:
         return False, "unknown provider %r (see: minimalrouter oauth list)" % provider
     spec = profiles[provider] or {}
-    auth = read_oauth()
-    rec = auth.get(provider) or {}
-    rt = rec.get("refresh_token", "")
-    if not rt:
-        return False, "%s: no refresh token — re-login with: minimalrouter oauth %s" % (
-            provider, provider)
     if spec.get("api_mode") == "omnirush":
         # single-flight and atomic persist live inside omnirush_access_token
         tok = omnirush_access_token(provider)
         return (True, "refreshed") if tok else (False, "refresh failed (see log)")
-    url = spec.get("refresh_url")
-    if not url:
-        return False, "%s: no refresh_url — re-login with: minimalrouter oauth %s" % (
-            provider, provider)
-    body = {k: str(v).replace("{refresh_token}", rt)
-            for k, v in (spec.get("refresh_body") or
-                         {"refresh_token": "{refresh_token}"}).items()}
-    try:
-        req = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST")
-        req.add_header("Content-Type", "application/json")
-        req.add_header("Accept", "application/json")
-        req.add_header("User-Agent", UA)
-        for k, v in (spec.get("refresh_headers") or {}).items():
-            req.add_header(k, str(v).replace("{refresh_token}", rt))
-        d = json.loads(urllib.request.urlopen(req, timeout=timeout).read() or b"{}")
-    except Exception as e:
-        return False, "refresh request failed: %s" % e
-    new = d.get("access_token") or d.get("token")
-    if not new:
-        return False, "no token in refresh response: %s" % str(d)[:120]
-    rec = dict(rec)
-    rec["access_token"] = new
-    if d.get("refresh_token"):
-        rec["refresh_token"] = d["refresh_token"]
-    rec["expires_at"] = time.time() + float(d.get("expires_in", 3600))
-    auth[provider] = rec
-    write_oauth(auth)
-    return True, "refreshed (new expiry in %s s)" % int(float(d.get("expires_in", 3600)))
+    ok, msg, _tok = _oauth_refresh_generic(provider, timeout=timeout, force=True)
+    return ok, msg
 
 
 def write_pidfile():
@@ -2684,6 +2859,8 @@ Usage:
 
 Endpoint: http://127.0.0.1:%d/v1     (env MINIMALROUTER_PORT overrides the port)
 Env:   MINIMALROUTER_PROBE_INTERVAL=seconds (default 600; 0 = boot probe only)
+       MINIMALROUTER_PRE_ROTATE_INTERVAL=seconds (default 300; 0 disables)
+       MINIMALROUTER_ROW_CONCURRENCY=n (default 1; 0 = unlimited)
 No server authentication. Localhost only. Three connection classes, one engine path:
   API     - a key or key_env in rows.json (dashboard: press a, paste URL + key).
   OAUTH   - a device-flow profile: `oauth add` then `oauth <id>`.
@@ -4141,6 +4318,7 @@ def main():
     log("MinimalRouter starting on %s:%d mode=%s" % (HOST, PORT, mode))
     write_pidfile()
     Thread(target=_probe_loop, daemon=True).start()
+    Thread(target=_prerotate_loop, daemon=True).start()
     if mode == "serve":
         print("MinimalRouter serving on http://%s:%d/v1  (dashboard: "
               "run `minimalrouter`)" % (HOST, PORT))

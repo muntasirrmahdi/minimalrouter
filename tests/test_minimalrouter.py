@@ -20,7 +20,7 @@ import types
 import unittest
 import urllib.error
 import urllib.request
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
 
@@ -434,7 +434,8 @@ class TestPoolStatsReconcile(unittest.TestCase):
         rows = [{"state": {"status": "ok"}},
                 {"state": {"status": "fail", "error": "HTTP Error 403: x"}},
                 {"state": {"status": "fail", "error": "HTTP Error 402: x"}},
-                {"state": {"status": "fail", "error": "HTTP Error 429: x"}},
+                {"state": {"status": "fail", "error": "HTTP Error 429: x",
+                           "retry_at": time.time() + 60}},
                 {"state": {"status": "fail", "error": "HTTP Error 530: x",
                            "fail_streak": 3}},
                 {"state": {"status": "fail", "error": "URLError: refused"}},
@@ -544,9 +545,16 @@ class TestClassifyV12(unittest.TestCase):
     """Richer STATUS vocabulary: cooldown (429), dead (streak), stale (old ok)."""
 
     def test_cooldown_429_single_fail(self):
+        now = time.time()
         self.assertEqual(mr.classify_status(
             {"status": "fail", "error": "HTTP Error 429: Too Many Requests",
-             "fail_streak": 1}), "cooldown")
+             "fail_streak": 1, "retry_at": now + 5}, now), "cooldown")
+
+    def test_a_429_without_a_clock_is_not_benched_forever(self):
+        """v1.8.0: the cooldown is the clock, not the status code."""
+        self.assertEqual(mr.classify_status(
+            {"status": "fail", "error": "HTTP Error 429: Too Many Requests",
+             "fail_streak": 1}, time.time()), "error")
 
     def test_dead_after_streak(self):
         self.assertEqual(mr.classify_status(
@@ -1895,14 +1903,16 @@ class TestPoolLearnsAcrossRequests(unittest.TestCase):
 
     # ---- pure: order_chain ----
 
-    def _st(self, err, streak=1, status="fail", at=None):
+    def _st(self, err, streak=1, status="fail", at=None, retry_at=0):
         return {"status": status, "error": err, "fail_streak": streak,
-                "at": at if at is not None else time.time()}
+                "at": at if at is not None else time.time(),
+                "retry_at": retry_at}
 
     def test_a_cooldown_row_moves_behind_a_healthy_row(self):
         now = time.time()
         chain = [{"name": "a", "model": "m"}, {"name": "b", "model": "m"}]
-        state = {"a": self._st("HTTP Error 429: rate limited"),
+        state = {"a": self._st("HTTP Error 429: rate limited",
+                               retry_at=now + 60),
                  "b": self._st("", status="ok")}
         out = [r["name"] for r in mr.order_chain(chain, state, now)]
         self.assertEqual(out, ["b", "a"],
@@ -1915,7 +1925,7 @@ class TestPoolLearnsAcrossRequests(unittest.TestCase):
         now = time.time()
         chain = [{"name": n, "model": "m"} for n in
                  ("cool", "empty", "gated", "dead", "good")]
-        state = {"cool": self._st("HTTP Error 429"),
+        state = {"cool": self._st("HTTP Error 429", retry_at=now + 60),
                  "empty": self._st("HTTP Error 402"),
                  "gated": self._st("HTTP Error 403"),
                  "dead": self._st("HTTP Error 500", streak=mr.FAIL_STREAK_DEAD),
@@ -1933,7 +1943,7 @@ class TestPoolLearnsAcrossRequests(unittest.TestCase):
                  {"name": "untried", "model": "m"}, {"name": "cool", "model": "m"}]
         state = {"err": self._st("HTTP Error 500"),
                  "stale": self._st("", status="ok", at=now - mr.STALE_AFTER - 1),
-                 "cool": self._st("HTTP Error 429")}
+                 "cool": self._st("HTTP Error 429", retry_at=now + 60)}
         out = [r["name"] for r in mr.order_chain(chain, state, now)]
         self.assertEqual(out[:3], ["err", "stale", "untried"],
                          "only upstream-declared states may defer")
@@ -1946,7 +1956,8 @@ class TestPoolLearnsAcrossRequests(unittest.TestCase):
         now = time.time()
         chain = [{"name": "a", "model": "m"}, {"name": "b", "model": "m"},
                  {"name": "c", "model": "m"}]
-        state = {n: self._st("HTTP Error 429") for n in ("a", "b", "c")}
+        state = {n: self._st("HTTP Error 429", retry_at=now + 60)
+                 for n in ("a", "b", "c")}
         out = [r["name"] for r in mr.order_chain(chain, state, now)]
         self.assertEqual(out, ["a", "b", "c"],
                          "all-deferred must preserve order and drop nothing")
@@ -1955,7 +1966,8 @@ class TestPoolLearnsAcrossRequests(unittest.TestCase):
     def test_relative_order_is_stable_within_each_group(self):
         now = time.time()
         chain = [{"name": n, "model": "m"} for n in ("a", "b", "c", "d", "e")]
-        state = {"b": self._st("HTTP Error 429"), "d": self._st("HTTP Error 429"),
+        state = {"b": self._st("HTTP Error 429", retry_at=now + 60),
+                 "d": self._st("HTTP Error 429", retry_at=now + 60),
                  "a": self._st("", status="ok"),
                  "c": self._st("", status="ok"),
                  "e": self._st("", status="ok")}
@@ -2393,6 +2405,298 @@ class TestPoolLearnsEndToEnd(unittest.TestCase):
         finally:
             self._stop(srv)
             fx.stop()
+
+
+# v1.8.0 — runtime discipline: retry clocks, backoff, concurrency, single-flight, pre-rotation
+    def _upstream(self, handler_cls):
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+        return srv, "http://127.0.0.1:%d/v1" % srv.server_address[1]
+
+    def test_a_429_with_retry_after_sets_a_retry_clock(self):
+        hits = {"n": 0}
+
+        class H(BaseHTTPRequestHandler):
+            def do_POST(self):
+                hits["n"] += 1
+                self.send_response(429)
+                self.send_header("Retry-After", "3")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, *a):
+                pass
+
+        srv, base_url = self._upstream(H)
+        router = None
+        try:
+            router, base, _ = self._boot([
+                {"name": "spent", "base": base_url, "model": "m", "key": "k"},
+            ])
+            # Let the boot probe run and its own 3s clock expire before the
+            # client path is measured; the probe is a real upstream hit and the
+            # test must not mistake it for a second client strike.
+            time.sleep(4.5)
+            before = hits["n"]
+            code, body, elapsed = self._chat(base, timeout=20)
+            self.assertEqual(code, 502)
+            self.assertEqual(hits["n"], before + 1,
+                             "the first client request is ONE upstream hit")
+            st = self._state(base)
+            row = st["rows"][0]["state"]
+            self.assertEqual(row.get("retry_source"), "retry-after")
+            left = float(row.get("retry_at", 0)) - time.time()
+            self.assertGreater(left, 1.5,
+                               "the 3s clock must still be running (left %.1fs)" % left)
+            self.assertLess(left, 5.0)
+            # the second request must wait the advertised interval, not restrike
+            t0 = time.time()
+            code2, _, elapsed2 = self._chat(base, timeout=20)
+            waited = time.time() - t0
+            self.assertEqual(code2, 502)
+            self.assertGreaterEqual(waited, 2.5,
+                                    "a 429 row was restriked before its clock expired")
+            self.assertEqual(hits["n"], before + 2,
+                             "the second client request must be ONE upstream hit")
+        finally:
+            self._stop(router)
+            srv.shutdown()
+
+    def test_a_bare_429_runs_the_backoff_curve(self):
+        class H(BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.send_response(429)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, *a):
+                pass
+
+        srv, base_url = self._upstream(H)
+        router = None
+        try:
+            router, base, _ = self._boot([
+                {"name": "bare", "base": base_url, "model": "m", "key": "k"},
+            ])
+            code, _, _ = self._chat(base, timeout=20)
+            self.assertEqual(code, 502)
+            row = self._state(base)["rows"][0]["state"]
+            self.assertEqual(row.get("retry_source"), "backoff")
+            left = float(row.get("retry_at", 0)) - time.time()
+            self.assertGreater(left, 0.0)
+            self.assertLess(left, 2.0,
+                            "streak 1 curve is 0.5s + jitter, not a long bench")
+        finally:
+            self._stop(router)
+            srv.shutdown()
+
+    def test_the_retry_clock_re_admits_the_row_after_it_expires(self):
+        now = 1000.0
+        cooled = {"status": "fail", "error": "HTTP Error 429: x",
+                  "retry_at": now + 5}
+        expired = {"status": "fail", "error": "HTTP Error 429: x",
+                   "retry_at": now - 1}
+        self.assertEqual(mr.classify_status(cooled, now), "cooldown")
+        self.assertEqual(mr.classify_status(expired, now), "error",
+                         "a row whose clock passed is not benched forever")
+        chain = [{"name": "cool", "model": "m"}, {"name": "fit", "model": "m"}]
+        state = {"cool": cooled, "fit": {"status": "ok"}}
+        out = [r["name"] for r in mr.order_chain(chain, state, now)]
+        self.assertEqual(out, ["fit", "cool"])
+        out2 = [r["name"] for r in mr.order_chain(chain, {"cool": expired, "fit": {"status": "ok"}}, now)]
+        self.assertEqual(out2, ["cool", "fit"],
+                         "the re-admitted row keeps its file position")
+
+    def test_weights_and_latency_order_the_healthy_group(self):
+        now = 1000.0
+        chain = [
+            {"name": "heavy", "model": "m", "weight": 10},
+            {"name": "slow", "model": "m"},
+            {"name": "fast", "model": "m"},
+        ]
+        state = {
+            "heavy": {"status": "ok", "ms": 900},
+            "slow": {"status": "ok", "ms": 400},
+            "fast": {"status": "ok", "ms": 100},
+        }
+        out = [r["name"] for r in mr.order_chain(chain, state, now)]
+        self.assertEqual(out, ["heavy", "fast", "slow"])
+        # no weight, no latency: file order survives (stable sort)
+        blind = [{"name": "a", "model": "m"}, {"name": "b", "model": "m"}]
+        self.assertEqual([r["name"] for r in mr.order_chain(blind, {}, now)],
+                         ["a", "b"])
+
+    def test_row_concurrency_cap_serialises_a_burst(self):
+        live = {"active": 0, "max": 0}
+        lock = threading.Lock()
+
+        class H(BaseHTTPRequestHandler):
+            def do_POST(self):
+                with lock:
+                    live["active"] += 1
+                    live["max"] = max(live["max"], live["active"])
+                time.sleep(0.15)
+                with lock:
+                    live["active"] -= 1
+                body = json.dumps({"choices": [{"message": {"content": "ok"}}]}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *a):
+                pass
+
+        srv, base_url = self._upstream(H)
+        router = None
+        try:
+            router, base, _ = self._boot([
+                {"name": "capped", "base": base_url, "model": "m", "key": "k",
+                 "concurrency": 1},
+            ])
+            codes = []
+
+            def one():
+                c, _, _ = self._chat(base, timeout=30)
+                codes.append(c)
+
+            ts = [threading.Thread(target=one) for _ in range(8)]
+            for t in ts:
+                t.start()
+            for t in ts:
+                t.join()
+            self.assertEqual(codes, [200] * 8,
+                             "a capped row queues, it does not refuse clients")
+            self.assertEqual(live["max"], 1,
+                             "the row was hammered %d ways at once" % live["max"])
+        finally:
+            self._stop(router)
+            srv.shutdown()
+
+    def test_a_row_can_opt_out_of_the_cap(self):
+        live = {"active": 0, "max": 0}
+        lock = threading.Lock()
+
+        class H(BaseHTTPRequestHandler):
+            def do_POST(self):
+                with lock:
+                    live["active"] += 1
+                    live["max"] = max(live["max"], live["active"])
+                time.sleep(0.15)
+                with lock:
+                    live["active"] -= 1
+                body = json.dumps({"choices": [{"message": {"content": "ok"}}]}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *a):
+                pass
+
+        srv, base_url = self._upstream(H)
+        router = None
+        try:
+            router, base, _ = self._boot([
+                {"name": "uncapped", "base": base_url, "model": "m", "key": "k",
+                 "concurrency": 0},
+            ])
+            ts = [threading.Thread(target=self._chat, args=(base,),
+                                   kwargs={"timeout": 30}) for _ in range(4)]
+            for t in ts:
+                t.start()
+            for t in ts:
+                t.join()
+            self.assertGreater(live["max"], 1,
+                               "concurrency 0 must mean unlimited, not a hidden cap")
+        finally:
+            self._stop(router)
+            srv.shutdown()
+
+    def test_generic_oauth_refresh_is_single_flight(self):
+        tmp = tempfile.mkdtemp()
+        saved = {a: getattr(mr, a) for a in
+                 ("OAUTH_PATH", "OAUTH_PROFILES_PATH", "MR_HOME")}
+        calls = {"n": 0}
+        lock = threading.Lock()
+        try:
+            mr.MR_HOME = tmp
+            mr.OAUTH_PATH = os.path.join(tmp, "oauth.json")
+            mr.OAUTH_PROFILES_PATH = os.path.join(tmp, "oauth-providers.json")
+            json.dump({"nous": {"label": "Nous", "refresh_url": "https://r/refresh"}},
+                      open(mr.OAUTH_PROFILES_PATH, "w"))
+            json.dump({"nous": {"access_token": "old", "refresh_token": "rt",
+                                "expires_at": time.time() - 10}},
+                      open(mr.OAUTH_PATH, "w"))
+
+            class FakeResp:
+                def __init__(self, body):
+                    self._b = body
+
+                def read(self):
+                    return self._b
+
+            def opener(req, timeout=30):
+                with lock:
+                    calls["n"] += 1
+                time.sleep(0.2)
+                return FakeResp(json.dumps({"access_token": "new",
+                                            "expires_in": 3600}).encode())
+
+            old = mr.urllib.request.urlopen
+            mr.urllib.request.urlopen = opener
+            tokens = []
+
+            def grab():
+                tokens.append(mr.oauth_access_token("nous"))
+
+            ts = [threading.Thread(target=grab) for _ in range(8)]
+            for t in ts:
+                t.start()
+            for t in ts:
+                t.join()
+            self.assertEqual(calls["n"], 1,
+                             "8 concurrent 401s produced %d vendor refreshes" % calls["n"])
+            self.assertEqual(set(tokens), {"new"})
+            self.assertEqual(json.load(open(mr.OAUTH_PATH))["nous"]["access_token"], "new")
+        finally:
+            mr.urllib.request.urlopen = old
+            for a, v in saved.items():
+                setattr(mr, a, v)
+
+    def test_pre_rotation_refreshes_only_expiring_profiles(self):
+        tmp = tempfile.mkdtemp()
+        saved = {a: getattr(mr, a) for a in
+                 ("OAUTH_PATH", "OAUTH_PROFILES_PATH", "MR_HOME")}
+        seen = []
+        try:
+            mr.MR_HOME = tmp
+            mr.OAUTH_PATH = os.path.join(tmp, "oauth.json")
+            mr.OAUTH_PROFILES_PATH = os.path.join(tmp, "oauth-providers.json")
+            json.dump({
+                "soon": {"label": "Soon", "refresh_url": "https://r"},
+                "later": {"label": "Later", "refresh_url": "https://r"},
+                "jwt": {"label": "No expiry", "refresh_url": "https://r"},
+            }, open(mr.OAUTH_PROFILES_PATH, "w"))
+            json.dump({
+                "soon": {"access_token": "a", "refresh_token": "rt",
+                         "expires_at": time.time() + 100},
+                "later": {"access_token": "b", "refresh_token": "rt",
+                          "expires_at": time.time() + 999999},
+                "jwt": {"access_token": "c", "refresh_token": "rt"},
+            }, open(mr.OAUTH_PATH, "w"))
+            old = mr.oauth_refresh
+            mr.oauth_refresh = lambda p: (seen.append(p), (True, "ok"))[1]
+            mr._prerotate_once()
+            self.assertEqual(seen, ["soon"],
+                             "pre-rotation touched a profile that did not need it")
+        finally:
+            mr.oauth_refresh = old
+            for a, v in saved.items():
+                setattr(mr, a, v)
 
 
 # v1.6.0 — auto-fetch add, responses auto-detect, row User-Agent
