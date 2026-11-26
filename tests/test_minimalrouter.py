@@ -2699,6 +2699,140 @@ class TestPoolLearnsEndToEnd(unittest.TestCase):
                 setattr(mr, a, v)
 
 
+    # ---------------- v1.9.0: Anthropic /v1/messages shim ----------------
+    def _messages(self, base, body, timeout=25):
+        rq = urllib.request.Request(
+            base + "/v1/messages",
+            data=json.dumps(body).encode(),
+            method="POST", headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(rq, timeout=timeout) as r:
+                return r.status, r.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as e:
+            return e.code, e.read().decode("utf-8", "replace")
+
+    def test_anthropic_request_translation_preserves_tools(self):
+        body = {
+            "model": "m", "max_tokens": 64,
+            "system": [{"type": "text", "text": "be brief"}],
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "calling"},
+                    {"type": "tool_use", "id": "toolu_1", "name": "read",
+                     "input": {"path": "a.txt"}}]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_1",
+                     "content": [{"type": "text", "text": "ok"}]}]},
+            ],
+            "tools": [{"name": "read", "description": "read a file",
+                       "input_schema": {"type": "object", "properties": {}}}],
+            "tool_choice": {"type": "auto"},
+        }
+        oa = mr.anthropic_to_openai(body)
+        self.assertEqual(oa["messages"][0], {"role": "system", "content": "be brief"})
+        self.assertEqual(oa["messages"][1], {"role": "user", "content": "hi"})
+        self.assertEqual(oa["messages"][2]["tool_calls"][0]["function"]["name"], "read")
+        self.assertEqual(oa["messages"][2]["tool_calls"][0]["id"], "toolu_1")
+        self.assertEqual(oa["messages"][3]["role"], "tool")
+        self.assertEqual(oa["messages"][3]["tool_call_id"], "toolu_1")
+        self.assertEqual(oa["tools"][0]["function"]["name"], "read")
+        self.assertEqual(oa["tool_choice"], "auto")
+        self.assertFalse(oa["stream"])
+
+    def test_anthropic_response_translation_maps_tool_calls(self):
+        data = {"id": "chatcmpl-1", "choices": [{
+            "message": {"role": "assistant", "content": "calling",
+                        "tool_calls": [{"id": "call_1", "type": "function",
+                                        "function": {"name": "read",
+                                                     "arguments": '{"path":"a.txt"}'}}]},
+            "finish_reason": "tool_calls"}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5}}
+        anth = mr.openai_to_anthropic(data, "m")
+        self.assertEqual(anth["stop_reason"], "tool_use")
+        self.assertEqual(anth["content"][0]["type"], "text")
+        self.assertEqual(anth["content"][1]["type"], "tool_use")
+        self.assertEqual(anth["content"][1]["input"], {"path": "a.txt"})
+        self.assertEqual(anth["usage"], {"input_tokens": 10, "output_tokens": 5})
+
+    def test_v1_messages_endpoint_translates_a_tool_call(self):
+        class H(BaseHTTPRequestHandler):
+            def do_POST(self):
+                data = {"id": "chatcmpl-1", "choices": [{
+                    "message": {"role": "assistant", "content": None,
+                                "tool_calls": [{"id": "call_1", "type": "function",
+                                                "function": {"name": "read",
+                                                             "arguments": '{"path":"a.txt"}'}}]},
+                    "finish_reason": "tool_calls"}],
+                    "usage": {"prompt_tokens": 7, "completion_tokens": 4}}
+                body = json.dumps(data).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *a):
+                pass
+
+        srv, base_url = self._upstream(H)
+        router = None
+        try:
+            router, base, _ = self._boot([
+                {"name": "anth", "base": base_url, "model": "m", "key": "k"},
+            ])
+            body = {"model": "m", "max_tokens": 64,
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "tools": [{"name": "read", "description": "read",
+                               "input_schema": {"type": "object"}}]}
+            code, raw = self._messages(base, body)
+            self.assertEqual(code, 200)
+            data = json.loads(raw)
+            self.assertEqual(data["type"], "message")
+            self.assertEqual(data["stop_reason"], "tool_use")
+            self.assertEqual(data["content"][0]["type"], "tool_use")
+            self.assertEqual(data["content"][0]["name"], "read")
+            self.assertEqual(data["usage"], {"input_tokens": 7, "output_tokens": 4})
+        finally:
+            self._stop(router)
+            srv.shutdown()
+
+    def test_v1_messages_stream_emits_anthropic_events(self):
+        class H(BaseHTTPRequestHandler):
+            def do_POST(self):
+                data = {"id": "chatcmpl-1", "choices": [{
+                    "message": {"role": "assistant", "content": "hello"},
+                    "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 3, "completion_tokens": 2}}
+                body = json.dumps(data).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *a):
+                pass
+
+        srv, base_url = self._upstream(H)
+        router = None
+        try:
+            router, base, _ = self._boot([
+                {"name": "anth", "base": base_url, "model": "m", "key": "k"},
+            ])
+            code, raw = self._messages(base, {
+                "model": "m", "max_tokens": 64, "stream": True,
+                "messages": [{"role": "user", "content": "hi"}]})
+            self.assertEqual(code, 200)
+            self.assertIn("event: message_start", raw)
+            self.assertIn("event: content_block_delta", raw)
+            self.assertIn("hello", raw)
+            self.assertIn("event: message_stop", raw)
+        finally:
+            self._stop(router)
+            srv.shutdown()
+
+
 # v1.6.0 — auto-fetch add, responses auto-detect, row User-Agent
 class TestProbeAutoV160(unittest.TestCase):
     """probe_auto retries through the Responses transport when the chat endpoint

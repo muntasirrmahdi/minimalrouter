@@ -185,6 +185,35 @@ class TestDashboardApp(unittest.TestCase):
         asyncio.run(go())
 
 
+    def test_grouped_toggle_sorts_by_provider(self):
+        d = self.d
+
+        async def go():
+            app = d.MissionControl(port=0)
+            async with app.run_test(size=(120, 40)) as pilot:
+                app.online = True
+                app.rows = [
+                    {"name": "z1", "provider": "zeta", "class": "api",
+                     "model": "m/z", "base": "https://z/v1", "key_src": "env:Z",
+                     "state": {"status": "ok"}},
+                    {"name": "a1", "provider": "alpha", "class": "api",
+                     "model": "m/a", "base": "https://a/v1", "key_src": "env:A",
+                     "state": {"status": "ok"}},
+                ]
+                app.ensure_slots(2)
+                app.rebuild_stats()
+                app.repaint_rows()
+                await pilot.press("i")
+                await pilot.pause(0.2)
+                self.assertTrue(app.grouped)
+                self.assertEqual([r["name"] for r in app.rows], ["a1", "z1"],
+                                 "grouped view must order rows by provider")
+                await pilot.press("q")
+                await pilot.pause(0.2)
+
+        asyncio.run(go())
+
+
 if __name__ == "__main__":
     unittest.main()
 # ---- v1.2.0 dashboard helper tests ----

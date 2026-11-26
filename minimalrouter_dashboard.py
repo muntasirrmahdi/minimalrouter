@@ -324,6 +324,14 @@ def classify(state):
     return "error"
 
 
+def provider_group_name(row):
+    return str(row.get("provider") or row.get("oauth_provider") or "?")
+
+
+def provider_group_key(row):
+    return (provider_group_name(row).lower(), str(row.get("name", "")).lower())
+
+
 def prov_short(name, row_name=""):
     """Provider tag: OAuth labels collapse to alphanumerics ('Nous Portal' ->
     NOUSPORTAL, 'ZCode (Z.ai)' -> ZCODE); domains shorten to the first
@@ -554,6 +562,7 @@ class HelpScreen(ModalScreen):
             ("v", "density: airy / compact"),
             ("m", "motion on / off — pauses every animation timer"),
             ("Tab", "focus the EVENTS panel  -  g/G newest / oldest"),
+            ("i", "group rows by provider (toggle)"),
             ("?", "this help  -  any key closes it (after a short guard)"),
             ("cli", "outside the board: `minimalrouter doctor` diagnoses the "
                    "install (launcher, keys, tokens, ports) and never spends "
@@ -732,6 +741,7 @@ class MissionControl(App):
         self.zone = "table"
         self.del_arm = (None, 0.0)
         self.server_ver = ""
+        self.grouped = False
 
     def pal(self):
         return THEMES[self.theme_ix]
@@ -902,6 +912,8 @@ class MissionControl(App):
         self.online = True
         self._ensure_tier()          # self-healing tier (event-order independent)
         self.rows = st.get("rows", []) or []
+        if self.grouped:
+            self.rows.sort(key=provider_group_key)
         self.nmodels = st.get("models", 0)
         self.stats = st.get("stats", {}) or {}
         self.probe = st.get("probe", self.probe) or self.probe
@@ -1084,12 +1096,28 @@ class MissionControl(App):
         self.update_events()
 
     def repaint_rows(self):
+        last_prov = None
         for i in range(len(self.row_statics)):
             w = self.row_statics.get(f"slot{i}")
             if w is None or not w.display:
                 continue
             if i < len(self.rows):
-                w.update(self.row_line(self.rows[i], i == self.sel))
+                r = self.rows[i]
+                prov = provider_group_name(r)
+                head = None
+                if self.grouped and prov != last_prov:
+                    head = prov
+                    last_prov = prov
+                line = self.row_line(r, i == self.sel)
+                if head:
+                    p = self.pal()
+                    out = Text()
+                    out.append("▸ " + head, style=f"bold {p['accent']}")
+                    out.append("\n")
+                    out.append_text(line)
+                    w.update(out)
+                else:
+                    w.update(line)
                 w.set_class(i == self.sel, "sel")
 
     # ---------- hero ----------
@@ -1323,7 +1351,7 @@ class MissionControl(App):
             keys = [("t", "test"), ("T", "all"), ("spc", "mark"), ("r", "token"),
                     ("R", "all"), ("f", "cat"), ("e", "off"), ("d", "del"),
                     ("a", "add"), ("y", "copy"), ("p", "theme"),
-                    ("v", "dens"), ("m", "motion"),
+                    ("v", "dens"), ("m", "motion"), ("i", "group"),
                     ("?", "help"), ("q", "quit")]
             for i, (k, lab) in enumerate(keys):
                 if i:
@@ -1371,6 +1399,16 @@ class MissionControl(App):
             event.stop()
             self.zone = "events" if self.zone == "table" else "table"
             self.ev_scroll = 0
+            self.update_events()
+        elif k == "i":
+            event.stop()
+            self.grouped = not self.grouped
+            self.sel = 0
+            if self.grouped:
+                self.rows.sort(key=provider_group_key)
+            self.toast = ("grouped by provider" if self.grouped else "flat row order")
+            self.repaint_rows()
+            self.update_selected(repaint=False)
             self.update_events()
         elif k == "g":
             event.stop()

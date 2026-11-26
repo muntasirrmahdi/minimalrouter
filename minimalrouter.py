@@ -39,6 +39,7 @@ responses). No provider is hardcoded. Tokens are refreshed on demand.
 
 HTTP API:
   POST /v1/chat/completions   stream + non-stream, ordered fallback per model
+  POST /v1/messages           Anthropic Messages shim (Claude Code), same pool
   GET  /v1/models             union of configured models/aliases
   GET  /health
   GET  /api/state             rows + live per-row state
@@ -85,7 +86,7 @@ except ImportError:  # platform without curses -> main() degrades to serve
 # CHANGELOG and the git tag all derive from this one line. MAJOR.MINOR.PATCH per
 # semver.org: MAJOR on a breaking client contract, MINOR on backward-compatible
 # features, PATCH on fixes.
-__version__ = "1.8.0"
+__version__ = "1.9.0"
 
 HOME = os.path.expanduser("~")
 MR_HOME = os.path.join(HOME, ".minimalrouter")
@@ -1593,6 +1594,276 @@ def _prerotate_loop():
         time.sleep(PRE_ROTATE_INTERVAL)
 
 
+# --- Anthropic Messages compatibility ---------------------------------------
+# Claude Code speaks the Anthropic Messages API, not OpenAI Chat. This shim
+# translates the request, runs the same row chain, and translates the response
+# back. It is a protocol adapter, never a second router.
+def _anthropic_text(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(str(b.get("text", "")) for b in content
+                       if isinstance(b, dict) and b.get("type") == "text")
+    return ""
+
+
+def anthropic_to_openai(body):
+    """Anthropic Messages request -> OpenAI Chat request (pure)."""
+    out = {}
+    msgs = []
+    sys = body.get("system")
+    if sys:
+        msgs.append({"role": "system", "content": _anthropic_text(sys)})
+    for m in body.get("messages", []) or []:
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role", "user")
+        content = m.get("content")
+        if isinstance(content, str):
+            msgs.append({"role": role, "content": content})
+            continue
+        if not isinstance(content, list):
+            msgs.append({"role": role, "content": ""})
+            continue
+        texts, images, tool_calls, tool_results = [], [], [], []
+        for b in content:
+            if not isinstance(b, dict):
+                continue
+            t = b.get("type")
+            if t == "text":
+                texts.append(str(b.get("text", "")))
+            elif t == "image":
+                src = b.get("source") or {}
+                if src.get("type") == "base64" and src.get("data"):
+                    images.append("data:%s;base64,%s"
+                                  % (src.get("media_type", "image/png"), src["data"]))
+                elif src.get("type") == "url" and src.get("url"):
+                    images.append(src["url"])
+            elif t == "tool_use":
+                tool_calls.append({
+                    "id": b.get("id", ""), "type": "function",
+                    "function": {"name": b.get("name", ""),
+                                 "arguments": json.dumps(b.get("input") or {})}})
+            elif t == "tool_result":
+                rc = b.get("content")
+                if isinstance(rc, list):
+                    txt = "".join(str(x.get("text", "")) for x in rc
+                                  if isinstance(x, dict) and x.get("type") == "text")
+                else:
+                    txt = str(rc or "")
+                tool_results.append({"role": "tool",
+                                     "tool_call_id": b.get("tool_use_id", ""),
+                                     "content": txt})
+        if tool_results:
+            msgs.extend(tool_results)
+            continue
+        if tool_calls:
+            msg = {"role": "assistant", "tool_calls": tool_calls}
+            if texts:
+                msg["content"] = "".join(texts)
+            msgs.append(msg)
+            continue
+        if images:
+            parts = []
+            if texts:
+                parts.append({"type": "text", "text": "".join(texts)})
+            parts.extend({"type": "image_url", "image_url": {"url": u}} for u in images)
+            msgs.append({"role": role, "content": parts})
+        else:
+            msgs.append({"role": role, "content": "".join(texts)})
+    out["messages"] = msgs
+    if body.get("max_tokens") is not None:
+        out["max_tokens"] = int(body["max_tokens"])
+    else:
+        out["max_tokens"] = 1024
+    for k in ("temperature", "top_p"):
+        if body.get(k) is not None:
+            out[k] = body[k]
+    if body.get("stop_sequences"):
+        out["stop"] = body["stop_sequences"]
+    tools = body.get("tools")
+    if isinstance(tools, list) and tools:
+        out["tools"] = [{"type": "function",
+                         "function": {"name": t.get("name", ""),
+                                      "description": t.get("description", ""),
+                                      "parameters": t.get("input_schema") or {}}}
+                        for t in tools if isinstance(t, dict)]
+    tc = body.get("tool_choice")
+    if isinstance(tc, dict):
+        if tc.get("type") == "auto":
+            out["tool_choice"] = "auto"
+        elif tc.get("type") == "any":
+            out["tool_choice"] = "required"
+        elif tc.get("type") == "tool" and tc.get("name"):
+            out["tool_choice"] = {"type": "function",
+                                  "function": {"name": tc["name"]}}
+        elif tc.get("type") == "none":
+            out["tool_choice"] = "none"
+    out["stream"] = False
+    return out
+
+
+def openai_to_anthropic(data, model):
+    """OpenAI Chat response -> Anthropic Messages response (pure)."""
+    data = data if isinstance(data, dict) else {}
+    choices = data.get("choices") or [{}]
+    choice = choices[0] if isinstance(choices[0], dict) else {}
+    msg = choice.get("message") or {}
+    content = []
+    text = msg.get("content")
+    if isinstance(text, list):
+        text = "".join(str(x.get("text", "")) for x in text
+                       if isinstance(x, dict) and x.get("type") == "text")
+    if text:
+        content.append({"type": "text", "text": str(text)})
+    for tc in (msg.get("tool_calls") or []):
+        fn = tc.get("function") or {}
+        try:
+            args = json.loads(fn.get("arguments") or "{}")
+        except Exception:
+            args = {"_raw": fn.get("arguments") or ""}
+        content.append({"type": "tool_use", "id": tc.get("id") or "toolu_1",
+                        "name": fn.get("name", ""), "input": args})
+    finish = choice.get("finish_reason") or "stop"
+    if msg.get("tool_calls"):
+        stop_reason = "tool_use"
+    elif finish == "length":
+        stop_reason = "max_tokens"
+    elif finish == "tool_calls":
+        stop_reason = "tool_use"
+    else:
+        stop_reason = "end_turn"
+    usage = data.get("usage") or {}
+    return {
+        "id": data.get("id") or "msg_minimalrouter",
+        "type": "message",
+        "role": "assistant",
+        "model": model,
+        "content": content,
+        "stop_reason": stop_reason,
+        "stop_sequence": None,
+        "usage": {"input_tokens": int(usage.get("prompt_tokens") or 0),
+                  "output_tokens": int(usage.get("completion_tokens") or 0)},
+    }
+
+
+def anthropic_error(message, typ="api_error"):
+    return {"type": "error", "error": {"type": typ, "message": str(message)}}
+
+
+def _messages_chain(body, model):
+    """Run the row chain non-stream and return (status, OpenAI-shaped data, err)."""
+    bm = BY_MODEL(enabled_rows())
+    chain = order_chain(bm.get(model)) if bm.get(model) else None
+    if not chain:
+        return 404, None, "model '%s' not in pool" % model
+    last_err = None
+    for row in chain:
+        st = ROW_STATE.get(row["name"], {})
+        ra = float(st.get("retry_at") or 0)
+        wait = ra - time.time()
+        if wait > 0:
+            time.sleep(min(wait, MAX_RETRY_WAIT))
+        sem = _row_semaphore(row)
+        if sem is not None and not sem.acquire(timeout=ROW_SLOT_TIMEOUT):
+            last_err = "%s: row slot busy" % row["name"]
+            continue
+        try:
+            t0 = time.time()
+            if row.get("api_mode") == "responses":
+                text = chat_from_responses(row, body)
+                data = {"choices": [{"message": {"role": "assistant",
+                                                "content": text},
+                                     "finish_reason": "stop"}], "usage": {}}
+            elif row.get("api_mode") == "omnirush":
+                oc = chat_from_omnirush(row, body)
+                data = {"choices": [{"message": {"role": "assistant",
+                                                "content": oc.get("text", "")},
+                                     "finish_reason": "stop"}],
+                        "usage": oc.get("usage") or {}}
+            elif row.get("api_mode") == "zcode":
+                zc = chat_from_zcode(row, body)
+                data = {"choices": [{"message": {"role": "assistant",
+                                                "content": zc.get("text", "")},
+                                     "finish_reason": "stop"}], "usage": {}}
+            else:
+                resp = upstream(row["base"], row["key"],
+                                "/v1/chat/completions", body, row=row)
+                data = json.loads(resp.read() or b"{}")
+            cms = (time.time() - t0) * 1000
+            usage = data.get("usage") or {}
+            record_state(row["name"], "ok", cms,
+                         tokens=int(usage.get("completion_tokens") or 0))
+            note_req(True, int(usage.get("completion_tokens") or 0), cms)
+            return 200, data, None
+        except Exception as e:
+            detail = str(e)
+            fh = None
+            if isinstance(e, urllib.error.HTTPError):
+                fh = e.headers
+                try:
+                    snippet = e.read(300).decode("utf-8", "replace").strip()
+                    if snippet:
+                        detail += " | " + snippet[:200]
+                except Exception:
+                    pass
+            prev = ROW_STATE.get(row["name"], {})
+            streak = int(prev.get("fail_streak", 0) or 0) + 1
+            ra_hdr = fh.get("Retry-After") if fh is not None else None
+            delay = backoff_delay(streak, parse_retry_after(ra_hdr))
+            record_state(row["name"], "fail", (time.time() - t0) * 1000,
+                         error=detail[:200], quota=quota_from_headers(fh),
+                         retry_at=time.time() + delay,
+                         retry_source=("retry-after" if ra_hdr is not None
+                                       else "backoff"))
+            note_req(False, 0, 0)
+            last_err = "%s: %s" % (row["name"], detail)
+        finally:
+            if sem is not None:
+                sem.release()
+    return 502, None, last_err
+
+
+def _anthropic_sse(handler, anth):
+    """Buffer the translated message and emit Anthropic SSE events."""
+    handler.send_response(200)
+    handler.send_header("Content-Type", "text/event-stream")
+    handler.send_header("Cache-Control", "no-cache")
+    handler.send_header("Transfer-Encoding", "chunked")
+    handler.end_headers()
+
+    def ev(name, obj):
+        handler._chunk(("event: %s\ndata: %s\n\n"
+                        % (name, json.dumps(obj))).encode())
+
+    start = dict(anth)
+    start["content"] = []
+    ev("message_start", {"type": "message_start", "message": start})
+    for i, block in enumerate(anth.get("content") or []):
+        if block.get("type") == "tool_use":
+            ev("content_block_start", {"type": "content_block_start", "index": i,
+                                        "content_block": {"type": "tool_use",
+                                                          "id": block.get("id", ""),
+                                                          "name": block.get("name", ""),
+                                                          "input": {}}})
+            ev("content_block_delta", {"type": "content_block_delta", "index": i,
+                                        "delta": {"type": "input_json_delta",
+                                                  "partial_json": json.dumps(block.get("input") or {})}})
+        else:
+            ev("content_block_start", {"type": "content_block_start", "index": i,
+                                        "content_block": {"type": "text", "text": ""}})
+            ev("content_block_delta", {"type": "content_block_delta", "index": i,
+                                        "delta": {"type": "text_delta",
+                                                  "text": block.get("text", "")}})
+        ev("content_block_stop", {"type": "content_block_stop", "index": i})
+    ev("message_delta", {"type": "message_delta",
+                          "delta": {"stop_reason": anth.get("stop_reason"),
+                                    "stop_sequence": None},
+                          "usage": anth.get("usage") or {}})
+    ev("message_stop", {"type": "message_stop"})
+    handler._chunk(b"")
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "minimalrouter/" + __version__
 
@@ -1679,6 +1950,17 @@ class Handler(BaseHTTPRequestHandler):
         except json.JSONDecodeError as e:
             return self._send(400, {"error": "bad json: %s" % e})
 
+        if p in ("/v1/messages", "/messages"):
+            model = body.get("model", "")
+            oa = anthropic_to_openai(body)
+            status, data, err = _messages_chain(oa, model)
+            if status != 200:
+                typ = "not_found_error" if status == 404 else "api_error"
+                return self._send(status, anthropic_error(err or "all rows failed", typ))
+            anth = openai_to_anthropic(data, model)
+            if body.get("stream"):
+                return _anthropic_sse(self, anth)
+            return self._send(200, anth)
         if p == "/api/refresh":
             pid = body.get("provider", "")
             ids = [pid] if pid else sorted(read_oauth_profiles())
@@ -2867,7 +3149,7 @@ No server authentication. Localhost only. Three connection classes, one engine p
   KEYLESS - an API row with no key; the upstream serves it with no Authorization header.
 Class is derived from the row's real shape, never from a label; a row cannot claim a class.
 The dashboard and GET /api/state show the class of every row. Client format is OpenAI Chat
-Completions.
+Completions; Claude Code can use the pool through POST /v1/messages (Anthropic shim).
 
 Dashboard: the installer bundles the Mission Control board (Textual, in a dedicated
 venv) so it works out of the box. If that setup is not possible it falls back to

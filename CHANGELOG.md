@@ -12,6 +12,31 @@ OpenAI-compatible request/response shape, the endpoint, or the install command);
 for backward-compatible features (new providers, classes, dashboard capability, CLI verbs);
 **PATCH** for fixes only.
 
+## [1.9.0] — 2026-11-26
+
+### Added
+
+- **Anthropic `/v1/messages` shim.** Claude Code can use the same pool. The shim
+  translates the Anthropic request (system blocks, text/image/tool_use/tool_result
+  content, tools and tool_choice) to OpenAI Chat, runs the same row chain, and
+  translates the response back (`tool_use` blocks, `stop_reason`, usage). Streaming
+  clients get Anthropic SSE events (`message_start`, `content_block_*`,
+  `message_delta`, `message_stop`). It is a protocol adapter, never a second router.
+- **Native Windows installer.** `install.ps1` mirrors `install.sh`: fetch, seed rows,
+  build the Textual venv, ship `bridges/zcode-identity.json`, write a `.cmd`
+  launcher. CI runs it on `windows-latest` with a clean home.
+- **systemd user unit.** `install.sh --systemd` writes
+  `~/.config/systemd/user/minimalrouter.service` and reloads; it never enables the
+  service. `docs/systemd.md` documents enable/status/logs/removal.
+- **Provider-grouped dashboard.** Press `i` to toggle a grouped view: rows sort by
+  provider and each group gets a header line above its first row. The flat view and
+  every existing key remain unchanged.
+
+### Changed
+
+- README roadmap now carries only the ruled 2.0.0 presets and 2.5+ agent;
+  `/v1/messages`, systemd and native Windows are shipped.
+
 ## [1.8.0] — 2026-11-26
 
 ### Added

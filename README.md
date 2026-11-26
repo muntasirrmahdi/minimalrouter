@@ -20,7 +20,7 @@ of every row in your terminal.
 | **Rate-limit discipline** | A 429 row records its `Retry-After` clock (both header forms) and re-enters the chain when it expires, instead of staying deferred forever. A bare 429 runs a jittered `0.5 * 2^n` curve capped at 8 s. Per-row concurrency defaults to 1 (0 = unlimited), and generic OAuth refresh is single-flight so a burst cannot replay a rotating token. |
 | **A real terminal dashboard** | Mission Control board out of the box: centered btop-class frame, block-pixel wordmark, 8 pixel-digit stat tiles (rows / models / serving / down / req-per-min / tokens-per-s / error % / uptime) that reconcile: serving + down + unprobed == rows, so no row is ever invisible, a dense table with provider, class, context window, latency, TPS, OK% and a live status vocabulary (OK/COOLDOWN/STALE/DEAD/GATED/EMPTY), multi-row marks with batch test/delete/park, a selected-row panel with TPS+CW gauges, a scrollable event tail, 14 themes (incl. Nous and Claude) + density + motion toggles. The board picks a layout tier from the live terminal height (wordmark and the detail panels scale down on short screens instead of clipping), pins every panel so the route table can never be starved, and `?` opens the full key reference as an overlay; the installer bundles it (Textual, in a dedicated venv), and if that setup isn't possible the core falls back to a stdlib curses board. |
 | **One-word provider connects** | A name-to-endpoint registry makes a known tool a single word: `oauth add`, type the name, approve in the browser. Unknown tools stay addable by pasting a base URL once. |
-| **Native translators** | Providers that need a transformed request (Responses-only gateways, Anthropic-Messages plan lanes) route through sibling transports in the same file — endpoints and identity assets are data, not code. |
+| **Native translators** | Providers that need a transformed request (Responses-only gateways, Anthropic-Messages plan lanes) route through sibling transports in the same file — endpoints and identity assets are data, not code. A `/v1/messages` shim lets Claude Code use the same pool. |
 | **Runs anywhere Python runs** | Linux, macOS, WSL2. One file, Python 3.8+, no database, no web UI, nothing to configure beyond a JSON file of rows. |
 
 ## Quick Install
@@ -46,9 +46,21 @@ minimalrouter        # server + terminal dashboard, one process
 
 ### Windows
 
-Use WSL2 and the one-liner above. The native Windows dashboard is not supported yet
-(the TUI needs curses); server mode and `stop` are written portably, and a native
-installer is a possible future contribution — see [CONTRIBUTING.md](CONTRIBUTING.md).
+Native Windows is supported by `install.ps1` (PowerShell). It installs the engine,
+the Textual board in a dedicated venv, the bridge asset, and a `.cmd` launcher:
+
+```powershell
+irm https://raw.githubusercontent.com/muntasirrmahdi/minimalrouter/main/install.ps1 | iex
+```
+
+From a checkout:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install.ps1
+```
+
+Pass `-Curses` to skip the dashboard venv. WSL2 remains the smoothest terminal
+experience, but the native path is tested in CI on `windows-latest`.
 
 ### From a checkout
 
@@ -175,7 +187,7 @@ marked rows (parked rows stay on the board, routing skips them), `y` copies the
 selected row's MODEL id untruncated (`Y` the row name, `u` the base URL) — the
 table clips long ids to fit the column, and drag-selecting one would copy the
 ellipsis, which pastes as a broken value, `p`/`P` theme next/prev, `v` density,
-`m` motion on/off, `?` help, `q` quit (stops the server).
+`m` motion on/off, `i` group rows by provider, `?` help, `q` quit (stops the server).
 
 The curses fallback keeps: Up/Down, `t`, `a`, `d`, `r`, `q`, Esc.
 
@@ -192,6 +204,7 @@ API key from your own machine. Provider logins are separate (OAuth profiles).
 | Method | Path | Purpose |
 |---|---|---|
 | POST | `/v1/chat/completions` | OpenAI-format chat, streaming and non-streaming |
+| POST | `/v1/messages` | Anthropic Messages shim for Claude Code: request/response + SSE translation, tool_use/tool_result blocks; routes through the same row chain |
 | GET | `/v1/models` | every pooled model id |
 | GET | `/health` | rows, models, classes, disabled count, serving/blocked, port |
 | GET | `/api/state` | rows + per-row state (provider, cw, tps, ok%, disabled) + pool stats (req/min, tok/s, err%, uptime) + probe progress + version (what the dashboard reads) |
@@ -215,6 +228,7 @@ the vendor's actual reason (and its suggested fix) survives the router boundary.
 | [docs/architecture.md](docs/architecture.md) | Engine map, request lifecycle, class system, translators, OAuth layer, lifecycle commands |
 | [docs/providers.md](docs/providers.md) | Rows, fallback, registry, device-flow profiles, per-provider status and the traps that actually bite |
 | [docs/development.md](docs/development.md) | Live-vs-repo workflow, offline tests, the live verification battery, release checklist |
+| [docs/systemd.md](docs/systemd.md) | Optional systemd user unit (`install.sh --systemd`) |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Ground rules, code style, adding a provider, PR process |
 | [SECURITY.md](SECURITY.md) | Trust model, scope, reporting, deployment hardening |
 
@@ -282,8 +296,9 @@ rm -rf ~/.minimalrouter
 
 ## Roadmap
 
-- Anthropic `/v1/messages` shim so Claude Code can use the pool
-- a systemd user unit for always-on use
+- **2.0.0:** OAuth presets 6 → 15, and presets auto-materialise a profile (a MAJOR
+  contract change, not a patch). Each preset must be a real device flow, live-probed.
+- **2.5+:** an in-box agent that can fix terminal problems, after its own spec.
 
 ## Contributing
 

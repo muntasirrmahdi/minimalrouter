@@ -102,3 +102,31 @@ jobs:
           asyncio.run(go())
           print("textual board headless smoke OK")
           PY
+
+  install-smoke-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Native Windows install (clean home)
+        shell: powershell
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP "mr-home"
+          New-Item -ItemType Directory -Force -Path $root | Out-Null
+          $env:USERPROFILE = $root
+          $env:HOME = $root
+          powershell -ExecutionPolicy Bypass -File .\install.ps1
+          & "$root\.local\bin\minimalrouter.cmd" -v
+          if ($LASTEXITCODE -ne 0) { throw "launcher exited $LASTEXITCODE" }
+          $bridge = Join-Path $root ".minimalrouter\bridges\zcode-identity.json"
+          if (-not (Test-Path $bridge)) { throw "bridge asset missing" }
+          $len = (Get-Item $bridge).Length
+          if ($len -ne 3487) { throw "bridge size $len != 3487" }
+          $engine = Join-Path $root ".minimalrouter\minimalrouter.py"
+          python $engine -v
+          if ($LASTEXITCODE -ne 0) { throw "engine exited $LASTEXITCODE" }
+          python $engine doctor --json > "$root\doctor.json" 2>&1
+          if (-not (Test-Path "$root\doctor.json")) { throw "doctor produced no JSON" }
+          Write-Host "native Windows install smoke OK"

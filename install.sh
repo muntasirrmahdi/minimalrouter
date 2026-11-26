@@ -6,7 +6,7 @@
 # set up (offline / no pip), it falls back to the built-in curses board.
 # Pass --curses to skip the dashboard venv entirely (zero-dep mode).
 # Usage:  curl -fsSL https://raw.githubusercontent.com/muntasirrmahdi/minimalrouter/main/install.sh | sh
-# Or from a checkout:  sh install.sh [--curses]
+# Or from a checkout:  sh install.sh [--curses] [--systemd]
 
 set -eu
 
@@ -19,10 +19,12 @@ BIN="$HOME/.local/bin"
 say() { printf '%s\n' "$*"; }
 
 WITH_TEXTUAL=1
+WITH_SYSTEMD=0
 for arg in "$@"; do
     case "$arg" in
         --curses) WITH_TEXTUAL=0 ;;
         --textual) WITH_TEXTUAL=1 ;;
+        --systemd) WITH_SYSTEMD=1 ;;
         *) say "note: ignoring unknown option '$arg'" ;;
     esac
 done
@@ -107,6 +109,38 @@ else
     printf '#!/bin/sh\nexec python3 "%s/minimalrouter.py" "$@"\n' "$DEST" > "$BIN/minimalrouter"
 fi
 chmod +x "$BIN/minimalrouter"
+
+# ---- optional systemd user unit -------------------------------------------
+# A user unit fires at login, not at boot; that is the honest target for a
+# personal localhost router. The installer writes and reloads the unit but
+# NEVER enables it: starting an always-on service is the user's decision.
+if [ "$WITH_SYSTEMD" = "1" ]; then
+    UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+    mkdir -p "$UNIT_DIR"
+    cat > "$UNIT_DIR/minimalrouter.service" <<UNIT
+[Unit]
+Description=MinimalRouter — localhost OpenAI-compatible pool
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=$BIN/minimalrouter serve
+Environment=MINIMALROUTER_PORT=8790
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+UNIT
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl --user daemon-reload >/dev/null 2>&1 || true
+        say "systemd: user unit written to $UNIT_DIR/minimalrouter.service"
+        say "systemd: enable it with: systemctl --user enable --now minimalrouter"
+    else
+        say "systemd: unit written to $UNIT_DIR/minimalrouter.service (systemctl absent)"
+    fi
+fi
 
 # ---- report ----------------------------------------------------------------
 say ""
