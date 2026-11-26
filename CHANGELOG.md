@@ -12,6 +12,16 @@ OpenAI-compatible request/response shape, the endpoint, or the install command);
 for backward-compatible features (new providers, classes, dashboard capability, CLI verbs);
 **PATCH** for fixes only.
 
+## [1.9.1] — 2026-11-26
+
+### Fixed
+
+- **The bridge-asset gate is cross-platform.** The Windows installer's Git
+  checkout converts line endings (CRLF), so the file is 3494 bytes there while
+  the Unix copy is 3487. Both CI jobs now assert the semantic contract instead:
+  the parsed JSON's `stablePrefix` is exactly 3014 characters. The asset itself
+  was never the problem; the byte-size gate was.
+
 ## [1.9.0] — 2026-11-26
 
 ### Added

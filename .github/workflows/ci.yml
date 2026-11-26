@@ -57,9 +57,9 @@ jobs:
           rows = json.load(open(p))
           assert rows[0]['name'] == 'kilocode-free', 'keyless row must be first'
           assert not rows[0].get('key') and not rows[0].get('key_env'), 'first row must be keyless'
-          asset = open(os.path.expanduser('~/.minimalrouter/bridges/zcode-identity.json'), 'rb').read()
-          assert len(asset) == 3487, 'identity asset size drift'
-          print('install smoke OK: keyless-first seed + identity asset shipped')
+          ident = json.load(open(os.path.expanduser('~/.minimalrouter/bridges/zcode-identity.json')))
+          assert len(ident['stablePrefix']) == 3014, 'identity stablePrefix drift'
+          print('install smoke OK: keyless-first seed + identity stablePrefix shipped')
           "
       - name: Zero-dep install (--curses) falls back to the curses board
         run: |
@@ -122,8 +122,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "launcher exited $LASTEXITCODE" }
           $bridge = Join-Path $root ".minimalrouter\bridges\zcode-identity.json"
           if (-not (Test-Path $bridge)) { throw "bridge asset missing" }
-          $len = (Get-Item $bridge).Length
-          if ($len -ne 3487) { throw "bridge size $len != 3487" }
+          $ident = Get-Content $bridge -Raw | ConvertFrom-Json
+          if ($ident.stablePrefix.Length -ne 3014) { throw "stablePrefix length $($ident.stablePrefix.Length) != 3014" }
           $engine = Join-Path $root ".minimalrouter\minimalrouter.py"
           python $engine -v
           if ($LASTEXITCODE -ne 0) { throw "engine exited $LASTEXITCODE" }
