@@ -86,7 +86,7 @@ except ImportError:  # platform without curses -> main() degrades to serve
 # CHANGELOG and the git tag all derive from this one line. MAJOR.MINOR.PATCH per
 # semver.org: MAJOR on a breaking client contract, MINOR on backward-compatible
 # features, PATCH on fixes.
-__version__ = "1.9.1"
+__version__ = "1.9.2"
 
 HOME = os.path.expanduser("~")
 MR_HOME = os.path.join(HOME, ".minimalrouter")
@@ -95,6 +95,7 @@ ENV_PATH = os.path.join(HOME, ".hermes", ".env")
 LOG_PATH = os.path.join(MR_HOME, "minimalrouter.log")
 PID_PATH = os.path.join(MR_HOME, "minimalrouter.pid")
 HOST = "127.0.0.1"
+IS_WINDOWS = os.name == "nt"
 PORT = int(os.environ.get("MINIMALROUTER_PORT", "8790"))
 TIMEOUT = 90
 PROBE_TIMEOUT = 30
@@ -3527,10 +3528,13 @@ def _doctor_cov_table(cov):
 
 
 def _launcher_path():
-    return os.path.join(HOME, ".local", "bin", "minimalrouter")
+    name = "minimalrouter.cmd" if IS_WINDOWS else "minimalrouter"
+    return os.path.join(HOME, ".local", "bin", name)
 
 
 def _launcher_venv_python():
+    if IS_WINDOWS:
+        return os.path.join(MR_HOME, ".venv", "Scripts", "python.exe")
     return os.path.join(MR_HOME, ".venv", "bin", "python3")
 
 
@@ -3767,9 +3771,11 @@ def doctor(fix=False, as_json=False, coverage=False):
         except OSError as e:
             lt = ""
             add("FAIL", "launcher", "unreadable: %s" % e, "re-run install.sh")
-        mv = re.search(r'^exec "([^"]+)" "([^"]+)/minimalrouter\.py"', lt, re.M)
+        mv = re.search(r'"([^"]+)"\s+"([^"]+minimalrouter\.py)"', lt, re.M)
         ms = re.search(r'^exec (python3) "([^"]+)/minimalrouter\.py"', lt, re.M)
-        if not (mv or ms):
+        mw = re.search(r'^(?:@echo off\s*)?python\s+"([^"]+minimalrouter\.py)"',
+                       lt, re.M)
+        if not (mv or ms or mw):
             add("FAIL", "launcher", "unrecognised launcher text",
                 "re-run install.sh — it rewrites this file")
         elif mv:
@@ -3798,7 +3804,9 @@ def doctor(fix=False, as_json=False, coverage=False):
                 except Exception as e:
                     add("WARN", "fix", "launcher not repinned: %s" % e,
                         "re-run install.sh", kind="repair")
-        if os.access(binp, os.X_OK) and (mv or ms):
+        if IS_WINDOWS:
+            add("OK", "launcher exec bit", "Windows .cmd — no POSIX exec bit")
+        elif os.access(binp, os.X_OK) and (mv or ms):
             add("OK", "launcher exec bit", "executable")
         elif (mv or ms):
             add("WARN", "launcher exec bit", "not executable",

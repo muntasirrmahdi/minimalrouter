@@ -12,6 +12,18 @@ OpenAI-compatible request/response shape, the endpoint, or the install command);
 for backward-compatible features (new providers, classes, dashboard capability, CLI verbs);
 **PATCH** for fixes only.
 
+## [1.9.2] — 2026-11-26
+
+### Fixed
+
+- **Doctor knows the Windows launcher.** `_launcher_path()` resolves
+  `~/.local/bin/minimalrouter.cmd` on Windows, the launcher parser accepts quoted
+  `.cmd`/`python` forms, and the POSIX exec-bit check is skipped there with an OK
+  line. The native install was healthy; doctor was reading a Unix-only path.
+- **Windows CI exits on its own proof.** The job's last native command (doctor)
+  returned 1 for Windows warnings and leaked that status after the smoke passed.
+  An explicit `exit 0` closes the job on the real assertions.
+
 ## [1.9.1] — 2026-11-26
 
 ### Fixed

@@ -130,3 +130,4 @@ jobs:
           python $engine doctor --json > "$root\doctor.json" 2>&1
           if (-not (Test-Path "$root\doctor.json")) { throw "doctor produced no JSON" }
           Write-Host "native Windows install smoke OK"
+          exit 0
