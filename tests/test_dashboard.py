@@ -185,6 +185,24 @@ class TestDashboardApp(unittest.TestCase):
         asyncio.run(go())
 
 
+    def test_timers_are_flat_over_an_idle_window(self):
+        d = self.d
+
+        async def go():
+            app = d.MissionControl(port=0)
+            async with app.run_test(size=(120, 40)) as pilot:
+                await pilot.pause(0.8)
+                t1 = len(getattr(app, "_timers", []))
+                await pilot.pause(2.0)
+                t2 = len(getattr(app, "_timers", []))
+                self.assertEqual(t1, 2, "expected exactly poll + anim timers")
+                self.assertEqual(t2, 2, "idle window stacked timers: %d -> %d"
+                                 % (t1, t2))
+                await pilot.press("q")
+                await pilot.pause(0.2)
+
+        asyncio.run(go())
+
     def test_grouped_toggle_sorts_by_provider(self):
         d = self.d
 

@@ -86,7 +86,7 @@ except ImportError:  # platform without curses -> main() degrades to serve
 # CHANGELOG and the git tag all derive from this one line. MAJOR.MINOR.PATCH per
 # semver.org: MAJOR on a breaking client contract, MINOR on backward-compatible
 # features, PATCH on fixes.
-__version__ = "1.9.2"
+__version__ = "1.9.3"
 
 HOME = os.path.expanduser("~")
 MR_HOME = os.path.join(HOME, ".minimalrouter")
@@ -127,6 +127,11 @@ PROBE_INTERVAL = max(0, int(os.environ.get("MINIMALROUTER_PROBE_INTERVAL", "600"
 PROBE_LOCK = Lock()
 PROBE_PROGRESS = {"done": 0, "total": 0, "active": False}
 PROBE_WORKERS = 4
+
+# 1.9.x patch-class resource limits. The defaults are deliberate: 64 in-flight
+# request threads is far more than a localhost router needs, and a 5 MB log
+# cap keeps a 24/7 install from growing without bound.
+MAX_WORKERS = int(os.environ.get("MINIMALROUTER_MAX_WORKERS", "64"))
 
 # v1.8.0 runtime discipline. These are the knobs the pool needs so a burst of
 # concurrent clients cannot hammer one free tier N ways at once, and so a 429
@@ -429,20 +434,24 @@ def read_rows():
     return rows
 
 
-def oauth_access_token(provider):
+def oauth_access_token(provider, auth=None, profiles=None):
     """Return an access token and rotate it when a profile supplies refresh_url.
 
     The generic path is single-flight: two concurrent 401s on the same profile
     must produce exactly one vendor refresh, not a replay that revokes the
     session. The omnirush translator keeps its own rotating-token lock.
+    auth/profiles are REQUEST-SCOPED snapshots: oauth_rows() passes one pair to
+    every profile instead of re-reading both files N+1 times. Cross-request
+    freshness is unchanged — the top-level default still reads on each call.
     """
-    auth = read_oauth()
+    auth = read_oauth() if auth is None else auth
+    profiles = read_oauth_profiles() if profiles is None else profiles
     rec = auth.get(provider) or {}
     token = rec.get("access_token", "")
     expires = float(rec.get("expires_at", 0) or 0)
     if token and (not expires or expires > time.time() + 60):
         return token
-    spec = read_oauth_profiles().get(provider, {})
+    spec = profiles.get(provider, {})
     if spec.get("api_mode") == "omnirush":
         return omnirush_access_token(provider)
     ok, msg, new_token = _oauth_refresh_generic(provider, force=False)
@@ -458,11 +467,17 @@ def token_live(rec):
     return exp <= 0 or exp > time.time()
 
 
-def oauth_rows():
+def oauth_rows(auth=None, profiles=None):
     rows = []
-    auth = read_oauth()
-    for provider, spec in read_oauth_profiles().items():
-        token = oauth_access_token(provider)
+    auth = read_oauth() if auth is None else auth
+    profiles = read_oauth_profiles() if profiles is None else profiles
+    for provider, spec in profiles.items():
+        token = oauth_access_token(provider, auth=auth, profiles=profiles)
+        # omnirush's refresh can rotate gateway_url; that flow keeps its own
+        # lock and is the only class that needs the post-refresh record.
+        rec = (read_oauth().get(provider) or {}
+               if spec.get("api_mode") == "omnirush"
+               else (auth.get(provider) or {}))
         dis = bool(spec.get("disabled"))
         for model in spec.get("models", []):
             if isinstance(model, str):
@@ -476,9 +491,9 @@ def oauth_rows():
                          "aliases": aliases, "key": token,
                          "oauth_provider": provider,
                          "api_mode": spec.get("api_mode", "chat_completions"),
-                         "gateway_url": (auth.get(provider) or {}).get("gateway_url", ""),
+                         "gateway_url": rec.get("gateway_url", ""),
                          "chat_path": spec.get("chat_path", ""),
-                         "org_id": (auth.get(provider) or {}).get("org_id", ""),
+                         "org_id": rec.get("org_id", ""),
                          "oauth_label": spec.get("label", provider),
                          "disabled": dis})
     return rows
@@ -487,7 +502,9 @@ def oauth_rows():
 def all_rows():
     """Every row including disabled ones — the dashboard/state surface. Routing
     uses enabled_rows(); a disabled row can never serve a client request."""
-    return read_rows() + oauth_rows()
+    auth = read_oauth()
+    profiles = read_oauth_profiles()
+    return read_rows() + oauth_rows(auth=auth, profiles=profiles)
 
 
 def enabled_rows():
@@ -694,9 +711,16 @@ def upstream(base, key, path, payload=None, timeout=None, row=None):
     if data is not None:
         req.add_header("Content-Type", "application/json")
     if key:
-        for hk, hv in oauth_headers(provider, key, row.get("org_id", ""),
-                                    row.get("user_agent", "")).items():
-            req.add_header(hk, hv)
+        if provider:
+            for hk, hv in oauth_headers(provider, key, row.get("org_id", ""),
+                                        row.get("user_agent", "")).items():
+                req.add_header(hk, hv)
+        else:
+            # An API row needs no profile lookup: this was the second
+            # read_oauth_profiles() on every API request.
+            req.add_header("Authorization", "Bearer " + key)
+            if row.get("user_agent"):
+                req.add_header("User-Agent", row["user_agent"])
     return urllib.request.urlopen(req, timeout=timeout)
 
 
@@ -3112,11 +3136,42 @@ def stop_server():
 
 
 def run_server():
-    ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()
+    _Srv((HOST, PORT), Handler).serve_forever()
 
 
 class _Srv(ThreadingHTTPServer):
-    pass
+    """A 128-deep accept backlog plus a bounded worker pool.
+
+    The default ThreadingHTTPServer backlog is 5; a measured 100-concurrent
+    burst produced 19 ConnectionResetError while the server stayed alive.
+    Backlog 128 turned that into 100/100. The semaphore caps live request
+    threads at MAX_WORKERS (64 by default) so a 1,000-request burst queues in
+    the OS backlog instead of spawning 1,000 Python threads.
+    """
+    request_queue_size = 128
+    daemon_threads = True
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self._worker_slots = (Semaphore(MAX_WORKERS)
+                              if MAX_WORKERS > 0 else None)
+
+    def process_request(self, request, client_address):
+        if self._worker_slots is not None:
+            self._worker_slots.acquire()
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            if self._worker_slots is not None:
+                self._worker_slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            if self._worker_slots is not None:
+                self._worker_slots.release()
 
 
 def usage():

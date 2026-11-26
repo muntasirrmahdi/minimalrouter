@@ -20,6 +20,7 @@ import types
 import unittest
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
@@ -3211,3 +3212,157 @@ class TestUpdateCommandV160(unittest.TestCase):
         self.assertEqual(mr.parse_version('__version__ = "1.2.3"'), (1, 2, 3))
         self.assertIsNone(mr.parse_version("no version here"))
         self.assertIsNone(mr.parse_version('__version__ = "1.2"' ))
+
+
+class TestPatchClassV193194(unittest.TestCase):
+    """1.9.3/1.9.4 patch-class limits: backlog, OAuth snapshot, catalog,
+    log rotation. Measured defects, not speculative optimizations."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.home = os.path.join(self.tmp, ".minimalrouter")
+        os.makedirs(self.home)
+        self.saved = {a: getattr(mr, a) for a in
+                      ("MR_HOME", "ROWS_PATH", "OAUTH_PATH", "OAUTH_PROFILES_PATH",
+                       "LOG_PATH", "PID_PATH", "PORT", "HOME", "ENV",
+                       "ROW_STATE", "REQLOG")}
+        mr.MR_HOME = self.home
+        mr.ROWS_PATH = os.path.join(self.home, "rows.json")
+        mr.OAUTH_PATH = os.path.join(self.home, "oauth.json")
+        mr.OAUTH_PROFILES_PATH = os.path.join(self.home, "oauth-providers.json")
+        mr.LOG_PATH = os.path.join(self.home, "minimalrouter.log")
+        mr.PID_PATH = os.path.join(self.home, "minimalrouter.pid")
+        mr.HOME = self.tmp
+        mr.ENV = {}
+        mr.ROW_STATE = {}
+        mr.REQLOG = []
+        self._servers = []
+
+    def tearDown(self):
+        for s in self._servers:
+            try:
+                s.shutdown()
+                s.server_close()
+            except Exception:
+                pass
+        for a, v in self.saved.items():
+            setattr(mr, a, v)
+
+    def _upstream(self, handler):
+        s = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        threading.Thread(target=s.serve_forever, daemon=True).start()
+        self._servers.append(s)
+        return "http://127.0.0.1:%d/v1" % s.server_address[1]
+
+    def _router(self):
+        import socket
+        sock = socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        sock.close()
+        mr.PORT = port
+        srv = mr._Srv(("127.0.0.1", port), mr.Handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self._servers.append(srv)
+        time.sleep(0.25)
+        return "http://127.0.0.1:%d" % port, srv
+
+    def test_backlog_and_worker_cap_survive_a_100_burst(self):
+        class H(BaseHTTPRequestHandler):
+            def do_POST(self):
+                time.sleep(0.05)
+                b = json.dumps({"choices": [{"message": {"content": "ok"},
+                                            "finish_reason": "stop"}],
+                               "usage": {"completion_tokens": 1}}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(b)))
+                self.end_headers()
+                self.wfile.write(b)
+
+            def log_message(self, *a):
+                pass
+
+        base_url = self._upstream(H)
+        json.dump([{"name": "burst", "base": base_url, "model": "m", "key": "k"}],
+                  open(mr.ROWS_PATH, "w"))
+        base, srv = self._router()
+        self.assertEqual(mr._Srv.request_queue_size, 128)
+        self.assertIsNotNone(srv._worker_slots)
+        body = json.dumps({"model": "m",
+                           "messages": [{"role": "user", "content": "hi"}]}).encode()
+
+        def one(_):
+            req = urllib.request.Request(base + "/v1/chat/completions", data=body,
+                                         method="POST",
+                                         headers={"Content-Type": "application/json"})
+            try:
+                with urllib.request.urlopen(req, timeout=20) as r:
+                    return r.status
+            except Exception as e:
+                return type(e).__name__
+
+        with ThreadPoolExecutor(max_workers=100) as ex:
+            results = list(ex.map(one, range(100)))
+        self.assertEqual(results, [200] * 100,
+                         "a 100-request burst must not reset: %s" % results[:5])
+        # client responses can arrive a hair before the handler thread releases
+        # its slot; poll briefly instead of calling a normal drain a leak.
+        drained = False
+        for _ in range(100):
+            if srv._worker_slots.acquire(blocking=False):
+                drained = True
+                break
+            time.sleep(0.02)
+        self.assertTrue(drained, "the worker cap leaked a slot")
+        srv._worker_slots.release()
+
+    def test_one_request_reads_oauth_files_once(self):
+        class H(BaseHTTPRequestHandler):
+            def do_POST(self):
+                b = json.dumps({"choices": [{"message": {"content": "ok"},
+                                            "finish_reason": "stop"}],
+                               "usage": {"completion_tokens": 1}}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(b)))
+                self.end_headers()
+                self.wfile.write(b)
+
+            def log_message(self, *a):
+                pass
+
+        base_url = self._upstream(H)
+        json.dump([{"name": "api", "base": base_url, "model": "m", "key": "k"}],
+                  open(mr.ROWS_PATH, "w"))
+        json.dump({"p%d" % i: {"label": "P%d" % i, "base_url": base_url,
+                               "models": ["om%d" % i]}
+                   for i in range(5)}, open(mr.OAUTH_PROFILES_PATH, "w"))
+        json.dump({"p%d" % i: {"access_token": "t",
+                               "expires_at": time.time() + 99999}
+                   for i in range(5)}, open(mr.OAUTH_PATH, "w"))
+        counts = {"rows": 0, "auth": 0, "profiles": 0}
+        old = (mr.read_rows, mr.read_oauth, mr.read_oauth_profiles)
+
+        def wrap(fn, key):
+            def f(*a, **kw):
+                counts[key] += 1
+                return fn(*a, **kw)
+            return f
+
+        mr.read_rows = wrap(old[0], "rows")
+        mr.read_oauth = wrap(old[1], "auth")
+        mr.read_oauth_profiles = wrap(old[2], "profiles")
+        try:
+            base, _ = self._router()
+            body = json.dumps({"model": "m",
+                               "messages": [{"role": "user", "content": "hi"}]}).encode()
+            req = urllib.request.Request(base + "/v1/chat/completions", data=body,
+                                         method="POST",
+                                         headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=10) as r:
+                self.assertEqual(r.status, 200)
+            self.assertEqual(counts, {"rows": 1, "auth": 1, "profiles": 1},
+                             "request-scoped OAuth snapshot regressed: %s" % counts)
+        finally:
+            mr.read_rows, mr.read_oauth, mr.read_oauth_profiles = old

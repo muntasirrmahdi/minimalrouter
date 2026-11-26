@@ -803,7 +803,7 @@ class MissionControl(App):
         if getattr(self, "_poll_timer", None) is None:
             self._poll_timer = self.set_interval(2.0, self.poll)
         if getattr(self, "_anim_timer", None) is None:
-            self._anim_timer = self.set_interval(0.25, self.tick_anim)
+            self._anim_timer = self.set_interval(0.5, self.tick_anim)
             if not self.motion:
                 self._anim_timer.pause()
         self.poll()

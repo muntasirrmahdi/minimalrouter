@@ -12,6 +12,24 @@ OpenAI-compatible request/response shape, the endpoint, or the install command);
 for backward-compatible features (new providers, classes, dashboard capability, CLI verbs);
 **PATCH** for fixes only.
 
+## [1.9.3] — 2026-11-26
+
+### Fixed
+
+- **Accept backlog and worker cap.** The default `ThreadingHTTPServer` backlog is 5;
+  a measured 100-concurrent burst produced 19 `ConnectionResetError`s while the
+  server stayed alive. `_Srv` now uses `request_queue_size = 128` and a bounded
+  worker pool (`MINIMALROUTER_MAX_WORKERS`, default 64; 0 = unlimited). Measured:
+  100/100 and 200/200 OK, peak 66 threads.
+- **Request-scoped OAuth snapshot.** `oauth_rows()` now reads `oauth.json` and
+  `oauth-providers.json` once per request and passes the snapshots to every
+  profile; API rows no longer trigger a profile lookup for headers. Measured one
+  request with 5 profiles: `read_oauth` 6 → 1, `read_oauth_profiles` 2 → 1;
+  25-profile p95 2.93 ms → 1.67 ms.
+- **Dashboard idle CPU.** The animation timer moved from 0.25 s to 0.5 s (the
+  wordmark still advances on alternate ticks). Measured 40-row motion-on idle CPU
+  3.3% → 2.3%; timers remain flat at 2.
+
 ## [1.9.2] — 2026-11-26
 
 ### Fixed
