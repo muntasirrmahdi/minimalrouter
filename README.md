@@ -158,7 +158,9 @@ format, which this router does not serve yet (404). The shim is on the roadmap.
 | `minimalrouter oauth <id>` | sign in: prints URL + code, waits for browser approval |
 | `minimalrouter oauth list` / `oauth rm <id>` | inspect / remove profiles |
 | `minimalrouter doctor` | self-diagnose the install: launcher, venv, rows, OAuth expiry, registry, ports, perms — never spends a token |
-| `minimalrouter doctor --fix` | apply the safe reversible repairs (stale pidfile, `chmod 600`) |
+| `minimalrouter doctor --fix` | apply the safe reversible repairs: stale pidfile, `chmod 600` on secret files, launcher exec bit, launcher pin to an existing dashboard venv, missing dashboard module, missing zcode bridge asset, registry device-flow fields |
+| `minimalrouter fix` | same as `doctor --fix` |
+| `minimalrouter doctor --coverage` | print the auto-fix coverage table (catalogue / observed / history-weighted) |
 | `minimalrouter update` | update the installed code to the newest release (`main`, the same ref the installer uses). Code only — rows, OAuth profiles, tokens, registry and board preferences are never touched. Version-parsed and AST-checked before anything is replaced, old files backed up, atomic writes |
 | `minimalrouter update --check` | report installed vs published without writing; `--force` re-installs the published file |
 | `minimalrouter -h` / `-v` | usage / version |
@@ -177,7 +179,9 @@ ellipsis, which pastes as a broken value, `p`/`P` theme next/prev, `v` density,
 The curses fallback keeps: Up/Down, `t`, `a`, `d`, `r`, `q`, Esc.
 
 Board trouble? Run `minimalrouter doctor` outside the board: it diagnoses the
-install, never spends a token, and `--fix` applies the safe repairs.
+install, never spends a token, and `minimalrouter fix` applies the safe repairs.
+`minimalrouter doctor --coverage` prints how much of the catalogue doctor can
+actually repair automatically.
 
 ## API
 

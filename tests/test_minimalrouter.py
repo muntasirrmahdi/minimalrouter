@@ -979,7 +979,7 @@ class TestDoctor(unittest.TestCase):
         self._saved = {}
         for attr in ("MR_HOME", "ROWS_PATH", "OAUTH_PATH", "OAUTH_PROFILES_PATH",
                      "PROVIDER_REGISTRY_PATH", "ZCODE_IDENTITY_PATH", "PID_PATH",
-                     "LOG_PATH", "ENV", "PORT", "HOME"):
+                     "LOG_PATH", "ENV", "PORT", "HOME", "DOCTOR_HISTORY_PATH"):
             self._saved[attr] = getattr(mr, attr)
         mr.MR_HOME = home
         mr.ROWS_PATH = os.path.join(home, "rows.json")
@@ -990,6 +990,7 @@ class TestDoctor(unittest.TestCase):
                                               "zcode-identity.json")
         mr.PID_PATH = os.path.join(home, "minimalrouter.pid")
         mr.LOG_PATH = os.path.join(home, "minimalrouter.log")
+        mr.DOCTOR_HISTORY_PATH = os.path.join(home, "doctor-history.jsonl")
         mr.ENV = {}
         mr.HOME = home
         mr.PORT = free_port()          # nothing listens -> the free branch
@@ -1609,20 +1610,277 @@ class TestDoctor(unittest.TestCase):
         saved = {a: getattr(mr, a) for a in
                  ("MR_HOME", "ROWS_PATH", "OAUTH_PATH", "OAUTH_PROFILES_PATH",
                   "PROVIDER_REGISTRY_PATH", "ZCODE_IDENTITY_PATH", "PID_PATH",
-                  "LOG_PATH", "PORT", "HOME", "ENV")}
+                  "LOG_PATH", "PORT", "HOME", "ENV", "DOCTOR_HISTORY_PATH")}
         mr.PORT = free_port()      # never touch a server Moon may be running
+        _hist_tmp = tempfile.TemporaryDirectory(prefix="mr-doctor-history-")
+        mr.DOCTOR_HISTORY_PATH = os.path.join(_hist_tmp.name,
+                                              "doctor-history.jsonl")
         buf = io.StringIO()
         try:
             with redirect_stdout(buf):
                 code = mr.doctor(fix=False, as_json=True)
             data = json.loads(buf.getvalue())
         finally:
+            _hist_tmp.cleanup()
             for a, v in saved.items():
                 setattr(mr, a, v)
         self.assertIn(code, (0, 1))
         self.assertTrue(data["checks"], "the real install produced no findings")
         for c in data["checks"]:
             self.assertIn(c["level"], ("OK", "WARN", "FAIL"))
+
+    # ---------------- v1.7.0: catalogue, coverage, repairs ----------------
+    def _diag(self, data):
+        return [c for c in data["checks"] if c.get("kind") == "check"]
+
+    def test_every_diagnostic_check_has_a_stable_id_and_category(self):
+        code, data = self.run_doctor()
+        for c in self._diag(data):
+            self.assertIn(c["id"], mr.DOCTOR_CATALOGUE,
+                          "%r has no catalogue id" % c["name"])
+            self.assertIn(c["category"], mr.DOCTOR_CATEGORY_LABELS,
+                          "%r has no category" % c["name"])
+
+    def test_catalogue_fixable_set_is_pinned(self):
+        """The coverage number is only honest while this set is deliberate."""
+        auto = {cid for cid, meta in mr.DOCTOR_CATALOGUE.items()
+                if meta.get("fixable")}
+        self.assertEqual(auto, {
+            "dashboard-module", "launcher-pin", "launcher-exec",
+            "zcode-bridge", "registry-fields", "pidfile", "perms",
+        })
+        self.assertEqual(len(mr.DOCTOR_CATALOGUE), 24)
+
+    def test_json_shape_carries_the_fixable_flag(self):
+        code, data = self.run_doctor()
+        self.assertIn("coverage", data)
+        for k in ("catalogue", "observed", "weighted", "by_category"):
+            self.assertIn(k, data["coverage"])
+        for c in data["checks"]:
+            for k in ("id", "category", "fixable", "auto_fixed", "kind"):
+                self.assertIn(k, c)
+            self.assertIsInstance(c["fixable"], bool)
+            self.assertIsInstance(c["auto_fixed"], bool)
+
+    def test_observed_coverage_counts_this_run_only(self):
+        """A perms finding is auto-fixable; a dead theme is not."""
+        self.healthy_install()
+        os.chmod(mr.ROWS_PATH, 0o644)
+        json.dump({"theme": "no-such-theme", "dense": False},
+                  open(os.path.join(mr.MR_HOME, "dashboard.json"), "w"))
+        code, data = self.run_doctor()
+        obs = data["coverage"]["observed"]
+        # The fake home always carries a PATH warning; perms + prefs are the
+        # two findings this test introduces.
+        self.assertEqual(obs["findings"], 3)
+        self.assertEqual(obs["auto_fixable"], 1)
+        self.assertEqual(obs["pct"], round(100.0 / 3.0, 1))
+
+    def test_history_is_private_bounded_and_weighted(self):
+        hist_path = mr.DOCTOR_HISTORY_PATH
+        for i in range(mr.DOCTOR_HISTORY_MAX + 25):
+            mr._doctor_history_append("1.7.0", [
+                {"id": "perms", "level": "WARN", "fixable": True},
+                {"id": "prefs", "level": "WARN", "fixable": False},
+            ])
+        with open(hist_path, encoding="utf-8") as f:
+            lines = [x for x in f.read().splitlines() if x.strip()]
+        self.assertEqual(len(lines), mr.DOCTOR_HISTORY_MAX)
+        blob = "\n".join(lines)
+        self.assertNotIn("detail", blob)
+        self.assertNotIn("/home", blob)
+        self.assertNotIn("rows.json", blob)
+        hist = mr._doctor_history_read()
+        self.assertEqual(len(hist), mr.DOCTOR_HISTORY_MAX)
+        w = mr._doctor_coverage([], hist)["weighted"]
+        self.assertEqual(w["runs"], mr.DOCTOR_HISTORY_MAX)
+        self.assertEqual(w["findings"], mr.DOCTOR_HISTORY_MAX * 2)
+        self.assertEqual(w["auto_fixable"], mr.DOCTOR_HISTORY_MAX)
+        self.assertEqual(w["pct"], 50.0)
+
+    def test_first_run_reports_weighted_coverage_from_its_own_history(self):
+        code, data = self.run_doctor()
+        w = data["coverage"]["weighted"]
+        obs = data["coverage"]["observed"]
+        self.assertIsNotNone(w)
+        self.assertEqual(w["runs"], 1)
+        self.assertEqual(w["findings"], obs["findings"])
+        self.assertEqual(w["auto_fixable"], obs["auto_fixable"])
+        self.assertEqual(w["pct"], obs["pct"])
+
+    def test_source_add_names_all_resolve_to_the_catalogue(self):
+        """A new check cannot ship without metadata, and metadata cannot rot."""
+        import ast as _ast
+        src = Path(mr.__file__).read_text(encoding="utf-8")
+        tree = _ast.parse(src)
+        fn = next(n for n in tree.body
+                  if isinstance(n, _ast.FunctionDef) and n.name == "doctor")
+        allowed = {
+            "fix", "fix applied",
+            "oauth:%s", "perms \u00b7 %s", "port %d",
+        }
+        for node in _ast.walk(fn):
+            if not (isinstance(node, _ast.Call)
+                    and isinstance(node.func, _ast.Name)
+                    and node.func.id == "add"):
+                continue
+            arg = node.args[1]
+            if isinstance(arg, _ast.Constant):
+                name = arg.value
+            elif isinstance(arg, _ast.BinOp) and isinstance(arg.left, _ast.Constant):
+                name = arg.left.value
+            else:
+                self.fail("doctor add() has a non-literal check name at line %d"
+                          % node.lineno)
+            if name in allowed:
+                continue
+            self.assertIn(mr._doctor_check_id(name), mr.DOCTOR_CATALOGUE,
+                          "add(%r) has no catalogue id" % name)
+
+    def test_repair_outcomes_do_not_inflate_coverage(self):
+        self.healthy_install()
+        os.chmod(mr.ROWS_PATH, 0o644)
+        code, data = self.run_doctor(fix=True)
+        repairs = [c for c in data["checks"] if c.get("kind") == "repair"]
+        self.assertTrue(repairs)
+        self.assertTrue(all(c["auto_fixed"] for c in repairs))
+        obs = data["coverage"]["observed"]
+        # PATH is the other standing WARN on a fake home; it is not auto-fixable.
+        self.assertEqual(obs["findings"], 2)
+        self.assertEqual(obs["auto_fixable"], 1)
+
+    def test_fix_restores_a_missing_dashboard_module(self):
+        dash = os.path.join(self.home, "minimalrouter_dashboard.py")
+        with mock.patch.object(mr, "_dash_sibling", return_value=dash):
+            code, data = self.run_doctor()
+            self.assertIn("dashboard module", self.names(data, "WARN"))
+            code2, data2 = self.run_doctor(fix=True)
+            self.assertTrue(os.path.exists(dash))
+            self.assertIn("dashboard module", self.names(data2, "WARN"),
+                          "the fix run must still report what it found")
+            self.assertIn("fix applied", self.names(data2, "OK"))
+            code3, data3 = self.run_doctor()
+            self.assertNotIn("dashboard module", self.names(data3, "WARN"))
+
+    def test_fix_restores_the_zcode_identity_asset(self):
+        json.dump([{"name": "z", "base": "https://z/v1", "model": "m",
+                    "oauth_provider": "zcode"}], open(mr.ROWS_PATH, "w"))
+        json.dump({"zcode": {"label": "Z"}}, open(mr.OAUTH_PROFILES_PATH, "w"))
+        json.dump({"zcode": {"access_token": "a", "expires_at": time.time() + 9999}},
+                  open(mr.OAUTH_PATH, "w"))
+        os.chmod(mr.OAUTH_PATH, 0o600)
+        if os.path.exists(mr.ZCODE_IDENTITY_PATH):
+            os.remove(mr.ZCODE_IDENTITY_PATH)
+        code, data = self.run_doctor()
+        self.assertIn("zcode bridge", self.names(data, "FAIL"))
+        code2, data2 = self.run_doctor(fix=True)
+        self.assertTrue(os.path.exists(mr.ZCODE_IDENTITY_PATH))
+        with open(mr.ZCODE_IDENTITY_PATH, "rb") as f:
+            self.assertEqual(len(f.read()), mr.ZCODE_IDENTITY_BYTES)
+        code3, data3 = self.run_doctor()
+        self.assertNotIn("zcode bridge", self.names(data3, "FAIL"))
+
+    def test_fix_repairs_the_launcher_exec_bit(self):
+        binp = mr._launcher_path()
+        os.makedirs(os.path.dirname(binp), exist_ok=True)
+        with open(binp, "w", encoding="utf-8") as f:
+            f.write('#!/bin/sh\nexec python3 "%s/minimalrouter.py" "$@"\n'
+                    % mr.MR_HOME)
+        os.chmod(binp, 0o644)
+        code, data = self.run_doctor()
+        self.assertIn("launcher exec bit", self.names(data, "WARN"))
+        code2, data2 = self.run_doctor(fix=True)
+        self.assertTrue(os.access(binp, os.X_OK))
+        code3, data3 = self.run_doctor()
+        self.assertNotIn("launcher exec bit", self.names(data3, "WARN"))
+
+    def test_fix_repins_a_bare_python_launcher_when_the_venv_exists(self):
+        binp = mr._launcher_path()
+        os.makedirs(os.path.dirname(binp), exist_ok=True)
+        with open(binp, "w", encoding="utf-8") as f:
+            f.write('#!/bin/sh\nexec python3 "%s/minimalrouter.py" "$@"\n'
+                    % mr.MR_HOME)
+        os.chmod(binp, 0o755)
+        venv = mr._launcher_venv_python()
+        os.makedirs(os.path.dirname(venv), exist_ok=True)
+        with open(venv, "w", encoding="utf-8") as f:
+            f.write("#!/bin/sh\n")
+        os.chmod(venv, 0o755)
+        code, data = self.run_doctor()
+        self.assertIn("launcher", self.names(data, "WARN"))
+        code2, data2 = self.run_doctor(fix=True)
+        with open(binp, encoding="utf-8") as f:
+            self.assertIn('exec "%s"' % venv, f.read())
+        code3, data3 = self.run_doctor()
+        self.assertNotIn("launcher", self.names(data3, "WARN"))
+
+    def test_fix_restores_registry_device_flow_fields(self):
+        json.dump({"providers": {"nous": {"label": "Nous",
+                                          "base_url": "https://portal.nousresearch.com",
+                                          "models": ["x"]}}},
+                  open(mr.PROVIDER_REGISTRY_PATH, "w"))
+        json.dump({"nous": {"label": "Nous", "refresh_url": "https://r"}},
+                  open(mr.OAUTH_PROFILES_PATH, "w"))
+        code, data = self.run_doctor()
+        self.assertIn("provider registry", self.names(data, "WARN"))
+        code2, data2 = self.run_doctor(fix=True)
+        reg = mr.read_provider_registry()
+        self.assertIn("authorize_url", reg["nous"])
+        self.assertIn("token_url", reg["nous"])
+        code3, data3 = self.run_doctor()
+        self.assertNotIn("provider registry", self.names(data3, "WARN"))
+
+    def test_user_data_files_survive_every_repair(self):
+        self.healthy_install()
+        binp = mr._launcher_path()
+        os.makedirs(os.path.dirname(binp), exist_ok=True)
+        with open(binp, "w", encoding="utf-8") as f:
+            f.write('#!/bin/sh\nexec python3 "%s/minimalrouter.py" "$@"\n'
+                    % mr.MR_HOME)
+        os.chmod(binp, 0o644)
+        os.chmod(mr.ROWS_PATH, 0o644)
+        before_rows = open(mr.ROWS_PATH, "rb").read()
+        before_oauth = open(mr.OAUTH_PATH, "rb").read()
+        prefs = os.path.join(mr.MR_HOME, "dashboard.json")
+        before_prefs = open(prefs, "rb").read()
+        dash = os.path.join(self.home, "minimalrouter_dashboard.py")
+        with mock.patch.object(mr, "_dash_sibling", return_value=dash):
+            code, data = self.run_doctor(fix=True)
+        self.assertEqual(open(mr.ROWS_PATH, "rb").read(), before_rows)
+        self.assertEqual(open(mr.OAUTH_PATH, "rb").read(), before_oauth)
+        self.assertEqual(open(prefs, "rb").read(), before_prefs)
+
+    def test_a_failed_repair_reports_and_does_not_crash(self):
+        self.healthy_install()
+        dash = os.path.join(self.home, "minimalrouter_dashboard.py")
+        with mock.patch.object(mr, "_dash_sibling", return_value=dash):
+            with mock.patch.object(mr, "_restore_dashboard_module",
+                                   side_effect=OSError("offline")):
+                code, data = self.run_doctor(fix=True)
+        self.assertEqual(code, 0)
+        blob = self.text(data, "WARN")
+        self.assertIn("dashboard module not restored", blob)
+        self.assertIn("re-run install.sh", blob)
+
+    def test_merge_registry_entry_preserves_device_flow_fields(self):
+        reg = {"nous": {"label": "Nous", "base_url": "https://old",
+                        "models": ["old"], "authorize_url": "https://a",
+                        "token_url": "https://t", "poll_method": "GET",
+                        "note": "keep me"}}
+        out = mr.merge_registry_entry(reg, "nous", "Nous Portal",
+                                      "https://new", ["new"], "responses")
+        self.assertEqual(out["nous"]["authorize_url"], "https://a")
+        self.assertEqual(out["nous"]["token_url"], "https://t")
+        self.assertEqual(out["nous"]["poll_method"], "GET")
+        self.assertEqual(out["nous"]["note"], "keep me")
+        self.assertEqual(out["nous"]["base_url"], "https://new")
+        self.assertEqual(out["nous"]["api_mode"], "responses")
+
+    def test_fix_alias_and_coverage_flag_are_documented(self):
+        u = mr.usage()
+        self.assertIn("minimalrouter fix", u)
+        self.assertIn("minimalrouter doctor --coverage", u)
+        self.assertIn("minimalrouter fix", Path(mr.__file__).read_text(encoding="utf-8").split("def usage(", 1)[0])
 
 
 class TestPoolLearnsAcrossRequests(unittest.TestCase):

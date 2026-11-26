@@ -19,6 +19,8 @@ Usage:
   minimalrouter oauth list   profiles and their connection state
   minimalrouter oauth <id>   device-code sign-in for that profile
   minimalrouter oauth rm <id>  delete a profile and its stored token
+  minimalrouter doctor       self-diagnose this install (never spends a token)
+  minimalrouter fix          apply the safe reversible repairs
   minimalrouter update       update the installed code to the newest release
 
 Home:   ~/.minimalrouter/
@@ -81,7 +83,7 @@ except ImportError:  # platform without curses -> main() degrades to serve
 # CHANGELOG and the git tag all derive from this one line. MAJOR.MINOR.PATCH per
 # semver.org: MAJOR on a breaking client contract, MINOR on backward-compatible
 # features, PATCH on fixes.
-__version__ = "1.6.0"
+__version__ = "1.7.0"
 
 HOME = os.path.expanduser("~")
 MR_HOME = os.path.join(HOME, ".minimalrouter")
@@ -2673,6 +2675,8 @@ Usage:
   minimalrouter stop         stop the running server/dashboard by verified PID
   minimalrouter doctor       self-diagnose this install (never spends a token)
   minimalrouter doctor --fix apply the safe reversible repairs
+  minimalrouter fix          same as doctor --fix
+  minimalrouter doctor --coverage  print the auto-fix coverage table
   minimalrouter update       update the installed code to the newest release
   minimalrouter update --check   report only; --force reinstalls same version
   minimalrouter -h|--help    show this help
@@ -2708,6 +2712,8 @@ Mission Control keys:
   ?        key reference.  Board trouble? Start outside it:
            minimalrouter doctor     (diagnoses the install, spends nothing)
            minimalrouter doctor --fix   (applies the safe repairs)
+           minimalrouter fix        (same as doctor --fix)
+           minimalrouter doctor --coverage  (auto-fix coverage table)
            minimalrouter update        (newest release; --check only reports)
   ?        help overlay      q      quit (stops the server)
 
@@ -2841,7 +2847,353 @@ def _port_holder(port):
     return (True, None, "")
 
 
-def doctor(fix=False, as_json=False):
+# --- doctor catalogue + coverage ------------------------------------------
+# The report is machine-readable only when every finding carries a stable id.
+# Display names can move; ids are the contract the coverage maths and any
+# external tool depend on. Category answers whose hands the fix needs; fixable
+# answers whether doctor can repair it without crossing the user-data boundary.
+DOCTOR_CATEGORY_LABELS = {
+    "A": "safe deterministic",
+    "B": "network repair",
+    "C": "human hands",
+    "D": "your data",
+    "E": "nothing to fix",
+}
+
+DOCTOR_CATALOGUE = {
+    "engine":          {"category": "E", "fixable": False, "repair": None},
+    "dashboard-module":{"category": "B", "fixable": True,  "repair": "restore-dashboard"},
+    "launcher":        {"category": "E", "fixable": False, "repair": None},
+    "launcher-pin":    {"category": "A", "fixable": True,  "repair": "repin-launcher"},
+    "launcher-exec":   {"category": "A", "fixable": True,  "repair": "chmod-launcher"},
+    "path":            {"category": "C", "fixable": False, "repair": None},
+    "tui-env":         {"category": "E", "fixable": False, "repair": None},
+    "rows-file":       {"category": "D", "fixable": False, "repair": None},
+    "row-schema":      {"category": "D", "fixable": False, "repair": None},
+    "row-names":       {"category": "D", "fixable": False, "repair": None},
+    "self-recursion":  {"category": "D", "fixable": False, "repair": None},
+    "key-resolution":  {"category": "D", "fixable": False, "repair": None},
+    "parked-rows":     {"category": "E", "fixable": False, "repair": None},
+    "oauth-profile":   {"category": "C", "fixable": False, "repair": None},
+    "zcode-bridge":    {"category": "B", "fixable": True,  "repair": "restore-zcode-asset"},
+    "registry-fields": {"category": "B", "fixable": True,  "repair": "restore-registry"},
+    "prefs":           {"category": "D", "fixable": False, "repair": None},
+    "themes":          {"category": "E", "fixable": False, "repair": None},
+    "server-version":  {"category": "E", "fixable": False, "repair": None},
+    "models-endpoint": {"category": "E", "fixable": False, "repair": None},
+    "port":            {"category": "E", "fixable": False, "repair": None},
+    "pidfile":         {"category": "A", "fixable": True,  "repair": "remove-pidfile"},
+    "log":             {"category": "D", "fixable": False, "repair": None},
+    "perms":           {"category": "A", "fixable": True,  "repair": "chmod-secret"},
+}
+
+DOCTOR_NAME_TO_ID = {
+    "engine": "engine",
+    "dashboard module": "dashboard-module",
+    "launcher": "launcher",
+    "launcher exec bit": "launcher-exec",
+    "PATH": "path",
+    "MINIMALROUTER_TUI": "tui-env",
+    "rows.json": "rows-file",
+    "row schema": "row-schema",
+    "row names": "row-names",
+    "self-recursion": "self-recursion",
+    "key resolution": "key-resolution",
+    "parked rows": "parked-rows",
+    "OAuth": "oauth-profile",
+    "OAuth profiles": "oauth-profile",
+    "zcode bridge": "zcode-bridge",
+    "provider registry": "registry-fields",
+    "prefs": "prefs",
+    "themes": "themes",
+    "server": "server-version",
+    "/v1/models": "models-endpoint",
+    "pidfile": "pidfile",
+    "log": "log",
+}
+
+DOCTOR_HISTORY_PATH = os.path.join(MR_HOME, "doctor-history.jsonl")
+DOCTOR_HISTORY_MAX = 100
+ZCODE_IDENTITY_BYTES = 3487
+
+
+def _doctor_check_id(name):
+    """Map a display name to its stable catalogue id."""
+    if not isinstance(name, str):
+        return None
+    if name.startswith("oauth:"):
+        return "oauth-profile"
+    if name.startswith("perms \u00b7"):
+        return "perms"
+    if name.startswith("port "):
+        return "port"
+    return DOCTOR_NAME_TO_ID.get(name)
+
+
+def _doctor_history_entries(checks):
+    """Only diagnostic findings, only catalogue ids, never detail text."""
+    out = []
+    for c in checks:
+        if c.get("kind") != "check":
+            continue
+        if c.get("level") not in ("FAIL", "WARN"):
+            continue
+        cid = c.get("id")
+        if cid not in DOCTOR_CATALOGUE:
+            continue
+        out.append({"id": cid, "level": c["level"], "fixable": bool(c.get("fixable"))})
+    return out
+
+
+def _doctor_history_append(version, entries):
+    """Append one run to the local ledger. A failed write must not break doctor."""
+    line = json.dumps({"ts": int(time.time()), "version": str(version or "?"),
+                       "findings": entries}, sort_keys=True)
+    try:
+        os.makedirs(os.path.dirname(DOCTOR_HISTORY_PATH), exist_ok=True)
+        old = []
+        try:
+            with open(DOCTOR_HISTORY_PATH, encoding="utf-8") as f:
+                old = [x for x in f.read().splitlines() if x.strip()]
+        except OSError:
+            old = []
+        old = old[-(DOCTOR_HISTORY_MAX - 1):]
+        old.append(line)
+        tmp = DOCTOR_HISTORY_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write("\n".join(old) + "\n")
+        os.replace(tmp, DOCTOR_HISTORY_PATH)
+        try:
+            os.chmod(DOCTOR_HISTORY_PATH, 0o600)
+        except OSError:
+            pass
+    except OSError:
+        pass
+
+
+def _doctor_history_read():
+    out = []
+    try:
+        with open(DOCTOR_HISTORY_PATH, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return out
+    for ln in lines[-DOCTOR_HISTORY_MAX:]:
+        if not ln.strip():
+            continue
+        try:
+            d = json.loads(ln)
+        except Exception:
+            continue
+        fs = d.get("findings") if isinstance(d, dict) else None
+        if isinstance(fs, list):
+            out.append({"ts": int(d.get("ts") or 0),
+                        "version": str(d.get("version") or "?"),
+                        "findings": [x for x in fs if isinstance(x, dict)]})
+    return out
+
+
+def _doctor_coverage(checks, history=None):
+    """Three numbers, never conflated: catalogue, this run, local history."""
+    diag = [c for c in checks if c.get("kind") == "check"]
+    total = len(DOCTOR_CATALOGUE)
+    auto_total = sum(1 for m in DOCTOR_CATALOGUE.values() if m.get("fixable"))
+    findings = [c for c in diag if c.get("level") in ("FAIL", "WARN")]
+    auto_now = sum(1 for c in findings if c.get("fixable"))
+    weighted = None
+    if history:
+        n_find = sum(len(h.get("findings", [])) for h in history)
+        n_auto = sum(1 for h in history for f in h.get("findings", [])
+                     if f.get("fixable"))
+        ts = [int(h.get("ts") or 0) for h in history if int(h.get("ts") or 0)]
+        weighted = {
+            "runs": len(history),
+            "findings": n_find,
+            "auto_fixable": n_auto,
+            "pct": round(100.0 * n_auto / n_find, 1) if n_find else None,
+            "from": min(ts) if ts else None,
+            "to": max(ts) if ts else None,
+        }
+    by_cat = {}
+    for cat in sorted(DOCTOR_CATEGORY_LABELS):
+        by_cat[cat] = {"total": 0, "auto": 0}
+    for cid, meta in DOCTOR_CATALOGUE.items():
+        cat = meta.get("category", "?")
+        by_cat.setdefault(cat, {"total": 0, "auto": 0})
+        by_cat[cat]["total"] += 1
+        if meta.get("fixable"):
+            by_cat[cat]["auto"] += 1
+    return {
+        "catalogue": {
+            "total": total,
+            "auto_fixable": auto_total,
+            "pct": round(100.0 * auto_total / total, 1) if total else None,
+        },
+        "observed": {
+            "findings": len(findings),
+            "auto_fixable": auto_now,
+            "pct": round(100.0 * auto_now / len(findings), 1) if findings else None,
+        },
+        "weighted": weighted,
+        "by_category": by_cat,
+    }
+
+
+def _fmt_pct(p):
+    return "no findings" if p is None else "%.1f%%" % p
+
+
+def _doctor_cov_line(cov):
+    w = cov.get("weighted")
+    if not w:
+        wh = "history none"
+    else:
+        wh = ("history %d run(s) \u00b7 weighted %d/%d (%s)"
+              % (w.get("runs", 0), w.get("auto_fixable", 0),
+                 w.get("findings", 0), _fmt_pct(w.get("pct"))))
+    return ("coverage \u00b7 catalogue %d/%d (%s) \u00b7 observed %d/%d (%s) \u00b7 %s"
+            % (cov["catalogue"]["auto_fixable"], cov["catalogue"]["total"],
+               _fmt_pct(cov["catalogue"]["pct"]),
+               cov["observed"]["auto_fixable"], cov["observed"]["findings"],
+               _fmt_pct(cov["observed"]["pct"]), wh))
+
+
+def _doctor_cov_table(cov):
+    print("")
+    print("COVERAGE BY CATEGORY")
+    for cat in sorted(DOCTOR_CATEGORY_LABELS):
+        b = cov["by_category"].get(cat, {"total": 0, "auto": 0})
+        print("  %s %-22s %d/%d auto" % (cat, DOCTOR_CATEGORY_LABELS[cat],
+                                          b["auto"], b["total"]))
+
+
+def _launcher_path():
+    return os.path.join(HOME, ".local", "bin", "minimalrouter")
+
+
+def _launcher_venv_python():
+    return os.path.join(MR_HOME, ".venv", "bin", "python3")
+
+
+def _atomic_write(path, data, mode=0o644):
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(data)
+    os.replace(tmp, path)
+    try:
+        os.chmod(path, mode)
+    except OSError:
+        pass
+
+
+def _repo_or_remote_file(rel):
+    """Read an asset from the checkout first; otherwise fetch it from main."""
+    p = os.path.join(os.path.dirname(os.path.abspath(__file__)), rel)
+    try:
+        with open(p, "rb") as f:
+            return f.read(), p
+    except OSError:
+        return _update_get(rel), "%s/%s" % (UPDATE_RAW, rel)
+
+
+def _backup_if_exists(path):
+    if not os.path.exists(path):
+        return None
+    bp = path + ".bak-" + time.strftime("%Y%m%d-%H%M%S")
+    shutil.copy2(path, bp)
+    return bp
+
+
+def _restore_dashboard_module():
+    data, src = _repo_or_remote_file("minimalrouter_dashboard.py")
+    ast.parse(data.decode("utf-8", "replace"))
+    dest = _dash_sibling()
+    _backup_if_exists(dest)
+    _atomic_write(dest, data, 0o644)
+    return src
+
+
+def _restore_zcode_asset():
+    data, src = _repo_or_remote_file("bridges/zcode-identity.json")
+    if len(data) != ZCODE_IDENTITY_BYTES:
+        raise ValueError("identity asset size drift: %d != %d"
+                         % (len(data), ZCODE_IDENTITY_BYTES))
+    _backup_if_exists(ZCODE_IDENTITY_PATH)
+    _atomic_write(ZCODE_IDENTITY_PATH, data, 0o600)
+    return src
+
+
+def _repin_launcher():
+    binp = _launcher_path()
+    venv = _launcher_venv_python()
+    if not os.path.exists(venv):
+        raise ValueError("no dashboard venv at %s" % venv)
+    with open(binp, encoding="utf-8") as f:
+        lt = f.read()
+    new = re.sub(r'^exec python3 "', 'exec "%s" "' % venv, lt, flags=re.M)
+    if new == lt:
+        raise ValueError("launcher text did not change")
+    _backup_if_exists(binp)
+    _atomic_write(binp, new.encode("utf-8"), 0o755)
+    return venv
+
+
+def _rich_registry_copy():
+    data, _ = _repo_or_remote_file("provider-registry.json")
+    d = json.loads(data.decode("utf-8", "replace"))
+    prov = d.get("providers", d) if isinstance(d, dict) else {}
+    if not isinstance(prov, dict) or not prov:
+        raise ValueError("repo registry is empty or malformed")
+    return prov
+
+
+def _restore_registry_fields():
+    """Merge the repo's rich presets under the live registry.
+
+    The live file wins on user edits, but empty values from the old clobber do
+    not erase the repo's device-flow fields.
+    """
+    live = read_provider_registry()
+    rich = _rich_registry_copy()
+    merged = {}
+    for pid, entry in rich.items():
+        if isinstance(entry, dict):
+            merged[pid] = dict(entry)
+    for pid, entry in live.items():
+        if not isinstance(entry, dict):
+            continue
+        base = merged.get(pid, {})
+        for k, v in entry.items():
+            if v in (None, "", [], {}):
+                continue
+            base[k] = v
+        merged[pid] = base
+    tmp = PROVIDER_REGISTRY_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"providers": merged}, f, indent=2)
+        f.write("\n")
+    os.replace(tmp, PROVIDER_REGISTRY_PATH)
+    try:
+        os.chmod(PROVIDER_REGISTRY_PATH, 0o644)
+    except OSError:
+        pass
+    return len(merged)
+
+
+def merge_registry_entry(registry, pid, label, base_url, models, api_mode=None):
+    """Remember one preset without stripping the fields it already carried."""
+    entry = dict(registry.get(pid, {}))
+    entry.update({"label": label, "base_url": base_url, "models": list(models)})
+    if api_mode:
+        entry["api_mode"] = api_mode
+    registry[pid] = entry
+    return registry
+
+
+def doctor(fix=False, as_json=False, coverage=False):
     """Self-diagnosis for THIS install. stdlib only, and it never spends a token.
 
     Cost: zero. The only network reads are loopback (`/api/state`, `/v1/models`)
@@ -2883,8 +3235,17 @@ def doctor(fix=False, as_json=False):
     """
     L = []
 
-    def add(level, name, detail="", hint=""):
-        L.append((level, name, detail, hint))
+    def add(level, name, detail="", hint="", check_id=None, fixable=None,
+            auto_fixed=False, kind="check", repair=None):
+        cid = check_id or _doctor_check_id(name)
+        meta = DOCTOR_CATALOGUE.get(cid) or {}
+        eff = meta.get("fixable", False) if fixable is None else bool(fixable)
+        L.append({
+            "level": level, "name": name, "detail": detail, "fix": hint,
+            "id": cid, "category": meta.get("category", "?"),
+            "fixable": eff, "auto_fixed": bool(auto_fixed),
+            "kind": kind, "repair": repair or meta.get("repair"),
+        })
 
     eng = os.path.abspath(__file__)
     from_repo = os.path.exists(os.path.join(os.path.dirname(eng), ".git"))
@@ -2914,9 +3275,19 @@ def doctor(fix=False, as_json=False):
     else:
         add("WARN", "dashboard module", "absent next to the engine",
             "the board falls back to the built-in curses UI. Re-run install.sh "
-            "(without --curses) to get Mission Control.")
+            "(without --curses) to get Mission Control.",
+            check_id="dashboard-module")
+        if fix:
+            try:
+                src = _restore_dashboard_module()
+                add("OK", "fix applied",
+                    "restored minimalrouter_dashboard.py from %s" % src, "",
+                    kind="repair", auto_fixed=True)
+            except Exception as e:
+                add("WARN", "fix", "dashboard module not restored: %s" % e,
+                    "re-run install.sh", kind="repair")
 
-    binp = os.path.join(HOME, ".local", "bin", "minimalrouter")
+    binp = _launcher_path()
     venv_py = ""
     if not os.path.exists(binp):
         if from_repo:
@@ -2952,15 +3323,35 @@ def doctor(fix=False, as_json=False):
                     "dies before Python starts" % venv_py,
                     "re-run install.sh to rebuild the dashboard venv")
         else:
+            venv_py = _launcher_venv_python()
+            can = os.path.exists(venv_py)
             add("WARN", "launcher", "pins system python3 — the curses board only",
                 "the beautiful board is not opt-in on this install. Re-run "
                 "install.sh (no --curses) to bundle Textual in "
-                "~/.minimalrouter/.venv")
+                "~/.minimalrouter/.venv" if not can else
+                "the dashboard venv exists; doctor can repin this launcher to it.",
+                check_id="launcher-pin", fixable=can)
+            if fix and can:
+                try:
+                    vp = _repin_launcher()
+                    add("OK", "fix applied", "launcher pinned to %s" % vp, "",
+                        kind="repair", auto_fixed=True)
+                except Exception as e:
+                    add("WARN", "fix", "launcher not repinned: %s" % e,
+                        "re-run install.sh", kind="repair")
         if os.access(binp, os.X_OK) and (mv or ms):
             add("OK", "launcher exec bit", "executable")
         elif (mv or ms):
             add("WARN", "launcher exec bit", "not executable",
-                "chmod +x %s" % binp)
+                "chmod +x %s" % binp, check_id="launcher-exec")
+            if fix:
+                try:
+                    os.chmod(binp, 0o755)
+                    add("OK", "fix applied", "chmod +x %s" % binp, "",
+                        kind="repair", auto_fixed=True)
+                except OSError as e:
+                    add("WARN", "fix", "chmod failed on launcher: %s" % e,
+                        "chmod +x %s" % binp, kind="repair")
 
     local_bin = os.path.join(HOME, ".local", "bin")
     on_path = False
@@ -3103,7 +3494,17 @@ def doctor(fix=False, as_json=False):
             add("FAIL", "zcode bridge", "zcode row exists but the identity "
                 "asset is missing",
                 "the vendor answers 405 code 3012 on an empty identity. Re-run "
-                "install.sh — it fetches bridges/zcode-identity.json")
+                "install.sh — it fetches bridges/zcode-identity.json",
+                check_id="zcode-bridge")
+            if fix:
+                try:
+                    src = _restore_zcode_asset()
+                    add("OK", "fix applied",
+                        "restored bridges/zcode-identity.json from %s" % src, "",
+                        kind="repair", auto_fixed=True)
+                except Exception as e:
+                    add("WARN", "fix", "zcode asset not restored: %s" % e,
+                        "re-run install.sh", kind="repair")
     used_profs = {str(r.get("oauth_provider")) for r in rows
                   if isinstance(r, dict) and r.get("oauth_provider")}
     orphan = sorted(used_profs - set(profiles))
@@ -3177,10 +3578,13 @@ def doctor(fix=False, as_json=False):
                 % pid)
 
     reg = read_provider_registry()
+    registry_needs_fix = False
     if not reg:
         add("FAIL", "provider registry", "empty, missing or unparseable",
             "restore provider-registry.json from the repo. The `oauth add` flow "
-            "rewrites it to a minimal shape and the device-flow fields are lost")
+            "rewrites it to a minimal shape and the device-flow fields are lost",
+            check_id="registry-fields")
+        registry_needs_fix = True
     else:
         thin = [p for p, e in sorted(reg.items()) if not (e or {}).get("base_url")]
         no_flow = [p for p in sorted(profiles)
@@ -3188,7 +3592,9 @@ def doctor(fix=False, as_json=False):
                    or not (reg.get(p) or {}).get("token_url")]
         if thin:
             add("FAIL", "provider registry", "entries without base_url: %s"
-                % ", ".join(thin), "restore the rich copy from the repo")
+                % ", ".join(thin), "restore the rich copy from the repo",
+                check_id="registry-fields")
+            registry_needs_fix = True
         else:
             add("OK", "provider registry", "%d providers, every entry has a "
                 "base_url" % len(reg))
@@ -3197,7 +3603,18 @@ def doctor(fix=False, as_json=False):
                 "device-flow fields lost for: %s" % ", ".join(no_flow),
                 "`oauth add` rewrote this file to a minimal shape. Those "
                 "profiles cannot be signed in again after expiry — restore the "
-                "repo copy of provider-registry.json")
+                "repo copy of provider-registry.json",
+                check_id="registry-fields")
+            registry_needs_fix = True
+    if fix and registry_needs_fix:
+        try:
+            n = _restore_registry_fields()
+            add("OK", "fix applied",
+                "restored provider-registry.json fields from the repo (%d entries)" % n,
+                "", kind="repair", auto_fixed=True)
+        except Exception as e:
+            add("WARN", "fix", "registry not restored: %s" % e,
+                "restore it manually from the repo copy", kind="repair")
 
     # ---------------------------------------------------------- prefs
     prefs_path = os.path.join(MR_HOME, "dashboard.json")
@@ -3278,9 +3695,11 @@ def doctor(fix=False, as_json=False):
             if fix:
                 try:
                     os.remove(PID_PATH)
-                    add("OK", "fix applied", "removed the stale pidfile", "")
+                    add("OK", "fix applied", "removed the stale pidfile", "",
+                        kind="repair", auto_fixed=True)
                 except OSError as e:
-                    add("WARN", "fix", "could not remove pidfile: %s" % e, "")
+                    add("WARN", "fix", "could not remove pidfile: %s" % e,
+                        "check ownership of %s" % PID_PATH, kind="repair")
     elif isinstance(srv, dict) and "rows" in srv:
         add("WARN", "pidfile", "a server answers but no pidfile exists",
             "`minimalrouter stop` cannot verify the PID, so it may refuse to "
@@ -3315,36 +3734,45 @@ def doctor(fix=False, as_json=False):
             if fix:
                 try:
                     os.chmod(p, 0o600)
-                    add("OK", "fix applied", "chmod 600 %s" % p, "")
+                    add("OK", "fix applied", "chmod 600 %s" % p, "",
+                        kind="repair", auto_fixed=True)
                 except OSError as e:
-                    add("WARN", "fix", "chmod failed on %s: %s" % (tag, e), "")
+                    add("WARN", "fix", "chmod failed on %s: %s" % (tag, e),
+                        "chmod 600 %s" % p, kind="repair")
         else:
             add("OK", "perms · %s" % tag, "mode %03o" % mode)
 
     # ---------------------------------------------------------- report
-    n_fail = sum(1 for x in L if x[0] == "FAIL")
-    n_warn = sum(1 for x in L if x[0] == "WARN")
+    n_fail = sum(1 for x in L if x["level"] == "FAIL")
+    n_warn = sum(1 for x in L if x["level"] == "WARN")
     n_ok = len(L) - n_fail - n_warn
+    hist_entries = _doctor_history_entries(L)
+    _doctor_history_append(ver, hist_entries)
+    hist = _doctor_history_read()
+    cov = _doctor_coverage(L, hist)
     if as_json:
         print(json.dumps({"version": ver, "port": PORT, "home": MR_HOME,
                           "ok": n_ok, "warn": n_warn, "fail": n_fail,
                           "healthy": n_fail == 0,
-                          "checks": [{"level": a, "name": b, "detail": c,
-                                      "fix": d} for a, b, c, d in L]}, indent=2))
+                          "coverage": cov,
+                          "checks": L}, indent=2))
         return 1 if n_fail else 0
     tag = {"OK": "[ ok ]", "WARN": "[warn]", "FAIL": "[FAIL]"}
     print("minimalrouter doctor · v%s · home %s · port %d" % (ver, MR_HOME, PORT))
     print("=" * 76)
-    for lvl, nm, detail, hint in L:
-        print("%-6s %-24s %s" % (tag[lvl], nm, detail))
-        if hint:
-            for hl in hint.split("\n"):
+    for c in L:
+        print("%-6s %-24s %s" % (tag[c["level"]], c["name"], c["detail"]))
+        if c["fix"]:
+            for hl in c["fix"].split("\n"):
                 print("            %s" % hl)
     print("=" * 76)
     verdict = ("UNHEALTHY — %d thing(s) will break requests" % n_fail if n_fail
                else "HEALTHY%s" % (" (%d warning(s))" % n_warn if n_warn else ""))
     print("%d checks · %d ok · %d warn · %d fail · %s"
           % (len(L), n_ok, n_warn, n_fail, verdict))
+    print(_doctor_cov_line(cov))
+    if coverage:
+        _doctor_cov_table(cov)
     if (n_fail or n_warn) and not fix:
         print("Safe reversible repairs run with: minimalrouter doctor --fix")
     return 1 if n_fail else 0
@@ -3635,10 +4063,9 @@ def main():
             profiles[pid] = spec
             write_oauth_profiles(profiles)
             # Remember name -> endpoints so the next add is a single word.
-            registry[pid] = {"label": label, "base_url": base_url,
-                             "models": spec["models"]}
-            if spec.get("api_mode"):
-                registry[pid]["api_mode"] = spec["api_mode"]
+            # Merge, never clobber: the repo's device-flow fields must survive.
+            merge_registry_entry(registry, pid, label, base_url, spec["models"],
+                                 spec.get("api_mode"))
             try:
                 tmp = PROVIDER_REGISTRY_PATH + ".tmp"
                 with open(tmp, "w") as f:
@@ -3691,9 +4118,11 @@ def main():
             print("%-12s %s" % (pid, ("OK " if ok else "FAIL ") + msg))
             bad += 0 if ok else 1
         return 1 if bad else 0
-    if args and args[0].lower() == "doctor":
-        return doctor(fix=("--fix" in args[1:] or "-f" in args[1:]),
-                      as_json="--json" in args[1:])
+    if args and args[0].lower() in ("doctor", "fix"):
+        return doctor(fix=(args[0].lower() == "fix"
+                           or "--fix" in args[1:] or "-f" in args[1:]),
+                      as_json="--json" in args[1:],
+                      coverage="--coverage" in args[1:])
     if args and args[0].lower() == "update":
         return cmd_update(check_only=("--check" in args[1:]),
                           force=("--force" in args[1:]))

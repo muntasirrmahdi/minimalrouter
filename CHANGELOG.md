@@ -12,6 +12,43 @@ OpenAI-compatible request/response shape, the endpoint, or the install command);
 for backward-compatible features (new providers, classes, dashboard capability, CLI verbs);
 **PATCH** for fixes only.
 
+## [1.7.0] — 2026-11-26
+
+### Added
+
+- **`doctor` findings are machine-readable.** Every check now carries a stable
+  `id`, a `category` (`A` safe deterministic, `B` network repair, `C` human hands,
+  `D` your data, `E` nothing to fix), and a `fixable` flag. The display name is
+  still there for humans; the id is the contract an external tool can depend on.
+  `--json` also returns a `coverage` block.
+- **Three coverage numbers, never conflated.** `doctor` prints:
+  - **catalogue coverage** — auto-fixable checks / all checks (structural);
+  - **observed coverage** — auto-fixable findings / all findings on this run;
+  - **frequency-weighted coverage** — the same ratio across the local history
+    ledger, with the sample size and date range printed. No history means `null`,
+    never an invented percentage.
+  `minimalrouter doctor --coverage` adds the per-category table.
+- **Expanded safe repairs.** `doctor --fix` now also repairs a launcher missing
+  its exec bit, a launcher pinned to bare `python3` when the dashboard venv
+  exists, a missing dashboard module, a missing zcode bridge asset, and a
+  `provider-registry.json` whose device-flow fields were stripped by the old
+  `oauth add` clobber. Each repair is backed up before it writes, uses atomic
+  writes, and is reported as `fix applied` or a WARN with a remedy. The boundary
+  holds: `rows.json`, `oauth.json` and `dashboard.json` are never rewritten.
+- **`minimalrouter fix`** is an alias for `doctor --fix`.
+- **Local history ledger.** `~/.minimalrouter/doctor-history.jsonl` stores only
+  `{ts, version, findings:[{id, level, fixable}]}` — no detail, no paths, no
+  secrets — bounded to 100 runs. It is the only instrument that can produce a
+  frequency-weighted number without pretending one install is a population.
+
+### Fixed
+
+- **`oauth add` no longer strips a preset's device-flow fields.** The registry
+  entry is merged, not replaced: `authorize_url`, `token_url`, `poll_method`,
+  `headers`, `token_body` and notes survive a re-add. This was the standing
+  prerequisite for the 15-preset promise: 15 presets whose fields vanish on first
+  re-add is worse than 6 that survive.
+
 ## [1.6.0] — 2026-11-26
 
 ### Added
