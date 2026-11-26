@@ -12,6 +12,23 @@ OpenAI-compatible request/response shape, the endpoint, or the install command);
 for backward-compatible features (new providers, classes, dashboard capability, CLI verbs);
 **PATCH** for fixes only.
 
+## [1.9.5] — 2026-11-26
+
+### Fixed
+
+- **Docs matched the shipped surfaces.** README no longer claims `/v1/messages`
+  returns 404 or that the shim is on the roadmap; the setup-help issue template
+  no longer says Windows native is unsupported; `docs/development.md` expects the
+  Anthropic shim to answer 200 with Anthropic content/`stop_reason`; the Windows
+  install path, `.cmd` launcher and PowerShell uninstall are documented; the
+  development doc lists the `install-smoke-windows` CI job.
+
+### Changed
+
+- **CI is release-aware and least-privilege.** The workflow now runs on `v*` tags
+  and `workflow_dispatch` as well as `main` and PRs, declares `contents: read`,
+  and cancels superseded runs per ref. README carries the CI badge.
+
 ## [1.9.4] — 2026-11-26
 
 ### Changed

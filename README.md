@@ -1,5 +1,7 @@
 # MinimalRouter
 
+[![CI](https://github.com/muntasirrmahdi/minimalrouter/actions/workflows/ci.yml/badge.svg)](https://github.com/muntasirrmahdi/minimalrouter/actions/workflows/ci.yml)
+
 One OpenAI-compatible endpoint over all your free API rows — the router engine is a
 single Python file on the standard library, localhost only, with a terminal dashboard
 built in. The installer sets up the full Mission Control board (Textual) automatically
@@ -21,7 +23,7 @@ of every row in your terminal.
 | **A real terminal dashboard** | Mission Control board out of the box: centered btop-class frame, block-pixel wordmark, 8 pixel-digit stat tiles (rows / models / serving / down / req-per-min / tokens-per-s / error % / uptime) that reconcile: serving + down + unprobed == rows, so no row is ever invisible, a dense table with provider, class, context window, latency, TPS, OK% and a live status vocabulary (OK/COOLDOWN/STALE/DEAD/GATED/EMPTY), multi-row marks with batch test/delete/park, a selected-row panel with TPS+CW gauges, a scrollable event tail, 14 themes (incl. Nous and Claude) + density + motion toggles. The board picks a layout tier from the live terminal height (wordmark and the detail panels scale down on short screens instead of clipping), pins every panel so the route table can never be starved, and `?` opens the full key reference as an overlay; the installer bundles it (Textual, in a dedicated venv), and if that setup isn't possible the core falls back to a stdlib curses board. |
 | **One-word provider connects** | A name-to-endpoint registry makes a known tool a single word: `oauth add`, type the name, approve in the browser. Unknown tools stay addable by pasting a base URL once. |
 | **Native translators** | Providers that need a transformed request (Responses-only gateways, Anthropic-Messages plan lanes) route through sibling transports in the same file — endpoints and identity assets are data, not code. A `/v1/messages` shim lets Claude Code use the same pool. |
-| **Runs anywhere Python runs** | Linux, macOS, WSL2. One file, Python 3.8+, no database, no web UI, nothing to configure beyond a JSON file of rows. |
+| **Runs anywhere Python runs** | Linux, macOS, Windows (native `install.ps1` or WSL2). One file, Python 3.8+, no database, no web UI, nothing to configure beyond a JSON file of rows. |
 
 ## Quick Install
 
@@ -156,8 +158,9 @@ custom_providers:
     model: "kilo-auto/free"
 ```
 
-Claude Code is the one notable format exception: it speaks the Anthropic `/v1/messages`
-format, which this router does not serve yet (404). The shim is on the roadmap.
+Claude Code speaks the Anthropic `/v1/messages` format. MinimalRouter serves a shim
+at `POST /v1/messages`: request/response and SSE translation, including
+`tool_use`/`tool_result` blocks, routed through the same row chain.
 
 ## CLI quick reference
 
@@ -282,9 +285,10 @@ identity assets are data (`provider-registry.json`, `oauth-providers.json`,
 ~/.minimalrouter/provider-registry.json       name -> base URL/model map (seeded once)
 ~/.minimalrouter/oauth-providers.json         personal provider profiles
 ~/.minimalrouter/oauth.json                   local OAuth tokens (chmod 600)
-~/.minimalrouter/minimalrouter.log            per-request OK/FAIL log
+~/.minimalrouter/minimalrouter.log            per-request OK/FAIL log (rotates at 5 MB)
 ~/.minimalrouter/minimalrouter.pid            pid file (mode 600, cleared on stop)
-~/.local/bin/minimalrouter                    launcher
+~/.local/bin/minimalrouter                    launcher (Unix)
+~/.local/bin/minimalrouter.cmd                launcher (Windows, install.ps1)
 ```
 
 ## Uninstall
@@ -292,6 +296,13 @@ identity assets are data (`provider-registry.json`, `oauth-providers.json`,
 ```sh
 rm -f ~/.local/bin/minimalrouter
 rm -rf ~/.minimalrouter
+```
+
+Windows PowerShell:
+
+```powershell
+Remove-Item "$env:USERPROFILE\.local\bin\minimalrouter.cmd"
+Remove-Item -Recurse "$env:USERPROFILE\.minimalrouter"
 ```
 
 ## Roadmap

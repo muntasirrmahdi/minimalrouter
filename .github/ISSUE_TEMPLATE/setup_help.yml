@@ -8,7 +8,7 @@ body:
       value: |
         Check the [README Quick Install](https://github.com/muntasirrmahdi/minimalrouter#quick-install)
         and [Troubleshooting](https://github.com/muntasirrmahdi/minimalrouter#troubleshooting) first.
-        Windows native is not supported yet — use WSL2.
+        Windows native is supported via `install.ps1` (PowerShell); WSL2 remains an option.
 
   - type: textarea
     id: tried
@@ -26,7 +26,7 @@ body:
     attributes:
       label: Environment
       placeholder: |
-        - OS: Ubuntu 24.04 / macOS 15 / WSL2
+        - OS: Ubuntu 24.04 / macOS 15 / Windows 11 (native or WSL2)
         - python3 -V: ...
         - Shell: bash / zsh
     validations:

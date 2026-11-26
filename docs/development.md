@@ -27,9 +27,10 @@ audit: class derivation and spoof resistance, `token_live` no-expiry semantics,
 and the failure-envelope upstream body (D4, loopback fixture server). CI runs the
 suite on Python 3.11-3.14 (the dashboard tests skip when textual is absent, so the
 core job stays zero-dep), an install-smoke job that runs `install.sh` from the
-checkout into a throwaway HOME and asserts the curses fallback without textual, and
-a `dashboard` job that installs textual and runs the full suite plus a headless
-Textual-board smoke.
+checkout into a throwaway HOME and asserts the curses fallback without textual,
+an `install-smoke-windows` job that runs `install.ps1` on `windows-latest` and
+asserts the `.cmd` launcher + bridge asset, and a `dashboard` job that installs
+textual and runs the full suite plus a headless Textual-board smoke.
 
 ## The Mission Control dashboard (bundled by the installer)
 
@@ -45,6 +46,7 @@ the beautiful board out of the box regardless of which `python3` is on the user'
 ```sh
 sh install.sh                 # one install -> Textual board (venv bundled)
 sh install.sh --curses        # zero-dep: curses board only, no venv
+powershell -ExecutionPolicy Bypass -File .\install.ps1   # native Windows
 python -m unittest discover -s tests -v          # dashboard tests run with textual
 MINIMALROUTER_TUI=curses minimalrouter           # force the curses fallback
 MINIMALROUTER_TUI=textual minimalrouter          # request the board (loud if absent)
@@ -84,7 +86,7 @@ spend fractions of a cent — say so before touching them.
 9. `/api/refresh` honesty: real rotation where a refresh token exists (re-probe a
    completion after a single-use rotation to prove persistence), plain "no refresh
    token" where none exists, honest error for unknown profiles.
-10. Error shapes: unknown model 404, malformed JSON 400, `/v1/messages` 404.
+10. Error shapes: unknown model 404, malformed JSON 400; `/v1/messages` returns 200 with Anthropic `content`/`stop_reason` (use a fake upstream with a `tool_calls` payload to prove `tool_use` translation).
 11. `stop`: live-kill frees the port and clears the pid file; a stale pid file with
     a dead PID is cleared; a same-named copy elsewhere survives. For the zombie
     edge, start the server as an unreaped child and stop it — the pid file must
